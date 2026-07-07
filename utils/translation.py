@@ -70,7 +70,7 @@ def translate_segments(segments: list, target_language: str, api_key: str):
     try:
         response = generate_content_with_retry(
             client,
-            model='gemini-2.5-flash',
+            model='gemini-3.1-flash-lite',
             contents=prompt,
             config=types.GenerateContentConfig(
                 temperature=0.3,
@@ -116,7 +116,7 @@ def _translate_sequential(client, segments, target_language):
         )
         response = generate_content_with_retry(
             client,
-            model='gemini-2.5-flash',
+            model='gemini-3.1-flash-lite',
             contents=prompt,
             config=types.GenerateContentConfig(
                 temperature=0.3,

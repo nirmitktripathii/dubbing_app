@@ -126,6 +126,7 @@ def _call_gemini(
     log_fn: Optional[Callable[[str], None]] = None
 ) -> str:
     """Call Gemini with logging, latency measurement, and fallback models."""
+    # NOTE: DO NOT change the default model 'gemini-3.1-flash-lite' unless explicitly instructed by the user.
     models_to_try = ["gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
     
     for attempt in range(5):
