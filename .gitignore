@@ -1,0 +1,78 @@
+# Python cache & compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+
+# Environments
+venv/
+.venv/
+env/
+.env
+.env.*
+ENV/
+env.bak/
+venv.bak/
+dubbing_app/
+
+# IDE / Editor folders and files
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Media & Large Binary files
+*.mp4
+*.wav
+*.mp3
+*.pdf
+*.zip
+*.crdownload
+*.srt
+rubberband.exe
+
+# Logs
+*.log
+verbose_import.log
+test_tts_drift_fixed.log
+test_tts_drift_run.log
+model_load_debug.log
+test_run.log
+
+# Temporary processing directories
+temp_diagnostic/
+temp_drift_test/
+temp_processing/
+temp_test_run/
+temp_test_run/
+
+# Git credentials / Secrets (safety fallback)
+*key*
+*token*
+*credential*
+secrets.json
+credentials.json
+kaggle.json
+
+# Irrelevant local/diagnostic scripts, notebooks, and text files
+check_key.py
+diagnostic_raw_audio.py
+dub_erosion_from_srt.py
+dub_erosion_video.py
+run_pipeline_test.py
+test_tts_drift.py
+trace_imports.py
+shreyash-gaur-shadowgpu-8a5edab282632443.txt
+*.bat
+*.ipynb
+*.crdownload
+
+# Planning and markdown reports
+implementation_plan_v3.md
+audio_quality_report.md
+walkthrough.md
+task.md

@@ -1,0 +1,34 @@
+# ── Core framework ────────────────────────────────────────────────────────
+streamlit
+
+# ── Transcription ─────────────────────────────────────────────────────────
+faster-whisper          # Upgraded from openai-whisper (4-8x faster, INT8 quant)
+openai-whisper          # Fallback if faster-whisper is unavailable
+
+# ── Translation ───────────────────────────────────────────────────────────
+google-genai            # Gemini API for isochrony-aware translation
+
+# ── Source separation ─────────────────────────────────────────────────────
+demucs                  # Vocal/background separation (htdemucs model)
+
+# ── TTS (IndicF5) ─────────────────────────────────────────────────────────
+# IndicF5 is installed from source:
+#   pip install git+https://github.com/ai4bharat/IndicF5.git
+# The following are its dependencies:
+transformers>=4.30.0,<5.0.0   # Pin <5 to avoid "meta tensor" crash with IndicF5 (v5 defaults low_cpu_mem_usage=True)
+accelerate
+huggingface_hub
+
+# ── Audio processing ──────────────────────────────────────────────────────
+soundfile               # Fast audio I/O (replaces pydub for new pipeline)
+pydub                   # Kept for legacy compatibility
+numpy
+pyrubberband            # Safety-net drift correction (pitch-preserving stretch)
+
+# ── Video processing ──────────────────────────────────────────────────────
+# FFmpeg must be installed on system PATH separately.
+# Windows: winget install ffmpeg  OR  choco install ffmpeg
+
+# ── Optional (resampling quality) ────────────────────────────────────────
+resampy                 # High-quality resampling for voice_manager.py
+
