@@ -1,0 +1,13 @@
+session,kaggle_version,wandb_run,step_approx,epoch,metric,value,perplexity,grad_norm,learning_rate,notes
+3,13,6zpo7lih,2558,0.767,session_resume,,,,,resumed from checkpoint-2558; restore verified t=73.5s; 14 checkpoints in place; quota 0/30h at commit; wandb full run 6zpo7lih (gohveo9u = smoke phase)
+3,13,6zpo7lih,2600,0.7798,eval_loss,0.4470,1.5636,,,eval_runtime=280.2s
+3,13,6zpo7lih,2800,0.8398,eval_loss,0.4403,1.5532,,,eval_runtime=279.8s
+3,13,6zpo7lih,3000,0.8997,eval_loss,0.4418,1.5555,,,eval_runtime=279.4s
+3,13,6zpo7lih,3200,0.9597,eval_loss,0.4368,1.5477,,,GLOBAL EVAL MIN so far; eval_runtime=279.3s
+3,13,6zpo7lih,3400,1.0197,eval_loss,0.4405,1.5535,,,first eval past epoch-1 boundary (step ~3335)
+3,13,6zpo7lih,3600,1.0797,eval_loss,0.4400,1.5527,,,plateau
+3,13,6zpo7lih,3800,1.1397,eval_loss,0.4393,1.5516,,,plateau
+3,13,6zpo7lih,3770,1.133,train_loss,0.3545,1.4255,0.5995,0.00008938,epoch-2 train drop (repeat-pass effect)
+3,13,6zpo7lih,3780,1.136,train_loss,0.3590,1.4319,0.5141,0.00008907,
+3,13,6zpo7lih,3790,1.139,train_loss,0.3323,1.3942,0.4881,0.00008876,last logged dict
+3,13,6zpo7lih,3801,1.14,session_stop,,,,,TimeLimitCallback 240min; checkpoint-3801 saved; total runtime 15209.1s (4h13m29s); 394 output files

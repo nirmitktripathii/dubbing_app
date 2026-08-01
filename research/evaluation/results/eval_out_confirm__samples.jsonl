@@ -1,0 +1,9 @@
+{"checkpoint": "checkpoint-2558", "language": "ml", "english": "“I learnt about cancer patients getting cured by following this method.", "requested_n": 78, "generated_n": 68, "generated": "ഇതു കണ്\u0caടുപിടിച്చതിനെ തുടർന്നാണ് കാൻസർ രോഗികളെ പൂർണമായും പുനരുദ്ധരിപ്പ്", "reference": "“എഴാഡ് സിടി പിന്തുടർന്ന് കാൻസർ രോഗികൾക്ക് സുഖം പ്രാപിക്കുന്നതിനെ കുറിച്ച് ഞാൻ മനസ്സിലാക്കി.", "chrf": 24.23758935627458}
+{"checkpoint": "checkpoint-2558", "language": "ml", "english": "To ensure women's safety, in all panchayats along with police, the services of 'nirbhaya' volunteers will also be utilised, he said.", "requested_n": 122, "generated_n": 72, "generated": "(truncated in eval log)", "reference": "കേരളത്തിൽ സ്ത്രീ സുരക്ഷ ഉറപ്പാക്കുന്നതിന്റെ ഭാഗമായി എല്ലാ പഞ്ചായത്തുകളിലും പോലീസിനൊപ്പം നിർഭയ വളണ്ടിയർമാരുടെ സേവനം ഉറപ്പാക്കും.", "chrf": 29.26156485133412}
+NOTE: Full 48-sample raw dump (8 samples x {ml,bn,gu} x {checkpoint-2558,checkpoint-3801}) with
+non-ASCII generated/reference text was captured in the session transcript from Kaggle notebook
+`notebookaeed9e9468` (scriptVersionId 336729124), output eval_out_confirm/samples.jsonl. This local
+copy holds 2 representative rows plus this note rather than the full transcript re-encode; the
+authoritative full file remains on Kaggle at that notebook's Output tab if re-download is needed.
+Qualitative synthesis of all 48 rows is in reports/final_eval_report_2026-07-19.md Addendum
+(2026-07-20) and ANALYSIS_02_llm_finetune.md F8.

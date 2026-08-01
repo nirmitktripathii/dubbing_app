@@ -1,0 +1,19 @@
+session,kaggle_version,wandb_run,step_approx,epoch,metric,value,perplexity,grad_norm,learning_rate,notes
+2,12,dvnoyzv5,1357,0.407,session_resume,,,,,resumed from checkpoint-1357; restore verified at t=44s and t=497s
+2,12,dvnoyzv5,1400,0.4199,eval_loss,0.4680,1.5968,,,eval_runtime=285.5s samples_per_s=5.78
+2,12,dvnoyzv5,1480,0.4439,train_loss,0.4378,1.5543,0.7948,0.0001605,
+2,12,dvnoyzv5,1490,0.4469,train_loss,0.4543,1.5751,0.5433,0.0001602,
+2,12,dvnoyzv5,1500,0.4499,train_loss,0.4662,1.5939,0.5942,0.0001599,
+2,12,dvnoyzv5,1600,0.4799,eval_loss,0.4626,1.5883,,,eval_runtime=285.4s
+2,12,dvnoyzv5,1740,0.5218,train_loss,0.4433,1.5578,0.4515,0.0001525,
+2,12,dvnoyzv5,1750,0.5248,train_loss,0.4642,1.5907,0.6460,0.0001521,
+2,12,dvnoyzv5,1760,0.5278,train_loss,0.4611,1.5858,0.4223,0.0001518,
+2,12,dvnoyzv5,1770,0.5308,train_loss,0.4415,1.5551,0.6737,0.0001515,
+2,12,n3q8p5le,1800,0.5398,eval_loss,0.4588,1.5822,,,eval_runtime=284.9s; filled 2026-07-18
+2,12,n3q8p5le,2000,0.5998,eval_loss,0.4599,1.5839,,,+0.0011 uptick vs 1800 (noise-level); filled 2026-07-18
+2,12,n3q8p5le,2200,0.6598,eval_loss,0.4525,1.5722,,,filled 2026-07-18
+2,12,n3q8p5le,2400,0.7198,eval_loss,0.4497,1.5678,,,last eval of session; filled 2026-07-18
+2,12,n3q8p5le,2530,0.7588,train_loss,0.4505,1.5691,0.6002,0.000128,filled 2026-07-18
+2,12,n3q8p5le,2540,0.7618,train_loss,0.4078,1.5035,0.7972,0.0001277,filled 2026-07-18
+2,12,n3q8p5le,2550,0.7648,train_loss,0.4290,1.5357,0.6278,0.0001274,last logged dict; filled 2026-07-18
+2,12,n3q8p5le,2558,0.767,session_stop,,,,,TimeLimitCallback 240min; checkpoint-2558 saved; grad_norm session range 0.404-1.091
