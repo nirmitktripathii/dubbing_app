@@ -238,7 +238,9 @@ def isochrony_score(
     The score is based on how close the target phoneme count (adjusted by the
     language expansion ratio) is to the source phoneme count.
 
-    A score ≥ 0.85 is considered acceptable for dubbing.
+    The acceptance threshold actually applied by the pipeline is
+    ``isochrony_translation.MINIMUM_ACCEPTABLE_SCORE`` (currently 0.75); a
+    candidate scoring below it triggers budget-tightening and regeneration.
     A score ≥ 0.95 is excellent.
 
     Args:
