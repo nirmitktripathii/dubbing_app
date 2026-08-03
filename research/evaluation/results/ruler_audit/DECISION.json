@@ -1,0 +1,32 @@
+{
+  "verdict": "RETRAIN",
+  "corpus_ruler_before": "chars:non-space",
+  "scoring_ruler": "phonemes:espeak-ng-1.50",
+  "phonemes_per_char": {
+    "as": 1.1162,
+    "bn": 1.0283,
+    "gu": 1.0428,
+    "hi": 0.9965,
+    "kn": 1.058,
+    "ml": 0.9375,
+    "mr": 0.9899,
+    "or": 1.1715,
+    "pa": 1.0391,
+    "ta": 0.9576,
+    "te": 1.0176
+  },
+  "per_language_cv": {
+    "as": 0.1914,
+    "bn": 0.1764,
+    "gu": 0.0872,
+    "hi": 0.0811,
+    "kn": 0.0983,
+    "ml": 0.1297,
+    "mr": 0.0764,
+    "or": 0.2717,
+    "pa": 0.0939,
+    "ta": 0.1111,
+    "te": 0.1189
+  },
+  "next_step": "Retrain from data/train.phonemes.jsonl. Fresh run, not a resume \u2014 the old checkpoints were conditioned on a different unit."
+}

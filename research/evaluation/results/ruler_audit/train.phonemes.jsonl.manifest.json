@@ -1,0 +1,136 @@
+{
+  "tool": "tools/relabel_dataset.py",
+  "generated_utc": "2026-08-03T16:35:32.365743+00:00",
+  "input": "/kaggle/input/notebooks/nktthegreat/01-wiring-and-dataset/data/translation_dataset/train.jsonl",
+  "output": "/kaggle/working/data/train.phonemes.jsonl",
+  "ruler": "phonemes:espeak-ng-1.50",
+  "espeak_version": "1.50",
+  "rows_in": 53350,
+  "rows_out": 53349,
+  "rows_dropped": 1,
+  "min_length_change": 0.1,
+  "keep_failed_augmentation": false,
+  "per_language": {
+    "as": {
+      "n": 4839,
+      "n_augmented": 0,
+      "labels_changed": 4295,
+      "labels_changed_frac": 0.8876,
+      "mean_label_before": 34.99,
+      "mean_label_after": 38.9,
+      "mean_shift_pct": 11.17,
+      "augmentation_failed_revalidation": 0,
+      "augmentation_source_unresolved": 0
+    },
+    "bn": {
+      "n": 4855,
+      "n_augmented": 0,
+      "labels_changed": 4048,
+      "labels_changed_frac": 0.8338,
+      "mean_label_before": 33.76,
+      "mean_label_after": 34.95,
+      "mean_shift_pct": 3.54,
+      "augmentation_failed_revalidation": 0,
+      "augmentation_source_unresolved": 0
+    },
+    "gu": {
+      "n": 4855,
+      "n_augmented": 0,
+      "labels_changed": 4159,
+      "labels_changed_frac": 0.8566,
+      "mean_label_before": 40.1,
+      "mean_label_after": 41.94,
+      "mean_shift_pct": 4.59,
+      "augmentation_failed_revalidation": 0,
+      "augmentation_source_unresolved": 0
+    },
+    "hi": {
+      "n": 4869,
+      "n_augmented": 0,
+      "labels_changed": 4168,
+      "labels_changed_frac": 0.856,
+      "mean_label_before": 52.19,
+      "mean_label_after": 52.06,
+      "mean_shift_pct": -0.24,
+      "augmentation_failed_revalidation": 0,
+      "augmentation_source_unresolved": 0
+    },
+    "kn": {
+      "n": 4839,
+      "n_augmented": 0,
+      "labels_changed": 4370,
+      "labels_changed_frac": 0.9031,
+      "mean_label_before": 49.35,
+      "mean_label_after": 52.27,
+      "mean_shift_pct": 5.93,
+      "augmentation_failed_revalidation": 0,
+      "augmentation_source_unresolved": 0
+    },
+    "ml": {
+      "n": 4851,
+      "n_augmented": 0,
+      "labels_changed": 4548,
+      "labels_changed_frac": 0.9375,
+      "mean_label_before": 56.35,
+      "mean_label_after": 52.91,
+      "mean_shift_pct": -6.11,
+      "augmentation_failed_revalidation": 0,
+      "augmentation_source_unresolved": 0
+    },
+    "mr": {
+      "n": 4836,
+      "n_augmented": 0,
+      "labels_changed": 4079,
+      "labels_changed_frac": 0.8435,
+      "mean_label_before": 45.02,
+      "mean_label_after": 44.73,
+      "mean_shift_pct": -0.65,
+      "augmentation_failed_revalidation": 0,
+      "augmentation_source_unresolved": 0
+    },
+    "or": {
+      "n": 4839,
+      "n_augmented": 0,
+      "labels_changed": 4309,
+      "labels_changed_frac": 0.8905,
+      "mean_label_before": 39.26,
+      "mean_label_after": 45.07,
+      "mean_shift_pct": 14.8,
+      "augmentation_failed_revalidation": 0,
+      "augmentation_source_unresolved": 0
+    },
+    "pa": {
+      "n": 4875,
+      "n_augmented": 0,
+      "labels_changed": 4196,
+      "labels_changed_frac": 0.8607,
+      "mean_label_before": 46.11,
+      "mean_label_after": 47.64,
+      "mean_shift_pct": 3.33,
+      "augmentation_failed_revalidation": 0,
+      "augmentation_source_unresolved": 0
+    },
+    "ta": {
+      "n": 4836,
+      "n_augmented": 0,
+      "labels_changed": 4436,
+      "labels_changed_frac": 0.9173,
+      "mean_label_before": 50.76,
+      "mean_label_after": 48.27,
+      "mean_shift_pct": -4.91,
+      "augmentation_failed_revalidation": 0,
+      "augmentation_source_unresolved": 0
+    },
+    "te": {
+      "n": 4855,
+      "n_augmented": 0,
+      "labels_changed": 4253,
+      "labels_changed_frac": 0.876,
+      "mean_label_before": 46.65,
+      "mean_label_after": 47.76,
+      "mean_shift_pct": 2.36,
+      "augmentation_failed_revalidation": 0,
+      "augmentation_source_unresolved": 0
+    }
+  }
+}

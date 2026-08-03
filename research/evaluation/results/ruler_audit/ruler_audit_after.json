@@ -1,0 +1,2176 @@
+[
+  {
+    "file": "/kaggle/working/data/train.phonemes.jsonl",
+    "n_rows": 53349,
+    "scoring_ruler": "phonemes:espeak-ng-1.50",
+    "corpus_ruler": "phonemes:espeak-ng",
+    "corpus_verdict": "RETRAIN",
+    "per_language": {
+      "as": {
+        "n": 4839,
+        "n_augmented": 0,
+        "ruler": "phonemes:espeak-ng",
+        "inventory_size": 84,
+        "inventory_top20": [
+          [
+            "ɔ",
+            22679
+          ],
+          [
+            "a",
+            17207
+          ],
+          [
+            "i",
+            15425
+          ],
+          [
+            "ɾ",
+            14142
+          ],
+          [
+            "o",
+            13653
+          ],
+          [
+            "n",
+            10518
+          ],
+          [
+            "k",
+            10472
+          ],
+          [
+            "t",
+            9992
+          ],
+          [
+            "e",
+            9014
+          ],
+          [
+            "u",
+            6384
+          ],
+          [
+            "b",
+            5261
+          ],
+          [
+            "l",
+            5189
+          ],
+          [
+            "h",
+            4341
+          ],
+          [
+            "p",
+            4109
+          ],
+          [
+            "m",
+            3928
+          ],
+          [
+            "χ",
+            3692
+          ],
+          [
+            "ʃ",
+            3417
+          ],
+          [
+            "j",
+            3244
+          ],
+          [
+            "w",
+            2425
+          ],
+          [
+            "d",
+            2205
+          ]
+        ],
+        "inventory_leaks": [],
+        "frac_label_eq_chars": 0.1124,
+        "frac_label_eq_phonemes": 1.0,
+        "phonemes_per_char_mean": 1.105,
+        "phonemes_per_char_sd": 0.2115,
+        "phonemes_per_char_cv": 0.1914,
+        "ols_k_through_origin": 1.1162,
+        "ols_r2": 0.8892,
+        "label_rel_error_vs_true_phonemes_mean": 0.0,
+        "verdict": "RETRAIN"
+      },
+      "bn": {
+        "n": 4855,
+        "n_augmented": 0,
+        "ruler": "phonemes:espeak-ng",
+        "inventory_size": 83,
+        "inventory_top20": [
+          [
+            "ɔ",
+            19992
+          ],
+          [
+            "a",
+            17739
+          ],
+          [
+            "e",
+            15877
+          ],
+          [
+            "i",
+            13209
+          ],
+          [
+            "ɾ",
+            12079
+          ],
+          [
+            "n",
+            10171
+          ],
+          [
+            "k",
+            7730
+          ],
+          [
+            "t",
+            6972
+          ],
+          [
+            "o",
+            6938
+          ],
+          [
+            "ʃ",
+            6562
+          ],
+          [
+            "b",
+            6037
+          ],
+          [
+            "m",
+            4721
+          ],
+          [
+            "l",
+            4200
+          ],
+          [
+            "u",
+            4173
+          ],
+          [
+            "p",
+            3571
+          ],
+          [
+            "d",
+            2943
+          ],
+          [
+            "h",
+            2470
+          ],
+          [
+            "ʈ",
+            2341
+          ],
+          [
+            "tʃʰ",
+            2241
+          ],
+          [
+            "kʰ",
+            1861
+          ]
+        ],
+        "inventory_leaks": [],
+        "frac_label_eq_chars": 0.1662,
+        "frac_label_eq_phonemes": 1.0,
+        "phonemes_per_char_mean": 1.0389,
+        "phonemes_per_char_sd": 0.1833,
+        "phonemes_per_char_cv": 0.1764,
+        "ols_k_through_origin": 1.0283,
+        "ols_r2": 0.9522,
+        "label_rel_error_vs_true_phonemes_mean": 0.0,
+        "verdict": "RETRAIN"
+      },
+      "gu": {
+        "n": 4855,
+        "n_augmented": 0,
+        "ruler": "phonemes:espeak-ng",
+        "inventory_size": 104,
+        "inventory_top20": [
+          [
+            "aː",
+            18151
+          ],
+          [
+            "ʌ",
+            17199
+          ],
+          [
+            "eː",
+            15476
+          ],
+          [
+            "ə",
+            12588
+          ],
+          [
+            "n",
+            11697
+          ],
+          [
+            "ɾ",
+            11552
+          ],
+          [
+            "m",
+            8111
+          ],
+          [
+            "t",
+            7650
+          ],
+          [
+            "k",
+            7204
+          ],
+          [
+            "i",
+            7092
+          ],
+          [
+            "oː",
+            6981
+          ],
+          [
+            "s",
+            5737
+          ],
+          [
+            "p",
+            5514
+          ],
+          [
+            "ʋ",
+            4660
+          ],
+          [
+            "ɪ",
+            4534
+          ],
+          [
+            "j",
+            4388
+          ],
+          [
+            "l",
+            3772
+          ],
+          [
+            "h",
+            3562
+          ],
+          [
+            "ɟ",
+            3084
+          ],
+          [
+            "cʰ",
+            3013
+          ]
+        ],
+        "inventory_leaks": [],
+        "frac_label_eq_chars": 0.1434,
+        "frac_label_eq_phonemes": 1.0,
+        "phonemes_per_char_mean": 1.0472,
+        "phonemes_per_char_sd": 0.0913,
+        "phonemes_per_char_cv": 0.0872,
+        "ols_k_through_origin": 1.0428,
+        "ols_r2": 0.9854,
+        "label_rel_error_vs_true_phonemes_mean": 0.0,
+        "verdict": "RESCALE_THEN_MEASURE"
+      },
+      "hi": {
+        "n": 4869,
+        "n_augmented": 0,
+        "ruler": "phonemes:espeak-ng",
+        "inventory_size": 107,
+        "inventory_top20": [
+          [
+            "aː",
+            21545
+          ],
+          [
+            "k",
+            16906
+          ],
+          [
+            "ɾ",
+            15555
+          ],
+          [
+            "eː",
+            15065
+          ],
+          [
+            "ə",
+            13901
+          ],
+          [
+            "ʌ",
+            12535
+          ],
+          [
+            "ɪ",
+            11607
+          ],
+          [
+            "n",
+            11220
+          ],
+          [
+            "s",
+            10975
+          ],
+          [
+            "h",
+            10706
+          ],
+          [
+            "i",
+            9021
+          ],
+          [
+            "m",
+            8976
+          ],
+          [
+            "l",
+            7310
+          ],
+          [
+            "t",
+            7052
+          ],
+          [
+            "p",
+            6148
+          ],
+          [
+            "j",
+            6094
+          ],
+          [
+            "oː",
+            5035
+          ],
+          [
+            "d",
+            4523
+          ],
+          [
+            "ʊ",
+            4466
+          ],
+          [
+            "ʋ",
+            4103
+          ]
+        ],
+        "inventory_leaks": [],
+        "frac_label_eq_chars": 0.144,
+        "frac_label_eq_phonemes": 1.0,
+        "phonemes_per_char_mean": 0.9973,
+        "phonemes_per_char_sd": 0.0808,
+        "phonemes_per_char_cv": 0.0811,
+        "ols_k_through_origin": 0.9965,
+        "ols_r2": 0.9882,
+        "label_rel_error_vs_true_phonemes_mean": 0.0,
+        "verdict": "RESCALE_THEN_MEASURE"
+      },
+      "kn": {
+        "n": 4839,
+        "n_augmented": 0,
+        "ruler": "phonemes:espeak-ng",
+        "inventory_size": 73,
+        "inventory_top20": [
+          [
+            "ɐ",
+            44980
+          ],
+          [
+            "i",
+            19518
+          ],
+          [
+            "u",
+            14188
+          ],
+          [
+            "n",
+            13732
+          ],
+          [
+            "aː",
+            13564
+          ],
+          [
+            "d",
+            12726
+          ],
+          [
+            "ɹ",
+            12352
+          ],
+          [
+            "e",
+            11836
+          ],
+          [
+            "t",
+            9903
+          ],
+          [
+            "l",
+            9024
+          ],
+          [
+            "ɡ",
+            7943
+          ],
+          [
+            "k",
+            7918
+          ],
+          [
+            "v",
+            7714
+          ],
+          [
+            "s",
+            7354
+          ],
+          [
+            "m",
+            7039
+          ],
+          [
+            "j",
+            6075
+          ],
+          [
+            "ɭ",
+            3767
+          ],
+          [
+            "p",
+            3658
+          ],
+          [
+            "ɖ",
+            3350
+          ],
+          [
+            "eː",
+            3326
+          ]
+        ],
+        "inventory_leaks": [],
+        "frac_label_eq_chars": 0.0969,
+        "frac_label_eq_phonemes": 1.0,
+        "phonemes_per_char_mean": 1.0597,
+        "phonemes_per_char_sd": 0.1042,
+        "phonemes_per_char_cv": 0.0983,
+        "ols_k_through_origin": 1.058,
+        "ols_r2": 0.9764,
+        "label_rel_error_vs_true_phonemes_mean": 0.0,
+        "verdict": "RESCALE_THEN_MEASURE"
+      },
+      "ml": {
+        "n": 4851,
+        "n_augmented": 0,
+        "ruler": "phonemes:espeak-ng",
+        "inventory_size": 74,
+        "inventory_top20": [
+          [
+            "ɐ",
+            21203
+          ],
+          [
+            "i",
+            20057
+          ],
+          [
+            "ə",
+            17852
+          ],
+          [
+            "n",
+            17216
+          ],
+          [
+            "u",
+            14166
+          ],
+          [
+            "m",
+            12468
+          ],
+          [
+            "aː",
+            12460
+          ],
+          [
+            "ɾ",
+            11555
+          ],
+          [
+            "j",
+            9595
+          ],
+          [
+            "l",
+            8359
+          ],
+          [
+            "e",
+            7877
+          ],
+          [
+            "d",
+            7083
+          ],
+          [
+            "v",
+            6364
+          ],
+          [
+            "ɨ",
+            5516
+          ],
+          [
+            "ɡ",
+            5061
+          ],
+          [
+            "s",
+            4987
+          ],
+          [
+            "ɖ",
+            4700
+          ],
+          [
+            "ɳ",
+            4627
+          ],
+          [
+            "ɭ",
+            4446
+          ],
+          [
+            "c",
+            4244
+          ]
+        ],
+        "inventory_leaks": [],
+        "frac_label_eq_chars": 0.0625,
+        "frac_label_eq_phonemes": 1.0,
+        "phonemes_per_char_mean": 0.9411,
+        "phonemes_per_char_sd": 0.1221,
+        "phonemes_per_char_cv": 0.1297,
+        "ols_k_through_origin": 0.9375,
+        "ols_r2": 0.9564,
+        "label_rel_error_vs_true_phonemes_mean": 0.0,
+        "verdict": "RESCALE_THEN_MEASURE"
+      },
+      "mr": {
+        "n": 4836,
+        "n_augmented": 0,
+        "ruler": "phonemes:espeak-ng",
+        "inventory_size": 99,
+        "inventory_top20": [
+          [
+            "aː",
+            28272
+          ],
+          [
+            "ə",
+            14863
+          ],
+          [
+            "eː",
+            11597
+          ],
+          [
+            "ɾ",
+            10757
+          ],
+          [
+            "t",
+            10199
+          ],
+          [
+            "j",
+            9362
+          ],
+          [
+            "n",
+            8562
+          ],
+          [
+            "ʌ",
+            8252
+          ],
+          [
+            "k",
+            8160
+          ],
+          [
+            "l",
+            7507
+          ],
+          [
+            "i",
+            7351
+          ],
+          [
+            "h",
+            7194
+          ],
+          [
+            "s",
+            6869
+          ],
+          [
+            "ɪ",
+            6410
+          ],
+          [
+            "m",
+            6060
+          ],
+          [
+            "v",
+            5943
+          ],
+          [
+            "p",
+            5172
+          ],
+          [
+            "ɳ",
+            4554
+          ],
+          [
+            "c",
+            3923
+          ],
+          [
+            "oː",
+            3747
+          ]
+        ],
+        "inventory_leaks": [],
+        "frac_label_eq_chars": 0.1565,
+        "frac_label_eq_phonemes": 1.0,
+        "phonemes_per_char_mean": 0.9971,
+        "phonemes_per_char_sd": 0.0762,
+        "phonemes_per_char_cv": 0.0764,
+        "ols_k_through_origin": 0.9899,
+        "ols_r2": 0.9881,
+        "label_rel_error_vs_true_phonemes_mean": 0.0,
+        "verdict": "SALVAGE"
+      },
+      "or": {
+        "n": 4839,
+        "n_augmented": 0,
+        "ruler": "phonemes:espeak-ng",
+        "inventory_size": 78,
+        "inventory_top20": [
+          [
+            "ɔ",
+            37328
+          ],
+          [
+            "a",
+            19577
+          ],
+          [
+            "i",
+            19552
+          ],
+          [
+            "ɾ",
+            14385
+          ],
+          [
+            "e",
+            13400
+          ],
+          [
+            "n",
+            11044
+          ],
+          [
+            "k",
+            10559
+          ],
+          [
+            "t",
+            9133
+          ],
+          [
+            "s",
+            8528
+          ],
+          [
+            "u",
+            7761
+          ],
+          [
+            "b",
+            7162
+          ],
+          [
+            "h",
+            6623
+          ],
+          [
+            "m",
+            5577
+          ],
+          [
+            "p",
+            4913
+          ],
+          [
+            "l",
+            4742
+          ],
+          [
+            "o",
+            3483
+          ],
+          [
+            "d",
+            3068
+          ],
+          [
+            "j",
+            2959
+          ],
+          [
+            "tʰ",
+            2458
+          ],
+          [
+            "ʈ",
+            2131
+          ]
+        ],
+        "inventory_leaks": [],
+        "frac_label_eq_chars": 0.1095,
+        "frac_label_eq_phonemes": 1.0,
+        "phonemes_per_char_mean": 1.1281,
+        "phonemes_per_char_sd": 0.3065,
+        "phonemes_per_char_cv": 0.2717,
+        "ols_k_through_origin": 1.1715,
+        "ols_r2": 0.841,
+        "label_rel_error_vs_true_phonemes_mean": 0.0,
+        "verdict": "RETRAIN"
+      },
+      "pa": {
+        "n": 4875,
+        "n_augmented": 0,
+        "ruler": "phonemes:espeak-ng",
+        "inventory_size": 119,
+        "inventory_top20": [
+          [
+            "ə",
+            21423
+          ],
+          [
+            "a",
+            18228
+          ],
+          [
+            "ɾ",
+            12710
+          ],
+          [
+            "i",
+            12302
+          ],
+          [
+            "ɪ",
+            11944
+          ],
+          [
+            "ʌ",
+            11846
+          ],
+          [
+            "h",
+            11055
+          ],
+          [
+            "n",
+            10942
+          ],
+          [
+            "k",
+            9934
+          ],
+          [
+            "e",
+            9612
+          ],
+          [
+            "s",
+            9549
+          ],
+          [
+            "d",
+            8390
+          ],
+          [
+            "t",
+            7872
+          ],
+          [
+            "l",
+            6966
+          ],
+          [
+            "v",
+            5622
+          ],
+          [
+            "m",
+            5259
+          ],
+          [
+            "p",
+            5094
+          ],
+          [
+            "ʊ",
+            4728
+          ],
+          [
+            "ã",
+            3976
+          ],
+          [
+            "o",
+            3750
+          ]
+        ],
+        "inventory_leaks": [],
+        "frac_label_eq_chars": 0.1393,
+        "frac_label_eq_phonemes": 1.0,
+        "phonemes_per_char_mean": 1.0258,
+        "phonemes_per_char_sd": 0.0963,
+        "phonemes_per_char_cv": 0.0939,
+        "ols_k_through_origin": 1.0391,
+        "ols_r2": 0.989,
+        "label_rel_error_vs_true_phonemes_mean": 0.0,
+        "verdict": "RESCALE_THEN_MEASURE"
+      },
+      "ta": {
+        "n": 4836,
+        "n_augmented": 0,
+        "ruler": "phonemes:espeak-ng",
+        "inventory_size": 65,
+        "inventory_top20": [
+          [
+            "ʌ",
+            32188
+          ],
+          [
+            "i",
+            17453
+          ],
+          [
+            "ʉ",
+            16639
+          ],
+          [
+            "n",
+            13206
+          ],
+          [
+            "k",
+            10822
+          ],
+          [
+            "m",
+            10593
+          ],
+          [
+            "aː",
+            10580
+          ],
+          [
+            "d",
+            8752
+          ],
+          [
+            "p",
+            8472
+          ],
+          [
+            "r",
+            8376
+          ],
+          [
+            "v",
+            8277
+          ],
+          [
+            "t",
+            7848
+          ],
+          [
+            "l",
+            7834
+          ],
+          [
+            "ɡ",
+            6808
+          ],
+          [
+            "ɹ",
+            6254
+          ],
+          [
+            "aɪ",
+            5895
+          ],
+          [
+            "j",
+            5636
+          ],
+          [
+            "ɭ",
+            5616
+          ],
+          [
+            "ɖ",
+            5259
+          ],
+          [
+            "ʈ",
+            4196
+          ]
+        ],
+        "inventory_leaks": [],
+        "frac_label_eq_chars": 0.0827,
+        "frac_label_eq_phonemes": 1.0,
+        "phonemes_per_char_mean": 0.9453,
+        "phonemes_per_char_sd": 0.105,
+        "phonemes_per_char_cv": 0.1111,
+        "ols_k_through_origin": 0.9576,
+        "ols_r2": 0.9799,
+        "label_rel_error_vs_true_phonemes_mean": 0.0,
+        "verdict": "RESCALE_THEN_MEASURE"
+      },
+      "te": {
+        "n": 4855,
+        "n_augmented": 0,
+        "ruler": "phonemes:espeak-ng",
+        "inventory_size": 72,
+        "inventory_top20": [
+          [
+            "a",
+            32016
+          ],
+          [
+            "n",
+            23759
+          ],
+          [
+            "i",
+            18285
+          ],
+          [
+            "aː",
+            16211
+          ],
+          [
+            "u",
+            15596
+          ],
+          [
+            "r",
+            12487
+          ],
+          [
+            "l",
+            9747
+          ],
+          [
+            "k",
+            9484
+          ],
+          [
+            "t",
+            7252
+          ],
+          [
+            "d",
+            6923
+          ],
+          [
+            "p",
+            6353
+          ],
+          [
+            "s",
+            6019
+          ],
+          [
+            "m",
+            5870
+          ],
+          [
+            "ʋ",
+            5683
+          ],
+          [
+            "j",
+            5109
+          ],
+          [
+            "eː",
+            5087
+          ],
+          [
+            "oː",
+            4693
+          ],
+          [
+            "ʈ",
+            4575
+          ],
+          [
+            "c",
+            4542
+          ],
+          [
+            "iː",
+            4290
+          ]
+        ],
+        "inventory_leaks": [],
+        "frac_label_eq_chars": 0.124,
+        "frac_label_eq_phonemes": 1.0,
+        "phonemes_per_char_mean": 1.0275,
+        "phonemes_per_char_sd": 0.1221,
+        "phonemes_per_char_cv": 0.1189,
+        "ols_k_through_origin": 1.0176,
+        "ols_r2": 0.9611,
+        "label_rel_error_vs_true_phonemes_mean": 0.0,
+        "verdict": "RESCALE_THEN_MEASURE"
+      }
+    }
+  },
+  {
+    "file": "/kaggle/working/data/val.phonemes.jsonl",
+    "n_rows": 1650,
+    "scoring_ruler": "phonemes:espeak-ng-1.50",
+    "corpus_ruler": "phonemes:espeak-ng",
+    "corpus_verdict": "RETRAIN",
+    "per_language": {
+      "as": {
+        "n": 161,
+        "n_augmented": 0,
+        "ruler": "phonemes:espeak-ng",
+        "inventory_size": 56,
+        "inventory_top20": [
+          [
+            "ɔ",
+            776
+          ],
+          [
+            "a",
+            575
+          ],
+          [
+            "i",
+            493
+          ],
+          [
+            "ɾ",
+            476
+          ],
+          [
+            "o",
+            430
+          ],
+          [
+            "k",
+            352
+          ],
+          [
+            "n",
+            332
+          ],
+          [
+            "t",
+            302
+          ],
+          [
+            "e",
+            292
+          ],
+          [
+            "u",
+            209
+          ],
+          [
+            "b",
+            171
+          ],
+          [
+            "l",
+            162
+          ],
+          [
+            "h",
+            162
+          ],
+          [
+            "p",
+            151
+          ],
+          [
+            "m",
+            132
+          ],
+          [
+            "ʃ",
+            113
+          ],
+          [
+            "χ",
+            108
+          ],
+          [
+            "j",
+            104
+          ],
+          [
+            "w",
+            91
+          ],
+          [
+            "d",
+            71
+          ]
+        ],
+        "inventory_leaks": [],
+        "frac_label_eq_chars": 0.0994,
+        "frac_label_eq_phonemes": 1.0,
+        "phonemes_per_char_mean": 1.0861,
+        "phonemes_per_char_sd": 0.1633,
+        "phonemes_per_char_cv": 0.1503,
+        "ols_k_through_origin": 1.1183,
+        "ols_r2": 0.903,
+        "label_rel_error_vs_true_phonemes_mean": 0.0,
+        "verdict": "RETRAIN"
+      },
+      "bn": {
+        "n": 145,
+        "n_augmented": 0,
+        "ruler": "phonemes:espeak-ng",
+        "inventory_size": 54,
+        "inventory_top20": [
+          [
+            "ɔ",
+            578
+          ],
+          [
+            "a",
+            517
+          ],
+          [
+            "e",
+            475
+          ],
+          [
+            "i",
+            399
+          ],
+          [
+            "ɾ",
+            370
+          ],
+          [
+            "n",
+            299
+          ],
+          [
+            "o",
+            239
+          ],
+          [
+            "k",
+            232
+          ],
+          [
+            "t",
+            201
+          ],
+          [
+            "ʃ",
+            197
+          ],
+          [
+            "b",
+            173
+          ],
+          [
+            "m",
+            158
+          ],
+          [
+            "l",
+            133
+          ],
+          [
+            "u",
+            129
+          ],
+          [
+            "p",
+            120
+          ],
+          [
+            "ʈ",
+            90
+          ],
+          [
+            "d",
+            86
+          ],
+          [
+            "tʃʰ",
+            69
+          ],
+          [
+            "ɟ",
+            62
+          ],
+          [
+            "ɡ",
+            60
+          ]
+        ],
+        "inventory_leaks": [],
+        "frac_label_eq_chars": 0.1655,
+        "frac_label_eq_phonemes": 1.0,
+        "phonemes_per_char_mean": 1.0262,
+        "phonemes_per_char_sd": 0.1587,
+        "phonemes_per_char_cv": 0.1547,
+        "ols_k_through_origin": 1.035,
+        "ols_r2": 0.9566,
+        "label_rel_error_vs_true_phonemes_mean": 0.0,
+        "verdict": "RETRAIN"
+      },
+      "gu": {
+        "n": 145,
+        "n_augmented": 0,
+        "ruler": "phonemes:espeak-ng",
+        "inventory_size": 69,
+        "inventory_top20": [
+          [
+            "aː",
+            492
+          ],
+          [
+            "ʌ",
+            474
+          ],
+          [
+            "eː",
+            421
+          ],
+          [
+            "ɾ",
+            326
+          ],
+          [
+            "n",
+            320
+          ],
+          [
+            "ə",
+            309
+          ],
+          [
+            "m",
+            219
+          ],
+          [
+            "i",
+            208
+          ],
+          [
+            "k",
+            205
+          ],
+          [
+            "t",
+            200
+          ],
+          [
+            "oː",
+            196
+          ],
+          [
+            "s",
+            176
+          ],
+          [
+            "p",
+            131
+          ],
+          [
+            "ʋ",
+            124
+          ],
+          [
+            "j",
+            110
+          ],
+          [
+            "l",
+            104
+          ],
+          [
+            "ɪ",
+            103
+          ],
+          [
+            "cʰ",
+            95
+          ],
+          [
+            "ɟ",
+            93
+          ],
+          [
+            "h",
+            92
+          ]
+        ],
+        "inventory_leaks": [],
+        "frac_label_eq_chars": 0.131,
+        "frac_label_eq_phonemes": 1.0,
+        "phonemes_per_char_mean": 1.0509,
+        "phonemes_per_char_sd": 0.1089,
+        "phonemes_per_char_cv": 0.1036,
+        "ols_k_through_origin": 1.0505,
+        "ols_r2": 0.9757,
+        "label_rel_error_vs_true_phonemes_mean": 0.0,
+        "verdict": "RESCALE_THEN_MEASURE"
+      },
+      "hi": {
+        "n": 131,
+        "n_augmented": 0,
+        "ruler": "phonemes:espeak-ng",
+        "inventory_size": 78,
+        "inventory_top20": [
+          [
+            "aː",
+            643
+          ],
+          [
+            "k",
+            492
+          ],
+          [
+            "eː",
+            437
+          ],
+          [
+            "ɾ",
+            437
+          ],
+          [
+            "ə",
+            403
+          ],
+          [
+            "ɪ",
+            362
+          ],
+          [
+            "ʌ",
+            332
+          ],
+          [
+            "s",
+            309
+          ],
+          [
+            "n",
+            297
+          ],
+          [
+            "h",
+            290
+          ],
+          [
+            "l",
+            242
+          ],
+          [
+            "m",
+            242
+          ],
+          [
+            "t",
+            221
+          ],
+          [
+            "i",
+            204
+          ],
+          [
+            "j",
+            175
+          ],
+          [
+            "p",
+            149
+          ],
+          [
+            "d",
+            138
+          ],
+          [
+            "oː",
+            135
+          ],
+          [
+            "ɟ",
+            121
+          ],
+          [
+            "ʊ",
+            117
+          ]
+        ],
+        "inventory_leaks": [],
+        "frac_label_eq_chars": 0.1908,
+        "frac_label_eq_phonemes": 1.0,
+        "phonemes_per_char_mean": 0.9991,
+        "phonemes_per_char_sd": 0.0945,
+        "phonemes_per_char_cv": 0.0946,
+        "ols_k_through_origin": 0.9841,
+        "ols_r2": 0.985,
+        "label_rel_error_vs_true_phonemes_mean": 0.0,
+        "verdict": "RESCALE_THEN_MEASURE"
+      },
+      "kn": {
+        "n": 161,
+        "n_augmented": 0,
+        "ruler": "phonemes:espeak-ng",
+        "inventory_size": 53,
+        "inventory_top20": [
+          [
+            "ɐ",
+            1532
+          ],
+          [
+            "i",
+            706
+          ],
+          [
+            "u",
+            570
+          ],
+          [
+            "aː",
+            492
+          ],
+          [
+            "n",
+            490
+          ],
+          [
+            "ɹ",
+            470
+          ],
+          [
+            "d",
+            446
+          ],
+          [
+            "e",
+            400
+          ],
+          [
+            "t",
+            334
+          ],
+          [
+            "m",
+            290
+          ],
+          [
+            "l",
+            290
+          ],
+          [
+            "s",
+            286
+          ],
+          [
+            "v",
+            282
+          ],
+          [
+            "ɡ",
+            279
+          ],
+          [
+            "k",
+            273
+          ],
+          [
+            "j",
+            203
+          ],
+          [
+            "p",
+            149
+          ],
+          [
+            "ɭ",
+            129
+          ],
+          [
+            "ɖ",
+            126
+          ],
+          [
+            "h",
+            125
+          ]
+        ],
+        "inventory_leaks": [],
+        "frac_label_eq_chars": 0.0932,
+        "frac_label_eq_phonemes": 1.0,
+        "phonemes_per_char_mean": 1.0548,
+        "phonemes_per_char_sd": 0.0859,
+        "phonemes_per_char_cv": 0.0814,
+        "ols_k_through_origin": 1.0607,
+        "ols_r2": 0.9811,
+        "label_rel_error_vs_true_phonemes_mean": 0.0,
+        "verdict": "RESCALE_THEN_MEASURE"
+      },
+      "ml": {
+        "n": 149,
+        "n_augmented": 0,
+        "ruler": "phonemes:espeak-ng",
+        "inventory_size": 54,
+        "inventory_top20": [
+          [
+            "ɐ",
+            729
+          ],
+          [
+            "i",
+            679
+          ],
+          [
+            "ə",
+            573
+          ],
+          [
+            "n",
+            560
+          ],
+          [
+            "u",
+            463
+          ],
+          [
+            "aː",
+            419
+          ],
+          [
+            "m",
+            397
+          ],
+          [
+            "ɾ",
+            390
+          ],
+          [
+            "j",
+            324
+          ],
+          [
+            "e",
+            254
+          ],
+          [
+            "l",
+            247
+          ],
+          [
+            "d",
+            221
+          ],
+          [
+            "ɡ",
+            200
+          ],
+          [
+            "v",
+            196
+          ],
+          [
+            "ɨ",
+            172
+          ],
+          [
+            "s",
+            165
+          ],
+          [
+            "ɳ",
+            159
+          ],
+          [
+            "p",
+            144
+          ],
+          [
+            "ɖ",
+            143
+          ],
+          [
+            "c",
+            142
+          ]
+        ],
+        "inventory_leaks": [],
+        "frac_label_eq_chars": 0.0403,
+        "frac_label_eq_phonemes": 1.0,
+        "phonemes_per_char_mean": 0.9566,
+        "phonemes_per_char_sd": 0.1145,
+        "phonemes_per_char_cv": 0.1197,
+        "ols_k_through_origin": 0.9473,
+        "ols_r2": 0.9673,
+        "label_rel_error_vs_true_phonemes_mean": 0.0,
+        "verdict": "RESCALE_THEN_MEASURE"
+      },
+      "mr": {
+        "n": 164,
+        "n_augmented": 0,
+        "ruler": "phonemes:espeak-ng",
+        "inventory_size": 67,
+        "inventory_top20": [
+          [
+            "aː",
+            910
+          ],
+          [
+            "ə",
+            518
+          ],
+          [
+            "ɾ",
+            377
+          ],
+          [
+            "eː",
+            372
+          ],
+          [
+            "t",
+            339
+          ],
+          [
+            "j",
+            281
+          ],
+          [
+            "i",
+            272
+          ],
+          [
+            "k",
+            270
+          ],
+          [
+            "n",
+            264
+          ],
+          [
+            "ʌ",
+            255
+          ],
+          [
+            "l",
+            252
+          ],
+          [
+            "h",
+            233
+          ],
+          [
+            "s",
+            216
+          ],
+          [
+            "m",
+            206
+          ],
+          [
+            "v",
+            205
+          ],
+          [
+            "ɪ",
+            190
+          ],
+          [
+            "p",
+            183
+          ],
+          [
+            "ɳ",
+            137
+          ],
+          [
+            "c",
+            130
+          ],
+          [
+            "ʊ",
+            125
+          ]
+        ],
+        "inventory_leaks": [],
+        "frac_label_eq_chars": 0.2073,
+        "frac_label_eq_phonemes": 1.0,
+        "phonemes_per_char_mean": 0.9974,
+        "phonemes_per_char_sd": 0.0694,
+        "phonemes_per_char_cv": 0.0696,
+        "ols_k_through_origin": 0.9954,
+        "ols_r2": 0.9926,
+        "label_rel_error_vs_true_phonemes_mean": 0.0,
+        "verdict": "SALVAGE"
+      },
+      "or": {
+        "n": 160,
+        "n_augmented": 0,
+        "ruler": "phonemes:espeak-ng",
+        "inventory_size": 56,
+        "inventory_top20": [
+          [
+            "ɔ",
+            1151
+          ],
+          [
+            "a",
+            654
+          ],
+          [
+            "i",
+            641
+          ],
+          [
+            "e",
+            443
+          ],
+          [
+            "ɾ",
+            436
+          ],
+          [
+            "n",
+            367
+          ],
+          [
+            "k",
+            328
+          ],
+          [
+            "t",
+            305
+          ],
+          [
+            "s",
+            283
+          ],
+          [
+            "h",
+            228
+          ],
+          [
+            "u",
+            227
+          ],
+          [
+            "b",
+            189
+          ],
+          [
+            "m",
+            179
+          ],
+          [
+            "l",
+            161
+          ],
+          [
+            "p",
+            157
+          ],
+          [
+            "o",
+            106
+          ],
+          [
+            "d",
+            99
+          ],
+          [
+            "j",
+            99
+          ],
+          [
+            "tʰ",
+            85
+          ],
+          [
+            "ɡ",
+            72
+          ]
+        ],
+        "inventory_leaks": [],
+        "frac_label_eq_chars": 0.125,
+        "frac_label_eq_phonemes": 1.0,
+        "phonemes_per_char_mean": 1.1268,
+        "phonemes_per_char_sd": 0.346,
+        "phonemes_per_char_cv": 0.3071,
+        "ols_k_through_origin": 1.2059,
+        "ols_r2": 0.8057,
+        "label_rel_error_vs_true_phonemes_mean": 0.0,
+        "verdict": "RETRAIN"
+      },
+      "pa": {
+        "n": 125,
+        "n_augmented": 0,
+        "ruler": "phonemes:espeak-ng",
+        "inventory_size": 73,
+        "inventory_top20": [
+          [
+            "ə",
+            499
+          ],
+          [
+            "a",
+            466
+          ],
+          [
+            "i",
+            312
+          ],
+          [
+            "ʌ",
+            305
+          ],
+          [
+            "ɪ",
+            299
+          ],
+          [
+            "ɾ",
+            292
+          ],
+          [
+            "h",
+            289
+          ],
+          [
+            "n",
+            284
+          ],
+          [
+            "k",
+            270
+          ],
+          [
+            "e",
+            262
+          ],
+          [
+            "t",
+            239
+          ],
+          [
+            "s",
+            214
+          ],
+          [
+            "d",
+            213
+          ],
+          [
+            "l",
+            182
+          ],
+          [
+            "v",
+            147
+          ],
+          [
+            "p",
+            122
+          ],
+          [
+            "m",
+            119
+          ],
+          [
+            "ʊ",
+            116
+          ],
+          [
+            "o",
+            106
+          ],
+          [
+            "ã",
+            91
+          ]
+        ],
+        "inventory_leaks": [],
+        "frac_label_eq_chars": 0.104,
+        "frac_label_eq_phonemes": 1.0,
+        "phonemes_per_char_mean": 1.0416,
+        "phonemes_per_char_sd": 0.1004,
+        "phonemes_per_char_cv": 0.0963,
+        "ols_k_through_origin": 1.043,
+        "ols_r2": 0.9898,
+        "label_rel_error_vs_true_phonemes_mean": 0.0,
+        "verdict": "RESCALE_THEN_MEASURE"
+      },
+      "ta": {
+        "n": 164,
+        "n_augmented": 0,
+        "ruler": "phonemes:espeak-ng",
+        "inventory_size": 43,
+        "inventory_top20": [
+          [
+            "ʌ",
+            1115
+          ],
+          [
+            "i",
+            623
+          ],
+          [
+            "ʉ",
+            530
+          ],
+          [
+            "n",
+            435
+          ],
+          [
+            "k",
+            359
+          ],
+          [
+            "m",
+            353
+          ],
+          [
+            "aː",
+            348
+          ],
+          [
+            "d",
+            308
+          ],
+          [
+            "r",
+            304
+          ],
+          [
+            "v",
+            275
+          ],
+          [
+            "t",
+            264
+          ],
+          [
+            "p",
+            263
+          ],
+          [
+            "l",
+            262
+          ],
+          [
+            "ɡ",
+            236
+          ],
+          [
+            "ɹ",
+            226
+          ],
+          [
+            "aɪ",
+            216
+          ],
+          [
+            "j",
+            205
+          ],
+          [
+            "ɭ",
+            198
+          ],
+          [
+            "ɖ",
+            188
+          ],
+          [
+            "ʈ",
+            142
+          ]
+        ],
+        "inventory_leaks": [],
+        "frac_label_eq_chars": 0.0793,
+        "frac_label_eq_phonemes": 1.0,
+        "phonemes_per_char_mean": 0.9481,
+        "phonemes_per_char_sd": 0.0766,
+        "phonemes_per_char_cv": 0.0808,
+        "ols_k_through_origin": 0.9512,
+        "ols_r2": 0.9865,
+        "label_rel_error_vs_true_phonemes_mean": 0.0,
+        "verdict": "RESCALE_THEN_MEASURE"
+      },
+      "te": {
+        "n": 145,
+        "n_augmented": 0,
+        "ruler": "phonemes:espeak-ng",
+        "inventory_size": 48,
+        "inventory_top20": [
+          [
+            "a",
+            1040
+          ],
+          [
+            "n",
+            685
+          ],
+          [
+            "i",
+            592
+          ],
+          [
+            "aː",
+            519
+          ],
+          [
+            "u",
+            480
+          ],
+          [
+            "r",
+            410
+          ],
+          [
+            "k",
+            321
+          ],
+          [
+            "l",
+            310
+          ],
+          [
+            "t",
+            246
+          ],
+          [
+            "d",
+            197
+          ],
+          [
+            "p",
+            196
+          ],
+          [
+            "ʋ",
+            195
+          ],
+          [
+            "s",
+            187
+          ],
+          [
+            "m",
+            177
+          ],
+          [
+            "j",
+            174
+          ],
+          [
+            "eː",
+            170
+          ],
+          [
+            "ʈ",
+            162
+          ],
+          [
+            "oː",
+            150
+          ],
+          [
+            "c",
+            124
+          ],
+          [
+            "iː",
+            122
+          ]
+        ],
+        "inventory_leaks": [],
+        "frac_label_eq_chars": 0.1103,
+        "frac_label_eq_phonemes": 1.0,
+        "phonemes_per_char_mean": 1.0194,
+        "phonemes_per_char_sd": 0.111,
+        "phonemes_per_char_cv": 0.1089,
+        "ols_k_through_origin": 1.0352,
+        "ols_r2": 0.9804,
+        "label_rel_error_vs_true_phonemes_mean": 0.0,
+        "verdict": "RESCALE_THEN_MEASURE"
+      }
+    }
+  }
+]

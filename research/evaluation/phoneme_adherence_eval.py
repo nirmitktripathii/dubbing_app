@@ -1,60 +1,67 @@
 """
 evaluation/phoneme_adherence_eval.py
 =====================================
-Post-/mid-training evaluation for Notebook 02's length-constrained translation LLM.
+Checkpoint-trajectory evaluation for the length-constrained translation fine-tune.
 
-WHY THIS EXISTS (read before running):
-Cross-entropy (train/eval loss on W&B) is a *proxy* for the actual objective. It answers
-"how probable is the reference translation token-by-token", NOT "does the model produce a
-translation of the requested phoneme length" and NOT "is fidelity preserved". Once eval CE
-plateaus (as it did around step ~3200 in this run), CE can no longer tell you whether the
-model is still getting better at the thing you actually care about. This script measures
-the thing you actually care about, and it does so PER LANGUAGE and ACROSS A CHECKPOINT
-TRAJECTORY, so it directly answers the two open research questions:
+WHAT CHANGED IN THIS REVISION, AND WHY
+---------------------------------------
+The previous harness produced numbers that could not be trusted, in four separate ways.
+Each fix below corresponds to a defect that was found in its output, not to a style
+preference.
 
-  Q1. "CE has plateaued — is length conditioning still being learned?"
-      -> Run --mode all across the checkpoint series. If mean |phoneme error| and/or the
-         length-response SLOPE keep improving while eval CE is flat, conditioning is still
-         being learned and it is worth spending more quota. If adherence has ALSO flattened,
-         the plateau is real and early-stopping loses nothing. (See LENGTH-RESPONSE PROBE.)
+**1. chrF++ was being swallowed.** `import sacrebleu` sat inside the same `try` as the
+scoring call, under a bare `except Exception: return None`. When the pip install failed in
+a Kaggle session, every one of 440 calls returned None without a single log line, the run
+completed, a report was written, and the fidelity column came out blank — the one column
+that would have told us whether the length constraint was being paid for out of meaning.
+The import now happens once at module scope and its failure is logged loudly and recorded
+in the report header, so an absent metric is visible rather than merely empty.
 
-  Q2. "Are some languages still improving while others overfit?"
-      -> Every metric here is grouped by the `language` field of val.jsonl. Per-language
-         eval CE across checkpoints shows which languages are still dropping vs. plateaued
-         vs. rising (a rising per-language eval CE across late checkpoints = that language
-         overfitting first). Per-language adherence shows the same for the real objective.
+**2. There were two different slope estimators and the report used the wrong one.**
+They are not duplicates; they measure different things, and the distinction is the whole
+point of the metric:
 
-DESIGN NOTES (consistency with the training pipeline — do not "fix" these):
-- Phoneme counting uses `translation.duration_predictor.phonemize_text`, the EXACT function
-  `dataset_generator.build_example` used to write the [Target Phonemes: N] labels. Using any
-  other phonemizer would make adherence numbers incomparable to the training signal.
-- The requested N is read from the row's `n_phonemes` field (what the label was built from),
-  not re-parsed from the prompt string, to avoid drift.
-- Per-language CE replicates training's *completion-only* loss: prompt tokens are masked to
-  -100 so only translation tokens contribute — matching TRL's conversational SFT masking, so
-  these numbers are directly comparable to the W&B eval_loss (which is the aggregate of this).
-- Model loading mirrors the notebook's Gate cell: unsloth FastLanguageModel.from_pretrained
-  on the adapter directory (adapter dirs already contain the merged config unsloth needs).
+  - *population slope* regresses generated length against requested length across
+    **different sentences**, whose budgets differ because the sentences differ. A model
+    that ignores the budget entirely still scores high on it — longer English produces
+    longer Hindi regardless. It measures whether translations are appropriately scaled,
+    which is a fluency property, not budget obedience.
+  - *probe slope* holds the sentence **fixed** and sweeps only the requested budget across
+    0.6-1.4x. The sentence is constant, so the only thing that can move the output length
+    is the budget. This is the capability probe.
 
-USAGE
------
-Single checkpoint, full eval:
-    python -m pipeline_v3.evaluation.phoneme_adherence_eval \
-        --val_jsonl data/translation_dataset/val.jsonl \
-        --checkpoints checkpoints/translation_llm/checkpoint-3200 \
-        --output_dir eval_out --mode all
+The old report quoted the population slope while the surrounding prose described the
+probe. Both are now computed, named distinctly, and the **probe** is what the report
+leads with.
 
-Checkpoint trajectory (answers Q1/Q2) + base-model baseline (the paper's headline delta):
-    python -m pipeline_v3.evaluation.phoneme_adherence_eval \
-        --val_jsonl data/translation_dataset/val.jsonl \
-        --checkpoints_glob "checkpoints/translation_llm/checkpoint-*" \
-        --base_baseline --output_dir eval_out --mode all
+**3. The probe's budgets were derived from the corpus labels**, which are known to be
+mislabelled (see `common/phonemes.py`). Natural length is now measured from the reference
+text with the canonical counter, so the probe is independent of the corpus labels and
+measures capability against the true ruler.
 
-Outputs (in --output_dir):
-    per_checkpoint_metrics.csv   # one row per (checkpoint, language, metric)
-    trajectory_summary.csv       # aggregate + per-language, one row per checkpoint
-    length_response.csv          # N-sweep probe results per checkpoint/language
-    eval_report.md               # human-readable summary + the Q1/Q2 verdicts
+**4. `summarize` used the population variance divisor and returned the upper-middle value
+as the "median"** for even-length samples. Small, systematic, and in every median in every
+report. Now sample variance (n-1) and a true median.
+
+Two things were also missing rather than broken:
+
+**Semantic fidelity was never measured.** chrF++ needs a reference translation, which
+exists here and never exists at dub time. The production-side question — "how much meaning
+did compression cost, measured against something available at inference?" — is answered by
+scoring each generation against the full-budget candidate using the same embedder the
+inference gate uses. That produces a degraded-segment rate per language, which is the
+number that converts an architectural worry into evidence.
+
+**The stopping rule lived in prose.** It is now `stopping_verdict()`, computed from the
+trajectory and printed in the report, so the decision cannot be re-argued after the fact.
+
+READING THE OUTPUT
+------------------
+Read the **per-language** table first, then the aggregate. Eleven languages across two
+families do not plateau together — Dravidian languages are agglutinative, so their
+token-to-phoneme relationship differs and they learn this task on a different schedule.
+Every aggregate number hides that. Building the decomposition and then reading the
+aggregate column anyway is the mistake this harness was already capable of preventing.
 """
 
 from __future__ import annotations
@@ -66,138 +73,112 @@ import logging
 import math
 import os
 import re
+import statistics
 import sys
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from common.languages import LANGUAGES, get_language  # noqa: E402
-from translation.duration_predictor import phonemize_text  # noqa: E402  # SAME fn as label build
+from common.phonemes import (  # noqa: E402
+    PhonemizationError, assert_g2p_available, count_phonemes, ruler_id,
+)
 
 logger = logging.getLogger("phoneme_adherence_eval")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 PROMPT_RE = re.compile(r"\[Target Phonemes:\s*(\d+)\]")
+LENGTH_SWEEP_FACTORS = [0.6, 0.8, 1.0, 1.2, 1.4]
+
+# --- chrF++ availability, resolved once, loudly -----------------------------------------
+# Imported at module scope precisely so its absence is a visible fact about the run rather
+# than 440 silent Nones.
+try:
+    import sacrebleu as _sacrebleu
+    CHRF_AVAILABLE = True
+    CHRF_UNAVAILABLE_REASON = None
+except Exception as _e:  # noqa: BLE001
+    _sacrebleu = None
+    CHRF_AVAILABLE = False
+    CHRF_UNAVAILABLE_REASON = repr(_e)
+    logger.error(
+        "sacrebleu is NOT importable (%s). chrF++ will be absent from this report. "
+        "Fidelity is the axis a length-targeted fine-tune puts at risk, so a run without "
+        "it answers a strictly smaller question. Install with: pip install sacrebleu",
+        CHRF_UNAVAILABLE_REASON,
+    )
 
 
-# --------------------------------------------------------------------------------------
-# Data
-# --------------------------------------------------------------------------------------
+# ========================================================================================
+# Corpus IO
+# ========================================================================================
 
-def read_val(path: str) -> list[dict]:
-    rows = []
+def read_val(path: str) -> list:
+    rows, bad = [], 0
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
-            if line:
+            if not line:
+                continue
+            try:
                 rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                bad += 1
+    if bad:
+        logger.warning("%d unparseable lines skipped in %s", bad, path)
     return rows
 
 
-def group_by_language(rows: list[dict]) -> dict[str, list[dict]]:
-    g: dict[str, list[dict]] = defaultdict(list)
+def group_by_language(rows: list) -> dict:
+    g = defaultdict(list)
     for r in rows:
         g[r.get("language", "unknown")].append(r)
     return g
 
 
 def requested_n(row: dict) -> int:
-    """Requested phoneme budget for a row. Prefer the stored label field; fall back to
-    parsing the prompt so this still works on rows written by older generator versions."""
-    if "n_phonemes" in row and row["n_phonemes"]:
-        return int(row["n_phonemes"])
+    """The budget the row's own prompt states — i.e. what the model was actually asked for.
+
+    Read from the prompt text first, not from the `n_phonemes` field, because the prompt
+    is what the model sees. If a relabelling ever updates one and not the other, this
+    reports the number that actually conditioned the generation.
+    """
     m = PROMPT_RE.search(row.get("prompt", ""))
-    return int(m.group(1)) if m else 0
+    if m:
+        return int(m.group(1))
+    return int(row.get("n_phonemes") or 0)
 
 
-# --------------------------------------------------------------------------------------
-# Model
-# --------------------------------------------------------------------------------------
-
-def load_model(adapter_path: Optional[str], base_model_id: str, max_seq_length: int = 512):
-    """adapter_path=None loads the base model with no adapter (baseline). Otherwise loads
-    the LoRA adapter directory (unsloth format, as saved by train_translation_llm.py)."""
-    from unsloth import FastLanguageModel
-    src = adapter_path if adapter_path else base_model_id
-    model, tok = FastLanguageModel.from_pretrained(
-        src, max_seq_length=max_seq_length, load_in_4bit=True, dtype=None,
-    )
-    FastLanguageModel.for_inference(model)
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
-    return model, tok
-
-
-def generate(model, tok, prompt: str, max_new_tokens: int = 128, temperature: float = 0.3) -> str:
-    import torch
-    inputs = tok.apply_chat_template(
-        [{"role": "user", "content": prompt}], return_tensors="pt", add_generation_prompt=True
-    ).to(model.device)
-    with torch.no_grad():
-        out = model.generate(
-            inputs, max_new_tokens=max_new_tokens,
-            do_sample=temperature > 0, temperature=max(temperature, 1e-4),
-            top_p=0.9, pad_token_id=tok.pad_token_id,
-        )
-    text = tok.decode(out[0][inputs.shape[1]:], skip_special_tokens=True).strip()
-    # mirror isochrony_translation_v3._clean_generated_text defensive stripping
-    for prefix in ("Translation:", "Output:", "Target:"):
-        if text.startswith(prefix):
-            text = text[len(prefix):].strip()
-    if len(text) >= 2 and text[0] in "\"'" and text[-1] in "\"'":
-        text = text[1:-1].strip()
-    return text
-
-
-def completion_ce(model, tok, prompt: str, completion: str, max_seq_length: int = 512) -> Optional[float]:
-    """Teacher-forced, completion-only cross-entropy for one (prompt, completion) pair —
-    the exact quantity TRL's SFTTrainer averages into eval_loss, computed here per row so it
-    can be grouped by language. Returns mean CE over completion tokens (nats)."""
-    import torch
-    ids = tok.apply_chat_template(
-        [{"role": "user", "content": prompt}, {"role": "assistant", "content": completion}],
-        return_tensors="pt", add_generation_prompt=False,
-    )
-    prompt_ids = tok.apply_chat_template(
-        [{"role": "user", "content": prompt}], return_tensors="pt", add_generation_prompt=True,
-    )
-    if ids.shape[1] > max_seq_length:
-        return None  # skip rows that would be truncated (they'd bias the number)
-    labels = ids.clone()
-    labels[:, : prompt_ids.shape[1]] = -100  # mask prompt -> completion-only loss
-    ids, labels = ids.to(model.device), labels.to(model.device)
-    with torch.no_grad():
-        loss = model(input_ids=ids, labels=labels).loss
-    return float(loss.item())
-
-
-# --------------------------------------------------------------------------------------
-# Metrics
-# --------------------------------------------------------------------------------------
-
-def chrf_pp(hypothesis: str, reference: str) -> Optional[float]:
+def true_phoneme_len(text: str, lang: str) -> Optional[int]:
     try:
-        import sacrebleu
-        return float(sacrebleu.sentence_chrf(hypothesis, [reference], word_order=2).score)
-    except Exception:  # noqa: BLE001 - sacrebleu optional; fidelity metric degrades gracefully
+        return count_phonemes(text, lang)
+    except PhonemizationError as e:
+        logger.warning("phonemization failed (%s): %s", lang, e)
         return None
 
 
-def summarize(xs: list[float]) -> dict:
+# ========================================================================================
+# Statistics
+# ========================================================================================
+
+def summarize(xs: list) -> dict:
+    """Sample statistics. Sample stdev (n-1) and a true median — the previous version used
+    the population divisor and `xs_sorted[n // 2]`, which returns the upper middle value
+    for even n."""
     if not xs:
         return {"n": 0}
-    xs_sorted = sorted(xs)
     n = len(xs)
-    mean = sum(xs) / n
-    median = xs_sorted[n // 2]
-    var = sum((x - mean) ** 2 for x in xs) / n
-    return {"n": n, "mean": mean, "median": median, "std": math.sqrt(var)}
+    return {
+        "n": n,
+        "mean": statistics.fmean(xs),
+        "median": statistics.median(xs),
+        "std": statistics.stdev(xs) if n > 1 else 0.0,
+    }
 
 
-def linfit_slope(xs: list[float], ys: list[float]) -> tuple[Optional[float], Optional[float]]:
-    """OLS slope + R^2 of ys on xs. For the length-response probe: xs=requested N,
-    ys=produced N. Slope→1.0 and R^2→1.0 mean the model obeys the requested length."""
+def linfit_slope(xs: list, ys: list):
     n = len(xs)
     if n < 2:
         return None, None
@@ -212,18 +193,158 @@ def linfit_slope(xs: list[float], ys: list[float]) -> tuple[Optional[float], Opt
     return slope, r2
 
 
-# --------------------------------------------------------------------------------------
-# Evaluation passes
-# --------------------------------------------------------------------------------------
+def chrf_pp(hypothesis: str, reference: str) -> Optional[float]:
+    """chrF++ against the reference. Returns None only when sacrebleu is genuinely absent
+    — which is recorded once, at module import, rather than per call."""
+    if not CHRF_AVAILABLE:
+        return None
+    return float(_sacrebleu.sentence_chrf(hypothesis, [reference], word_order=2).score)
 
-def eval_checkpoint(model, tok, rows_by_lang: dict[str, list[dict]], adherence_per_lang: int,
-                    ce_per_lang: int, do_generation: bool, do_ce: bool) -> dict:
-    """Returns {lang: {ce_mean, adherence_rel_mean, adherence_signed_mean, chrf_mean, ...}}."""
-    results: dict[str, dict] = {}
+
+# ========================================================================================
+# Semantic scoring — the production-side fidelity check
+# ========================================================================================
+
+class SemanticScorer:
+    """Cosine similarity with the same embedder the inference gate uses.
+
+    Deliberately the same model as `translation/semantic_gate.py` and
+    `training/length_augmentation.py`: a threshold validated on one embedder means nothing
+    on another, so an eval that used a different one could not be compared against the
+    gate that ships.
+    """
+
+    def __init__(self, model_id: Optional[str] = None, device: Optional[str] = None):
+        from translation.semantic_gate import DEFAULT_EMBEDDER_MODEL_ID
+        self.model_id = model_id or DEFAULT_EMBEDDER_MODEL_ID
+        self.device = device
+        self._model = None
+        self.available = True
+        self.reason = None
+
+    def _lazy(self):
+        if self._model is None and self.available:
+            try:
+                from sentence_transformers import SentenceTransformer
+                logger.info("Loading semantic embedder %s ...", self.model_id)
+                self._model = SentenceTransformer(self.model_id, device=self.device)
+            except Exception as e:  # noqa: BLE001
+                self.available = False
+                self.reason = repr(e)
+                logger.error("Semantic scoring DISABLED — embedder failed to load: %s", e)
+        return self._model
+
+    def similarity(self, a: str, b: str) -> Optional[float]:
+        model = self._lazy()
+        if model is None or not a or not b:
+            return None
+        import numpy as np
+        emb = model.encode([a, b], normalize_embeddings=True)
+        return float(np.dot(emb[0], emb[1]))
+
+
+# ========================================================================================
+# Model loading and generation
+# ========================================================================================
+
+def load_model(adapter_path: Optional[str], base_model_id: str, max_seq_length: int = 512):
+    from unsloth import FastLanguageModel
+    src = adapter_path if adapter_path else base_model_id
+    model, tok = FastLanguageModel.from_pretrained(
+        src, max_seq_length=max_seq_length, load_in_4bit=True, dtype=None,
+    )
+    FastLanguageModel.for_inference(model)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    return model, tok
+
+
+def _clean(text: str) -> str:
+    text = text.strip()
+    for prefix in ("Translation:", "Output:", "Target:"):
+        if text.startswith(prefix):
+            text = text[len(prefix):].strip()
+    if len(text) >= 2 and text[0] in "\"'" and text[-1] in "\"'":
+        text = text[1:-1].strip()
+    return text
+
+
+def generate_batch(model, tok, prompts: list[str], max_new_tokens: int = 128,
+                   temperature: float = 0.3, batch_size: int = 8) -> list[str]:
+    """Batched generation.
+
+    The probe needs 5 generations per sentence per language per checkpoint; unbatched that
+    dominates the entire session's wall clock and is the reason the probe was previously
+    run at 10 sentences per language, where per-language orderings are not trustworthy.
+    Left padding is required — decoder-only models continue from the rightmost token, and
+    right padding would have the model continue from pad tokens.
+    """
+    import torch
+    outs: list[str] = []
+    prev_side = tok.padding_side
+    tok.padding_side = "left"
+    try:
+        for i in range(0, len(prompts), batch_size):
+            chunk = prompts[i:i + batch_size]
+            texts = [
+                tok.apply_chat_template([{"role": "user", "content": p}],
+                                        tokenize=False, add_generation_prompt=True)
+                for p in chunk
+            ]
+            enc = tok(texts, return_tensors="pt", padding=True, add_special_tokens=False).to(model.device)
+            with torch.no_grad():
+                gen = model.generate(
+                    **enc, max_new_tokens=max_new_tokens,
+                    do_sample=temperature > 0, temperature=max(temperature, 1e-4),
+                    top_p=0.9, pad_token_id=tok.pad_token_id,
+                )
+            for j in range(len(chunk)):
+                new = gen[j][enc["input_ids"].shape[1]:]
+                outs.append(_clean(tok.decode(new, skip_special_tokens=True)))
+    finally:
+        tok.padding_side = prev_side
+    return outs
+
+
+def completion_ce(model, tok, prompt: str, completion: str, max_seq_length: int = 512) -> Optional[float]:
+    import torch
+    ids = tok.apply_chat_template(
+        [{"role": "user", "content": prompt}, {"role": "assistant", "content": completion}],
+        return_tensors="pt", add_generation_prompt=False,
+    )
+    prompt_ids = tok.apply_chat_template(
+        [{"role": "user", "content": prompt}], return_tensors="pt", add_generation_prompt=True,
+    )
+    if ids.shape[1] > max_seq_length:
+        return None
+    labels = ids.clone()
+    labels[:, : prompt_ids.shape[1]] = -100
+    ids, labels = ids.to(model.device), labels.to(model.device)
+    with torch.no_grad():
+        loss = model(input_ids=ids, labels=labels).loss
+    return float(loss.item())
+
+
+# ========================================================================================
+# Metric passes
+# ========================================================================================
+
+def eval_checkpoint(model, tok, rows_by_lang: dict, adherence_per_lang: int,
+                    ce_per_lang: int, do_generation: bool, do_ce: bool,
+                    semantic: Optional[SemanticScorer] = None,
+                    semantic_threshold: float = 0.80,
+                    budget_scale: Optional[dict] = None,
+                    batch_size: int = 8,
+                    dump_langs: Optional[set] = None, dump_n: int = 0,
+                    dump_sink: Optional[list] = None, ckpt_label: str = "") -> dict:
+    results = {}
+    dump_langs = dump_langs or set()
+
     for lang, rows in rows_by_lang.items():
-        lang_res: dict = {"language": lang}
+        if lang not in LANGUAGES:
+            continue
+        lang_res = {"language": lang}
 
-        # --- per-language completion-only CE (fast; teacher-forced; matches W&B eval_loss) ---
         if do_ce:
             ce_vals = []
             for r in rows[:ce_per_lang]:
@@ -235,94 +356,298 @@ def eval_checkpoint(model, tok, rows_by_lang: dict[str, list[dict]], adherence_p
             lang_res["ce_perplexity"] = math.exp(s["mean"]) if s.get("mean") is not None else None
             lang_res["ce_n"] = s["n"]
 
-        # --- adherence + fidelity (needs generation; slower) ---
         if do_generation:
-            rel_errs, signed_errs, chrfs, req_ns, gen_ns = [], [], [], [], []
-            for r in rows[:adherence_per_lang]:
-                N = requested_n(r)
-                if N <= 0:
-                    continue
-                gen = generate(model, tok, r["prompt"])
+            subset = [r for r in rows[:adherence_per_lang] if requested_n(r) > 0]
+            prompts = [_rescaled_prompt(r, lang, budget_scale) for r in subset]
+            gens = generate_batch(model, tok, prompts, temperature=0.3, batch_size=batch_size)
+
+            rel_errs, signed_errs, chrfs, sims = [], [], [], []
+            req_ns, gen_ns = [], []
+            degraded = 0
+            dumped = 0
+            for r, gen in zip(subset, gens):
                 if not gen:
                     continue
-                n_gen = len(phonemize_text(gen, lang))
+                # The budget we hold the model to is always in TRUE phonemes, whatever unit
+                # the corpus label happened to be written in.
+                N = _true_budget(r, lang)
+                if not N:
+                    continue
+                n_gen = true_phoneme_len(gen, lang)
+                if n_gen is None:
+                    continue
+                ref = r.get("target") or r.get("completion") or ""
                 rel_errs.append(abs(n_gen - N) / N)
                 signed_errs.append((n_gen - N) / N)
                 req_ns.append(float(N))
                 gen_ns.append(float(n_gen))
-                c = chrf_pp(gen, r.get("target") or r.get("completion") or "")
+
+                c = chrf_pp(gen, ref) if ref else None
                 if c is not None:
                     chrfs.append(c)
-            ra, sa, ca = summarize(rel_errs), summarize(signed_errs), summarize(chrfs)
-            lang_res["adherence_rel_mean"] = ra.get("mean")     # |Ngen-N|/N  (lower=better)
+
+                sim = None
+                if semantic is not None:
+                    # Anchor = the human reference. At dub time no reference exists and the
+                    # anchor is the full-budget candidate instead (see probe below); here the
+                    # reference is the stronger anchor and is free.
+                    sim = semantic.similarity(ref, gen) if ref else None
+                    if sim is not None:
+                        sims.append(sim)
+                        if sim < semantic_threshold:
+                            degraded += 1
+
+                if lang in dump_langs and dump_sink is not None and dumped < dump_n:
+                    dump_sink.append({
+                        "checkpoint": ckpt_label, "language": lang, "english": r.get("english"),
+                        "requested_n": N, "generated_n": n_gen, "generated": gen,
+                        "reference": ref, "chrf": c, "semantic_similarity": sim,
+                    })
+                    dumped += 1
+
+            ra, sa, ca, si = summarize(rel_errs), summarize(signed_errs), summarize(chrfs), summarize(sims)
+            lang_res["adherence_rel_mean"] = ra.get("mean")
             lang_res["adherence_rel_median"] = ra.get("median")
-            lang_res["adherence_signed_mean"] = sa.get("mean")  # sign shows over/undershoot bias
-            lang_res["chrf_mean"] = ca.get("mean")              # fidelity (higher=better)
+            lang_res["adherence_signed_mean"] = sa.get("mean")
+            lang_res["adherence_signed_median"] = sa.get("median")
+            lang_res["chrf_mean"] = ca.get("mean")
+            lang_res["semantic_mean"] = si.get("mean")
+            lang_res["semantic_degraded_frac"] = (degraded / si["n"]) if si.get("n") else None
             lang_res["adherence_n"] = ra["n"]
             slope, r2 = linfit_slope(req_ns, gen_ns)
-            lang_res["length_slope"] = slope   # produced-vs-requested slope on natural-N spread
-            lang_res["length_r2"] = r2
+            # Named for what it is. Across DIFFERENT sentences, so it is confounded by
+            # sentence length and is a fluency proxy, not a budget-obedience measurement.
+            lang_res["length_slope_population"] = slope
+            lang_res["length_r2_population"] = r2
+
         results[lang] = lang_res
     return results
 
 
-LENGTH_SWEEP_FACTORS = [0.6, 0.8, 1.0, 1.2, 1.4]
+def _true_budget(row: dict, lang: str) -> Optional[int]:
+    """The budget in true phonemes.
+
+    If the row was written by the repaired labeller it carries `ruler`, and `n_phonemes`
+    is already correct. Otherwise the reference text is re-counted, so a legacy
+    character-ruled corpus is still evaluated on the right ruler.
+    """
+    if str(row.get("ruler", "")).startswith("phonemes:"):
+        n = int(row.get("n_phonemes") or 0)
+        if n > 0:
+            return n
+    ref = row.get("target") or row.get("completion") or ""
+    return true_phoneme_len(ref, lang) if ref else None
 
 
-def length_response_probe(model, tok, rows_by_lang: dict[str, list[dict]],
-                          sentences_per_lang: int) -> dict:
-    """The purest length-control signal, fully decoupled from translation CE: take a fixed
-    set of English sentences, ask for the SAME sentence at N = f * natural_N for a sweep of
-    f, and measure whether the produced phoneme count tracks the request. A model that truly
-    learned length conditioning yields a monotone response with slope≈1; a model that ignores
-    N yields a flat response (slope≈0). Rising slope across checkpoints while CE is flat is
-    the decisive evidence that length conditioning is still being learned (Q1)."""
-    out: dict[str, dict] = {}
+def _rescaled_prompt(row: dict, lang: str, budget_scale: Optional[dict]) -> str:
+    """The prompt to send.
+
+    With `--budget_scale_json`, the true-phoneme budget is divided by that language's
+    phonemes-per-character constant before being written into the prompt. That converts
+    "the budget I want, in phonemes" into "the budget this model was actually taught, in
+    characters" — the salvage path for a checkpoint trained on character-ruled labels,
+    which needs no retraining. Without the flag the row's own prompt is used unchanged.
+    """
+    if not budget_scale or lang not in budget_scale:
+        return row["prompt"]
+    N = _true_budget(row, lang)
+    if not N:
+        return row["prompt"]
+    k = budget_scale[lang]
+    asked = max(1, round(N / k)) if k else N
+    return PROMPT_RE.sub(f"[Target Phonemes: {asked}]", row["prompt"])
+
+
+def length_response_probe(model, tok, rows_by_lang: dict, sentences_per_lang: int,
+                          semantic: Optional[SemanticScorer] = None,
+                          semantic_threshold: float = 0.80,
+                          budget_scale: Optional[dict] = None,
+                          batch_size: int = 8) -> dict:
+    """The capability probe: one sentence, five budgets, only the budget varies.
+
+    Natural length is measured from the reference text with the canonical counter rather
+    than read from the corpus label, so the probe is unaffected by how the corpus was
+    labelled.
+
+    The semantic anchor here is the model's own 1.0x generation — the same anchor the
+    inference gate uses, because at dub time no reference exists. That makes the degraded
+    rate reported here directly comparable to what the shipped gate will see.
+    """
+    out = {}
     for lang, rows in rows_by_lang.items():
-        req_all, gen_all = [], []
-        for r in rows[:sentences_per_lang]:
-            natural_N = requested_n(r)
-            if natural_N <= 0:
-                continue
+        if lang not in LANGUAGES:
+            continue
+        lang_name = get_language(lang).name
+
+        specs = []          # (sentence_index, factor, prompt)
+        naturals = []
+        for si, r in enumerate(rows[:sentences_per_lang]):
             eng = r.get("english") or ""
-            lang_name = get_language(lang).name if lang in LANGUAGES else lang
+            ref = r.get("target") or r.get("completion") or ""
+            if not eng or not ref:
+                continue
+            natural = true_phoneme_len(ref, lang)
+            if not natural:
+                continue
+            naturals.append(natural)
+            k = (budget_scale or {}).get(lang)
             for f in LENGTH_SWEEP_FACTORS:
-                target = max(1, round(natural_N * f))
-                prompt = f'[Translate to {lang_name}] [Target Phonemes: {target}] "{eng}"'
-                gen = generate(model, tok, prompt)
-                if not gen:
-                    continue
-                req_all.append(float(target))
-                gen_all.append(float(len(phonemize_text(gen, lang))))
+                want = max(1, round(natural * f))          # what we want, in phonemes
+                asked = max(1, round(want / k)) if k else want   # what we write in the prompt
+                specs.append((len(naturals) - 1, f, want,
+                              f'[Translate to {lang_name}] [Target Phonemes: {asked}] "{eng}"'))
+
+        if not specs:
+            out[lang] = {"language": lang, "length_slope_probe": None, "n_points": 0}
+            continue
+
+        gens = generate_batch(model, tok, [s[3] for s in specs], temperature=0.3,
+                              batch_size=batch_size)
+
+        req_all, gen_all = [], []
+        by_sentence: dict[int, dict[float, str]] = defaultdict(dict)
+        for (si, f, want, _), gen in zip(specs, gens):
+            if not gen:
+                continue
+            n_gen = true_phoneme_len(gen, lang)
+            if n_gen is None:
+                continue
+            req_all.append(float(want))
+            gen_all.append(float(n_gen))
+            by_sentence[si][f] = gen
+
         slope, r2 = linfit_slope(req_all, gen_all)
-        out[lang] = {"language": lang, "length_slope": slope, "length_r2": r2,
-                     "n_points": len(req_all)}
+
+        # Semantic cost of compression, anchored the way production anchors it.
+        sims, degraded, n_scored = [], 0, 0
+        if semantic is not None:
+            for si, byf in by_sentence.items():
+                anchor = byf.get(1.0)
+                if not anchor:
+                    continue
+                for f, gen in byf.items():
+                    if f >= 1.0:
+                        continue
+                    s = semantic.similarity(anchor, gen)
+                    if s is None:
+                        continue
+                    sims.append(s)
+                    n_scored += 1
+                    if s < semantic_threshold:
+                        degraded += 1
+
+        out[lang] = {
+            "language": lang,
+            "length_slope_probe": slope,
+            "length_r2_probe": r2,
+            "n_points": len(req_all),
+            "n_sentences": len(naturals),
+            "compressed_semantic_mean": statistics.fmean(sims) if sims else None,
+            "compressed_degraded_frac": (degraded / n_scored) if n_scored else None,
+        }
     return out
 
 
-# --------------------------------------------------------------------------------------
+# ========================================================================================
+# The stopping rule, as code
+# ========================================================================================
+
+def stopping_verdict(traj: list[dict], ce_flat_tol: float = 0.005,
+                     slope_move_tol: float = 0.01) -> dict:
+    """CE-flat + slope still moving => keep spending quota.
+       CE-flat + slope flat        => genuine plateau; early-stop loses nothing.
+
+    Written as code rather than kept in prose because the whole point of the rule is that
+    it must survive the moment when stopping looks attractive. Uses the probe slope; the
+    population slope is not a capability measurement.
+    """
+    pts = sorted([t for t in traj if t.get("step", -1) >= 0], key=lambda x: x["step"])
+    if len(pts) < 2:
+        return {"verdict": "INSUFFICIENT_DATA", "reason": "need at least two checkpoints"}
+
+    def last_valid(key):
+        vals = [(t["step"], t[key]) for t in pts if t.get(key) is not None]
+        return vals[-2:] if len(vals) >= 2 else None
+
+    ce = last_valid("ce_mean")
+    sl = last_valid("length_slope_probe") or last_valid("length_slope_population")
+    if sl is None:
+        return {"verdict": "INSUFFICIENT_DATA", "reason": "no slope measured on >=2 checkpoints"}
+
+    ce_delta = (ce[1][1] - ce[0][1]) if ce else None
+    slope_delta = sl[1][1] - sl[0][1]
+    ce_flat = ce_delta is None or abs(ce_delta) < ce_flat_tol
+    slope_moving = slope_delta > slope_move_tol
+
+    if ce_flat and slope_moving:
+        verdict, reason = "CONTINUE", (
+            f"CE flat (delta {ce_delta:+.4f}) but probe slope still climbing "
+            f"({sl[0][1]:.3f} -> {sl[1][1]:.3f}, delta {slope_delta:+.3f}). Length control "
+            f"is still being learned after the loss curve went quiet. Keep spending quota."
+        )
+    elif ce_flat:
+        verdict, reason = "STOP", (
+            f"CE flat (delta {ce_delta if ce_delta is None else f'{ce_delta:+.4f}'}) and probe "
+            f"slope flat ({sl[0][1]:.3f} -> {sl[1][1]:.3f}, delta {slope_delta:+.3f}). "
+            f"Genuine plateau; early-stopping loses nothing measurable."
+        )
+    else:
+        verdict, reason = "CONTINUE", (
+            f"CE still moving (delta {ce_delta:+.4f}). Not a plateau."
+        )
+    return {"verdict": verdict, "reason": reason,
+            "ce_delta": ce_delta, "slope_delta": slope_delta,
+            "steps_compared": [sl[0][0], sl[1][0]]}
+
+
+# ========================================================================================
 # Driver
-# --------------------------------------------------------------------------------------
+# ========================================================================================
 
 def checkpoint_step(path: str) -> int:
-    m = re.search(r"checkpoint-(\d+)", os.path.basename(path.rstrip("/")))
+    m = re.search(r"checkpoint-(\d+)", os.path.basename(str(path).rstrip("/")))
     return int(m.group(1)) if m else -1
 
 
 def run(args):
+    # An eval that silently used a character fallback would report a mislabelled corpus as
+    # correctly labelled. Refuse to start.
+    g2p = assert_g2p_available()
+    logger.info("G2P ruler: %s", g2p["ruler"])
+
+    budget_scale = None
+    if args.budget_scale_json:
+        budget_scale = json.loads(Path(args.budget_scale_json).read_text(encoding="utf-8"))
+        if "per_language" in budget_scale:  # accept a ruler_audit report directly
+            budget_scale = {k: v["ols_k_through_origin"]
+                            for k, v in budget_scale["per_language"].items()}
+        logger.info("Budget rescale ACTIVE: %s", budget_scale)
+
     rows = read_val(args.val_jsonl)
     rows_by_lang = group_by_language(rows)
     logger.info("Loaded %d val rows across %d languages", len(rows), len(rows_by_lang))
 
-    targets: list[tuple[str, Optional[str]]] = []  # (label, adapter_path_or_None)
+    semantic = None
+    if not args.no_semantic:
+        semantic = SemanticScorer(device=args.semantic_device)
+
+    targets = []
     if args.base_baseline:
         targets.append(("base_model", None))
     ckpts = list(args.checkpoints or [])
     if args.checkpoints_glob:
-        ckpts += glob.glob(args.checkpoints_glob)
+        found = glob.glob(args.checkpoints_glob)
+        if not found:
+            # The silent-resume bug's twin: a glob that matches nothing produces a run that
+            # looks healthy and evaluates nothing.
+            raise SystemExit(
+                f"--checkpoints_glob {args.checkpoints_glob!r} matched NOTHING. "
+                f"Check the directory depth before spending a session on it."
+            )
+        ckpts += found
     ckpts = sorted(set(ckpts), key=checkpoint_step)
     for c in ckpts:
-        targets.append((os.path.basename(c.rstrip("/")), c))
+        targets.append((os.path.basename(str(c).rstrip("/")), c))
     if not targets:
         raise SystemExit("Nothing to evaluate: pass --checkpoints/--checkpoints_glob and/or --base_baseline")
 
@@ -332,101 +657,191 @@ def run(args):
     do_ce = args.mode in ("all", "ce")
     do_probe = args.mode in ("all", "length")
 
-    per_ckpt_rows, traj_rows, lr_rows = [], [], []
+    per_ckpt_rows, traj_rows, lr_rows, sample_rows = [], [], [], []
+    dump_langs = set(args.dump_samples_langs or [])
+
     for label, adapter in targets:
         logger.info("=== Evaluating %s ===", label)
         model, tok = load_model(adapter, args.base_model_id, args.max_seq_length)
-        res = eval_checkpoint(model, tok, rows_by_lang, args.adherence_samples_per_lang,
-                              args.ce_samples_per_lang, do_gen, do_ce)
-        probe = length_response_probe(model, tok, rows_by_lang, args.probe_sentences_per_lang) if do_probe else {}
+        res = eval_checkpoint(
+            model, tok, rows_by_lang, args.adherence_samples_per_lang,
+            args.ce_samples_per_lang, do_gen, do_ce,
+            semantic=semantic, semantic_threshold=args.semantic_threshold,
+            budget_scale=budget_scale, batch_size=args.batch_size,
+            dump_langs=dump_langs, dump_n=args.dump_samples_n,
+            dump_sink=sample_rows, ckpt_label=label,
+        )
+        probe = length_response_probe(
+            model, tok, rows_by_lang, args.probe_sentences_per_lang,
+            semantic=semantic, semantic_threshold=args.semantic_threshold,
+            budget_scale=budget_scale, batch_size=args.batch_size,
+        ) if do_probe else {}
 
-        # aggregate across languages (sample-weighted where counts exist)
-        def agg(key):
-            vals = [v[key] for v in res.values() if v.get(key) is not None]
+        def agg(source: dict, key: str):
+            vals = [v[key] for v in source.values() if v.get(key) is not None]
             return sum(vals) / len(vals) if vals else None
+
         step = checkpoint_step(adapter) if adapter else -1
         traj_rows.append({
             "checkpoint": label, "step": step,
-            "ce_mean": agg("ce_mean"), "ce_perplexity": agg("ce_perplexity"),
-            "adherence_rel_mean": agg("adherence_rel_mean"),
-            "adherence_signed_mean": agg("adherence_signed_mean"),
-            "chrf_mean": agg("chrf_mean"), "length_slope": agg("length_slope"),
+            "ce_mean": agg(res, "ce_mean"), "ce_perplexity": agg(res, "ce_perplexity"),
+            "adherence_rel_mean": agg(res, "adherence_rel_mean"),
+            "adherence_signed_mean": agg(res, "adherence_signed_mean"),
+            "chrf_mean": agg(res, "chrf_mean"),
+            "semantic_mean": agg(res, "semantic_mean"),
+            "semantic_degraded_frac": agg(res, "semantic_degraded_frac"),
+            "length_slope_population": agg(res, "length_slope_population"),
+            "length_slope_probe": agg(probe, "length_slope_probe") if probe else None,
+            "compressed_degraded_frac": agg(probe, "compressed_degraded_frac") if probe else None,
         })
         for lang, v in res.items():
-            per_ckpt_rows.append({"checkpoint": label, "step": step, **v})
+            merged = {**v, **{k: val for k, val in (probe.get(lang) or {}).items()
+                              if k != "language"}}
+            per_ckpt_rows.append({"checkpoint": label, "step": step, **merged})
         for lang, v in probe.items():
             lr_rows.append({"checkpoint": label, "step": step, **v})
 
+        _write_csv(out_dir / "per_checkpoint_metrics.csv", per_ckpt_rows)
+        _write_csv(out_dir / "trajectory_summary.csv", traj_rows)
+        if lr_rows:
+            _write_csv(out_dir / "length_response.csv", lr_rows)
+
         del model
         try:
-            import torch, gc  # noqa
+            import gc
+            import torch
             gc.collect(); torch.cuda.empty_cache()
         except Exception:  # noqa: BLE001
             pass
 
-    _write_csv(out_dir / "per_checkpoint_metrics.csv", per_ckpt_rows)
-    _write_csv(out_dir / "trajectory_summary.csv", traj_rows)
-    if lr_rows:
-        _write_csv(out_dir / "length_response.csv", lr_rows)
-    _write_report(out_dir / "eval_report.md", traj_rows, per_ckpt_rows, lr_rows)
+    if sample_rows:
+        with open(out_dir / "samples.jsonl", "w", encoding="utf-8") as f:
+            for row in sample_rows:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    manifest = {
+        "generated_utc": datetime.now(timezone.utc).isoformat(),
+        "ruler": g2p["ruler"],
+        "val_jsonl": args.val_jsonl,
+        "n_val_rows": len(rows),
+        "mode": args.mode,
+        "adherence_samples_per_lang": args.adherence_samples_per_lang,
+        "probe_sentences_per_lang": args.probe_sentences_per_lang,
+        "chrf_available": CHRF_AVAILABLE,
+        "chrf_unavailable_reason": CHRF_UNAVAILABLE_REASON,
+        "semantic_available": bool(semantic and semantic.available),
+        "semantic_threshold": args.semantic_threshold,
+        "budget_scale": budget_scale,
+        "checkpoints": [t[0] for t in targets],
+    }
+    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    _write_report(out_dir / "eval_report.md", traj_rows, per_ckpt_rows, lr_rows, manifest)
     logger.info("Wrote outputs to %s", out_dir)
 
 
-def _write_csv(path: Path, rows: list[dict]):
+def _write_csv(path, rows):
     if not rows:
         return
     cols = list({k for r in rows for k in r.keys()})
     order = ["checkpoint", "step", "language"]
-    cols = [c for c in order if c in cols] + [c for c in cols if c not in order]
+    cols = [c for c in order if c in cols] + sorted(c for c in cols if c not in order)
     with open(path, "w", encoding="utf-8") as f:
         f.write(",".join(cols) + "\n")
         for r in rows:
             f.write(",".join("" if r.get(c) is None else str(r.get(c)) for c in cols) + "\n")
 
 
-def _write_report(path: Path, traj: list[dict], per_ckpt: list[dict], lr: list[dict]):
-    lines = ["# Phoneme-Adherence Evaluation Report", ""]
-    lines.append("## Aggregate trajectory (the Q1 answer is in whether adherence/slope keep")
-    lines.append("moving after CE flattens)\n")
-    lines.append("| Checkpoint | Step | CE | Perplexity | |ΔN|/N | signed | chrF++ | length_slope |")
-    lines.append("|---|---|---|---|---|---|---|---|")
+def _fmt(x, p=3):
+    return "-" if x is None else f"{x:.{p}f}"
+
+
+def _write_report(path, traj, per_ckpt, lr, manifest):
+    L = ["# Phoneme-Adherence Evaluation Report", ""]
+    L += [f"- **Ruler:** `{manifest['ruler']}`",
+          f"- **Val set:** `{manifest['val_jsonl']}` ({manifest['n_val_rows']} rows)",
+          f"- **Generated:** {manifest['generated_utc']}",
+          f"- **Adherence samples/lang:** {manifest['adherence_samples_per_lang']}  "
+          f"**Probe sentences/lang:** {manifest['probe_sentences_per_lang']}"]
+    if manifest.get("budget_scale"):
+        L.append(f"- **Budget rescale ACTIVE** (phoneme budget converted to the character "
+                 f"budget the model was taught): `{manifest['budget_scale']}`")
+    if not manifest["chrf_available"]:
+        L.append(f"- **chrF++ UNAVAILABLE** — `{manifest['chrf_unavailable_reason']}`. "
+                 f"The fidelity column is absent, not zero.")
+    if not manifest["semantic_available"]:
+        L.append("- **Semantic scoring UNAVAILABLE** — embedder failed to load. "
+                 "Semantic columns are absent, not zero.")
+    L += ["", "> Read the per-language table first. Eleven languages across two families do "
+          "not plateau together; every aggregate number below hides that.", ""]
+
+    # --- per-language first, by design ---
+    L += ["## Per-language", ""]
+    by_ckpt = defaultdict(list)
+    for r in per_ckpt:
+        by_ckpt[(r["step"], r["checkpoint"])].append(r)
+    for (step, ckpt) in sorted(by_ckpt):
+        L += [f"### {ckpt} (step {step})", "",
+              "| Lang | relErr | signed | probe slope | pop slope | chrF++ | semantic | degraded |",
+              "|---|---|---|---|---|---|---|---|"]
+        for r in sorted(by_ckpt[(step, ckpt)], key=lambda x: x.get("language") or ""):
+            L.append(
+                f"| {r.get('language')} | {_fmt(r.get('adherence_rel_mean'))} | "
+                f"{_fmt(r.get('adherence_signed_mean'))} | {_fmt(r.get('length_slope_probe'))} | "
+                f"{_fmt(r.get('length_slope_population'))} | {_fmt(r.get('chrf_mean'), 1)} | "
+                f"{_fmt(r.get('semantic_mean'))} | {_fmt(r.get('semantic_degraded_frac'))} |")
+        L.append("")
+
+    # --- aggregate ---
+    L += ["## Aggregate (read second)", "",
+          "| Checkpoint | Step | CE | PPL | relErr | signed | chrF++ | semantic | probe slope | pop slope |",
+          "|---|---|---|---|---|---|---|---|---|---|"]
     for t in sorted(traj, key=lambda x: x["step"]):
-        def fmt(x, p=4):
-            return "—" if x is None else f"{x:.{p}f}"
-        lines.append(f"| {t['checkpoint']} | {t['step']} | {fmt(t['ce_mean'])} | "
-                     f"{fmt(t['ce_perplexity'],3)} | {fmt(t['adherence_rel_mean'],3)} | "
-                     f"{fmt(t['adherence_signed_mean'],3)} | {fmt(t['chrf_mean'],1)} | "
-                     f"{fmt(t['length_slope'],3)} |")
-    lines += ["", "## How to read this", "",
-              "- **CE flat + |ΔN|/N still falling OR length_slope still rising toward 1.0** ⇒ "
-              "length conditioning is STILL being learned; more training quota is justified.",
-              "- **CE flat + adherence flat** ⇒ genuine plateau; early-stop at the best-eval "
-              "checkpoint loses nothing measurable.",
-              "- **signed mean** drifting negative ⇒ systematic UNDER-generation (too short); "
-              "positive ⇒ over-generation. Guides whether the inference 65/85/100% budgets or "
-              "an added >100% candidate are warranted.",
-              "- **Per-language** rows in per_checkpoint_metrics.csv answer Q2: sort by step "
-              "within a language and watch for a language whose CE rises across late "
-              "checkpoints (overfitting onset for THAT language) while others keep falling.",
-              "- **base_model row** is the untrained baseline; every trained checkpoint's "
-              "delta vs. it is the paper's headline 'what fine-tuning bought' number."]
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+        L.append(f"| {t['checkpoint']} | {t['step']} | {_fmt(t['ce_mean'], 4)} | "
+                 f"{_fmt(t['ce_perplexity'])} | {_fmt(t['adherence_rel_mean'])} | "
+                 f"{_fmt(t['adherence_signed_mean'])} | {_fmt(t['chrf_mean'], 1)} | "
+                 f"{_fmt(t.get('semantic_mean'))} | {_fmt(t.get('length_slope_probe'))} | "
+                 f"{_fmt(t['length_slope_population'])} |")
+
+    v = stopping_verdict(traj)
+    L += ["", "## Stopping verdict", "", f"**{v['verdict']}** — {v.get('reason', '')}", "",
+          "> `length_slope_probe` holds the sentence fixed and sweeps only the budget: it is "
+          "the capability measurement. `length_slope_population` regresses across different "
+          "sentences and is confounded by sentence length — a model that ignores the budget "
+          "entirely still scores high on it. Never select a checkpoint on the population slope.", ""]
+
+    Path(path).write_text("\n".join(L) + "\n", encoding="utf-8")
 
 
 def _cli():
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--val_jsonl", required=True)
     p.add_argument("--checkpoints", nargs="*", default=[])
     p.add_argument("--checkpoints_glob", default=None)
-    p.add_argument("--base_baseline", action="store_true", help="also eval the base model (no adapter)")
+    p.add_argument("--base_baseline", action="store_true")
     p.add_argument("--base_model_id", default="meta-llama/Llama-3.1-8B-Instruct")
     p.add_argument("--output_dir", required=True)
     p.add_argument("--mode", choices=["all", "ce", "adherence", "length"], default="all")
     p.add_argument("--max_seq_length", type=int, default=512)
     p.add_argument("--adherence_samples_per_lang", type=int, default=40)
     p.add_argument("--ce_samples_per_lang", type=int, default=150)
-    p.add_argument("--probe_sentences_per_lang", type=int, default=10)
+    p.add_argument("--probe_sentences_per_lang", type=int, default=30,
+                   help="Sentences per language for the capability probe; each costs 5 "
+                        "generations. The previous default of 10 gave 50 points per "
+                        "language, at which per-language orderings are not trustworthy.")
+    p.add_argument("--batch_size", type=int, default=8,
+                   help="Generation batch size. The probe is generation-bound; batching is "
+                        "what makes a trustworthy sentence count affordable.")
+    p.add_argument("--budget_scale_json", default=None,
+                   help="Path to a tools/ruler_audit.py report (or a plain {lang: k} map). "
+                        "Converts the true-phoneme budget into the character budget a "
+                        "character-ruled checkpoint was actually taught — the salvage path.")
+    p.add_argument("--semantic_threshold", type=float, default=0.80)
+    p.add_argument("--semantic_device", default=None)
+    p.add_argument("--no_semantic", action="store_true",
+                   help="Skip semantic scoring (faster; loses the production-side fidelity axis).")
+    p.add_argument("--dump_samples_langs", nargs="*", default=[])
+    p.add_argument("--dump_samples_n", type=int, default=8)
     run(p.parse_args())
 
 
