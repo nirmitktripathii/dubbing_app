@@ -368,6 +368,85 @@ def test_unlabelled_corpus_is_refused():
     assert raised, "a corpus with no ruler tag predates the repair and must be refused"
 
 
+def test_pooled_probe_slope_is_not_zero_referenced():
+    """The scar: a model that emits its natural translation every time, ignoring the
+    budget completely, scores 0.60-0.83 on the pooled probe — not 0. Reading that number
+    against zero overstates every model, and it is why five languages looked like they
+    were 'partially following' when they were at or below their own floor."""
+    from evaluation.phoneme_adherence_eval import linfit_slope
+
+    naturals = [20, 28, 35, 41, 47, 52, 58, 63]
+    scales = [0.6, 0.8, 1.0, 1.2, 1.4]
+    req = [float(max(1, round(n * s))) for n in naturals for s in scales]
+    flat = [float(n) for n in naturals for _ in scales]          # ignores the budget
+
+    pooled, _ = linfit_slope(req, flat)
+    assert pooled > 0.5, ("if this ever drops to ~0 the pooled estimator has been fixed "
+                          "and this test should become an equality check")
+
+    # The within-sentence estimator on the same flat model. This is the one to read.
+    norm, _ = linfit_slope([s for _ in naturals for s in scales],
+                           [1.0 for _ in naturals for _ in scales])
+    assert abs(norm) < 1e-9, f"normalised slope must be 0 for a flat model, got {norm}"
+
+
+def test_response_diagnosis_separates_the_four_failure_shapes():
+    """A slope alone cannot distinguish four defects that need four different fixes.
+    These are the canonical shapes; if the classifier stops separating them, the
+    pre-registered branch in PHASE02_RUNBOOK.md is being chosen by accident."""
+    import random
+    from evaluation.response_diagnosis import diagnose
+
+    random.seed(7)
+    scales = [0.4, 0.55, 0.7, 0.85, 1.0, 1.15, 1.3, 1.6, 2.0]
+    shapes = {
+        "obeys":    lambda s: s,
+        "flat":     lambda s: 1.0,
+        "noisy":    lambda s: 1.0 + random.gauss(0, 0.35),
+        "saturate": lambda s: min(max(s, 0.82), 1.25),
+        "asym":     lambda s: s if s >= 1.0 else 1.0,
+    }
+    expect = {"obeys": "OBEYS", "flat": "FLAT", "noisy": "NOISY",
+              "saturate": "SATURATING", "asym": "ASYMMETRIC"}
+
+    pts = []
+    for name, fn in shapes.items():
+        for si in range(25):
+            nat = random.randint(25, 60)
+            for s in scales:
+                ratio = fn(s) + (0 if name == "noisy" else random.gauss(0, 0.04))
+                pts.append({"language": name, "sentence_idx": si, "scale": s,
+                            "natural_n": nat, "requested_n": round(nat * s),
+                            "produced_n": max(1, round(nat * ratio))})
+
+    got = {lg: v["diagnosis"] for lg, v in diagnose(pts)["per_language"].items()}
+    assert got == expect, f"expected {expect}, got {got}"
+
+
+def test_preflight_rejects_a_corpus_with_no_elastic_rows():
+    """The defect that cost Phase 02 two weeks: every row's budget is its own completion's
+    length, so ignoring the budget is a correct answer everywhere and nothing teaches the
+    task. This must be caught on CPU, before a push."""
+    from tools.preflight import check_elasticity, check_direction
+
+    rigid = [{"language": "hi", "english": f"sentence {i}", "n_phonemes": 30 + i}
+             for i in range(500)]
+    assert check_elasticity(rigid, "t").state == "FAIL"
+    assert check_direction(rigid, "t").state == "FAIL"
+
+    # The same corpus with each input seen at three budgets.
+    elastic = []
+    for i in range(500):
+        base = 30 + i % 20
+        elastic.append({"language": "hi", "english": f"s{i}", "n_phonemes": base})
+        elastic.append({"language": "hi", "english": f"s{i}", "n_phonemes": round(base * 0.7),
+                        "augmentation": {"direction": "compress"}})
+        elastic.append({"language": "hi", "english": f"s{i}", "n_phonemes": round(base * 1.4),
+                        "augmentation": {"direction": "expand"}})
+    assert check_elasticity(elastic, "t").state == "PASS"
+    assert check_direction(elastic, "t").state == "PASS"
+
+
 def test_required_wandb_aborts_instead_of_running_blind():
     """Session 02i burned ~12 GPU-hours with no live channel because a Kaggle secrets
     outage was only a warning. Under --wandb_required the same condition must abort."""
@@ -375,9 +454,8 @@ def test_required_wandb_aborts_instead_of_running_blind():
     from evaluation.phoneme_adherence_eval import wandb_init
 
     saved = os.environ.pop("WANDB_API_KEY", None)
-    netrc = Path.home() / ".netrc"
     try:
-        if netrc.exists():
+        if any((Path.home() / n).exists() for n in (".netrc", "_netrc")):
             return  # a real credential is present; this machine cannot exercise the path
         raised = False
         try:

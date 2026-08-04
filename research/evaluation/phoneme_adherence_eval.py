@@ -512,6 +512,7 @@ def length_response_probe(model, tok, rows_by_lang: dict, sentences_per_lang: in
                               batch_size=batch_size)
 
         req_all, gen_all = [], []
+        norm_x, norm_y = [], []       # scale vs produced/natural — see the note below
         by_sentence: dict[int, dict[float, str]] = defaultdict(dict)
         for (si, f, want, _), gen in zip(specs, gens):
             if not gen:
@@ -521,6 +522,9 @@ def length_response_probe(model, tok, rows_by_lang: dict, sentences_per_lang: in
                 continue
             req_all.append(float(want))
             gen_all.append(float(n_gen))
+            if naturals[si] > 0:
+                norm_x.append(float(f))
+                norm_y.append(n_gen / naturals[si])
             by_sentence[si][f] = gen
             if points_sink is not None:
                 points_sink.append({
@@ -530,6 +534,22 @@ def length_response_probe(model, tok, rows_by_lang: dict, sentences_per_lang: in
                 })
 
         slope, r2 = linfit_slope(req_all, gen_all)
+
+        # `slope` above is NOT zero-referenced, and that is easy to miss. It regresses raw
+        # produced length on raw requested length, pooling points from sentences of
+        # different lengths — and since requested = scale x natural, the spread of natural
+        # leaks into the fit. A model that emits its natural translation every time,
+        # ignoring the budget completely, therefore scores 0.60-0.83 rather than 0, with a
+        # different value in every language. Reading it against 0 overstates every model.
+        #
+        # So report the floor next to it, and report the within-sentence estimator, in
+        # which natural divides out and 0 really does mean "ignored the budget".
+        floor, _ = linfit_slope(
+            [float(max(1, round(naturals[si] * f))) for si in range(len(naturals))
+             for f in LENGTH_SWEEP_FACTORS],
+            [float(naturals[si]) for si in range(len(naturals))
+             for _ in LENGTH_SWEEP_FACTORS])
+        slope_norm, r2_norm = linfit_slope(norm_x, norm_y)
 
         # Semantic cost of compression, anchored the way production anchors it.
         sims, degraded, n_scored = [], 0, 0
@@ -551,8 +571,17 @@ def length_response_probe(model, tok, rows_by_lang: dict, sentences_per_lang: in
 
         out[lang] = {
             "language": lang,
+            # The one to read. Zero-referenced: 0 = ignores the budget, 1 = follows it.
+            "length_slope_normalized": slope_norm,
+            "length_r2_normalized": r2_norm,
+            # Kept for continuity with earlier reports, with the floor beside it so the
+            # number cannot be read against zero by mistake.
             "length_slope_probe": slope,
             "length_r2_probe": r2,
+            "length_slope_probe_floor": floor,
+            "length_slope_probe_above_floor": (
+                (slope - floor) / (1.0 - floor)
+                if slope is not None and floor is not None and floor < 1.0 else None),
             "n_points": len(req_all),
             "n_sentences": len(naturals),
             "compressed_semantic_mean": statistics.fmean(sims) if sims else None,
@@ -823,9 +852,11 @@ def wandb_init(manifest: dict, project: str, entity: Optional[str],
 
     # Check the credential before anything expensive. Without this the run discovers the
     # problem after loading an 8B model, or not at all.
+    # Both filenames: wandb writes `_netrc` on Windows and `.netrc` everywhere else, and
+    # checking only the POSIX name makes this abort on the one machine it runs from.
     if required and not (os.environ.get("WANDB_API_KEY") or
-                         (Path.home() / ".netrc").exists()):
-        return _fail("no WANDB_API_KEY in the environment and no ~/.netrc")
+                         any((Path.home() / n).exists() for n in (".netrc", "_netrc"))):
+        return _fail("no WANDB_API_KEY in the environment and no ~/.netrc or ~/_netrc")
 
     try:
         run = wandb.init(project=project, entity=entity, name=run_name,
