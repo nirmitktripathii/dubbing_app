@@ -1,0 +1,21 @@
+{
+  "generated_utc": "2026-08-04T05:44:59.082606+00:00",
+  "ruler": "phonemes:espeak-ng-1.50",
+  "val_jsonl": "/kaggle/input/notebooks/nktthegreat/02h-ruler-audit/data/val.phonemes.jsonl",
+  "n_val_rows": 1650,
+  "mode": "all",
+  "adherence_samples_per_lang": 30,
+  "probe_sentences_per_lang": 25,
+  "chrf_available": true,
+  "chrf_unavailable_reason": null,
+  "semantic_available": true,
+  "semantic_threshold": 0.8,
+  "budget_scale": null,
+  "checkpoints": [
+    "base_model",
+    "checkpoint-2558",
+    "checkpoint-3200",
+    "checkpoint-3400",
+    "checkpoint-3801"
+  ]
+}

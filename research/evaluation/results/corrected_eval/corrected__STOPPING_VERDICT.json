@@ -1,0 +1,10 @@
+{
+  "verdict": "CONTINUE",
+  "reason": "CE flat (delta +0.0001) but probe slope still climbing (0.623 -> 0.637, delta +0.014). Length control is still being learned after the loss curve went quiet. Keep spending quota.",
+  "ce_delta": 7.492488247273776e-05,
+  "slope_delta": 0.014216147058698447,
+  "steps_compared": [
+    3400,
+    3801
+  ]
+}

@@ -368,6 +368,32 @@ def test_unlabelled_corpus_is_refused():
     assert raised, "a corpus with no ruler tag predates the repair and must be refused"
 
 
+def test_required_wandb_aborts_instead_of_running_blind():
+    """Session 02i burned ~12 GPU-hours with no live channel because a Kaggle secrets
+    outage was only a warning. Under --wandb_required the same condition must abort."""
+    import os
+    from evaluation.phoneme_adherence_eval import wandb_init
+
+    saved = os.environ.pop("WANDB_API_KEY", None)
+    netrc = Path.home() / ".netrc"
+    try:
+        if netrc.exists():
+            return  # a real credential is present; this machine cannot exercise the path
+        raised = False
+        try:
+            wandb_init({}, "p", "e", "r", required=True)
+        except SystemExit as e:
+            raised = True
+            assert "wandb_required" in str(e), "the error must say how to opt out"
+        assert raised, "a missing credential must be fatal when W&B is required"
+
+        # Without the flag the old behaviour stands: warn and keep the disk artifacts.
+        assert wandb_init({}, "p", "e", "r", required=False) is None
+    finally:
+        if saved is not None:
+            os.environ["WANDB_API_KEY"] = saved
+
+
 if __name__ == "__main__":
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]

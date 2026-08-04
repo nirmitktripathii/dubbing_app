@@ -76,3 +76,6 @@ implementation_plan_v3.md
 audio_quality_report.md
 walkthrough.md
 task.md
+
+# W&B local run cache (the run of record is the hosted project, not this)
+wandb/

@@ -1,0 +1,2 @@
+checkpoint,step,adherence_rel_mean,adherence_signed_mean,ce_mean,ce_perplexity,chrf_mean,compressed_degraded_frac,length_slope_population,length_slope_probe,semantic_degraded_frac,semantic_mean
+checkpoint-3801,3801,0.12465109143226583,-0.04071534160106231,,,31.259373190193504,0.2781818181818182,0.6655579359690142,0.63585396385472,0.3522727272727273,0.8284516386687756

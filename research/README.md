@@ -8,6 +8,29 @@ the articles traces to a file here.
 
 ---
 
+## ⚠ Read this before quoting any number below
+
+Two audits in August 2026 invalidated the original measurements. Both are documented, and
+the superseded numbers are kept rather than deleted so the correction is auditable.
+
+| Document | What it establishes |
+|---|---|
+| [`RULER_AUDIT_FINDINGS.md`](RULER_AUDIT_FINDINGS.md) | The corpus was labelled with **character** counts while the prompts said "phonemes" — a silent `except Exception` fallback in the phonemizer, firing for the whole corpus. `frac_label_eq_chars = 1.00` in all 11 languages. |
+| [`CORRECTED_EVAL_FINDINGS.md`](CORRECTED_EVAL_FINDINGS.md) | Re-evaluation under the corrected ruler. The aggregate hides a **two-population split**: 6 languages follow the phoneme budget (probe slope 0.69–0.94), 5 effectively ignore it (0.35–0.42). |
+
+Concretely, in the tables that follow:
+
+- **Any length/adherence figure sourced from `eval_out_*` is measured in characters, not
+  phonemes.** Superseded by `evaluation/results/corrected_eval/`.
+- **Any "length slope" quoted as a single number is the *population* estimator**, which
+  regresses across different sentences and is confounded by sentence length. A model that
+  ignores the budget entirely still scores well on it. The estimator that answers the
+  question is `length_slope_probe` — same sentence, budget swept 0.6×–1.4×.
+- The decoupling result (loss flat, length control still improving) **reproduces** under the
+  corrected ruler and stands.
+
+---
+
 ## Project status
 
 The dubbing pipeline is **in development — stage 3 of 7**. What's here is a complete record
@@ -31,7 +54,10 @@ still moving and isn't published yet; these are its measurements.
 
 | Claim | File |
 |---|---|
-| Length error 0.495 → 0.103; chrF++ 22.0 → 30.1; signed error +0.290 → −0.043; length slope 0.593 → 0.687 | `evaluation/results/eval_out_all__eval_report.md` |
+| **Corrected, phoneme-ruled** — relErr 0.565 → 0.117; signed +0.344 → −0.013; chrF++ 21.3 → 30.3; **probe** slope 0.481 → 0.637, split two ways across languages | `evaluation/results/corrected_eval/corrected__eval_report.md` |
+| **Corrected** per-language probe slope and R² | `evaluation/results/corrected_eval/corrected__length_response.csv` |
+| **Corrected** — the budget-rescale falsification test (salvage path closed) | `evaluation/results/corrected_eval/rescaled__eval_report.md` |
+| ~~Length error 0.495 → 0.103; chrF++ 22.0 → 30.1; signed error +0.290 → −0.043; length slope 0.593 → 0.687~~ **superseded — character ruler, population slope** | `evaluation/results/eval_out_all__eval_report.md` |
 | Full per-checkpoint trajectory for those four metrics | `evaluation/results/eval_out_all__trajectory_summary.csv` |
 | Cross-entropy across all 23 checkpoints; minimum at step 3200 | `evaluation/results/eval_out_ce__eval_report.md` |
 | Per-language decomposition (the aggregate hides that languages plateau at different steps) | `evaluation/results/eval_out_ce__per_checkpoint_metrics.csv` |
@@ -74,10 +100,19 @@ The four metrics, and why each exists:
 - **`adherence_signed_mean`** — the same miss with its sign, so you can see whether the
   model runs systematically long or short. The base model sits at +0.290; that bias is why
   naive dubbing pipelines always need a compressor.
-- **`length_slope`** — regress produced length on requested length across five budgets for
-  the same sentence. Slope 1.0 = full obedience, slope 0 = the budget was ignored. This is
-  the only metric here that is mathematically independent of cross-entropy, which is what
-  makes it useful.
+- **`length_slope_probe`** — regress produced length on requested length across five budgets
+  **for the same sentence**. Slope 1.0 = full obedience, slope 0 = the budget was ignored.
+  This is the only metric here that is mathematically independent of cross-entropy, which is
+  what makes it useful. It is *the* acceptance metric, read per language.
+- **`length_slope_population`** — the same regression run across *different* sentences. It is
+  reported for comparison and must never be selected on: it is confounded by sentence length,
+  so a model that ignores the budget entirely still scores well. The harness names the two
+  separately for exactly this reason; an earlier version reported only this one under the
+  bare name `length_slope`.
+- **`semantic_mean` / `semantic_degraded_frac`** — cosine similarity against the reference
+  under `paraphrase-multilingual-MiniLM-L12-v2`, and the fraction falling below the 0.80
+  gate. Budget obedience and meaning trade against each other (r = −0.58 across the eleven
+  languages), so a slope number without a semantic number beside it is not interpretable.
 - **`chrf_mean`** — translation quality, as a guard against hitting the budget by deleting
   content.
 
@@ -96,6 +131,11 @@ But between steps 3200 and 3801, while loss was flat:
 
 - length error kept falling, 0.104 → 0.103
 - length slope kept climbing, 0.656 → **0.687**
+
+> Those two figures are the superseded character-ruled, population-slope versions. Under the
+> corrected phoneme ruler the same decoupling holds — CE moved +0.0001 between steps 3400
+> and 3801 while the **probe** slope rose 0.623 → 0.637 — so the finding survives its own
+> re-measurement. See [`CORRECTED_EVAL_FINDINGS.md`](CORRECTED_EVAL_FINDINGS.md) §5.
 
 The slope is computed from generated text, not from teacher-forced likelihood of a
 reference, so it is not a restatement of the loss. A rising slope against a flat loss is

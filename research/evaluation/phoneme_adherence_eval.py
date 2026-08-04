@@ -462,7 +462,8 @@ def length_response_probe(model, tok, rows_by_lang: dict, sentences_per_lang: in
                           semantic: Optional[SemanticScorer] = None,
                           semantic_threshold: float = 0.80,
                           budget_scale: Optional[dict] = None,
-                          batch_size: int = 8) -> dict:
+                          batch_size: int = 8,
+                          points_sink: Optional[list] = None) -> dict:
     """The capability probe: one sentence, five budgets, only the budget varies.
 
     Natural length is measured from the reference text with the canonical counter rather
@@ -472,6 +473,12 @@ def length_response_probe(model, tok, rows_by_lang: dict, sentences_per_lang: in
     The semantic anchor here is the model's own 1.0x generation — the same anchor the
     inference gate uses, because at dub time no reference exists. That makes the degraded
     rate reported here directly comparable to what the shipped gate will see.
+
+    `points_sink` collects the raw (requested, produced) pairs. Session 02i stored only the
+    fitted slope and R², and that turned out to be too little: five languages came back at
+    slope ~0.4 with R² ~0.55, and a summary statistic cannot distinguish "flat across the
+    whole sweep" from "follows the budget down to 0.8x and then saturates". Those are
+    different defects with different fixes.
     """
     out = {}
     for lang, rows in rows_by_lang.items():
@@ -515,6 +522,12 @@ def length_response_probe(model, tok, rows_by_lang: dict, sentences_per_lang: in
             req_all.append(float(want))
             gen_all.append(float(n_gen))
             by_sentence[si][f] = gen
+            if points_sink is not None:
+                points_sink.append({
+                    "language": lang, "sentence_idx": si, "scale": f,
+                    "natural_n": naturals[si], "requested_n": want,
+                    "produced_n": n_gen,
+                })
 
         slope, r2 = linfit_slope(req_all, gen_all)
 
@@ -658,7 +671,14 @@ def run(args):
     do_probe = args.mode in ("all", "length")
 
     per_ckpt_rows, traj_rows, lr_rows, sample_rows = [], [], [], []
+    probe_point_rows: list[dict] = []
     dump_langs = set(args.dump_samples_langs or [])
+
+    wb = wandb_init({"ruler": g2p["ruler"], "val_jsonl": args.val_jsonl, "mode": args.mode,
+                     "checkpoints": [t[0] for t in targets],
+                     "budget_scale": budget_scale}, args.wandb_project,
+                    args.wandb_entity, args.wandb_run_name,
+                    required=args.wandb_required) if args.wandb else None
 
     for label, adapter in targets:
         logger.info("=== Evaluating %s ===", label)
@@ -671,11 +691,15 @@ def run(args):
             dump_langs=dump_langs, dump_n=args.dump_samples_n,
             dump_sink=sample_rows, ckpt_label=label,
         )
+        ckpt_points: list[dict] = []
         probe = length_response_probe(
             model, tok, rows_by_lang, args.probe_sentences_per_lang,
             semantic=semantic, semantic_threshold=args.semantic_threshold,
             budget_scale=budget_scale, batch_size=args.batch_size,
+            points_sink=ckpt_points,
         ) if do_probe else {}
+        probe_point_rows += [{"checkpoint": label, "step": checkpoint_step(adapter)
+                              if adapter else -1, **p} for p in ckpt_points]
 
         def agg(source: dict, key: str):
             vals = [v[key] for v in source.values() if v.get(key) is not None]
@@ -705,6 +729,12 @@ def run(args):
         _write_csv(out_dir / "trajectory_summary.csv", traj_rows)
         if lr_rows:
             _write_csv(out_dir / "length_response.csv", lr_rows)
+        if probe_point_rows:
+            _write_csv(out_dir / "length_response_points.csv", probe_point_rows)
+        # Stream to W&B on the same cadence as the CSVs — this is the only signal
+        # visible while the session is still running.
+        wandb_log_checkpoint(wb, traj_rows[-1],
+                             [r for r in per_ckpt_rows if r["step"] == step])
 
         del model
         try:
@@ -736,7 +766,153 @@ def run(args):
     }
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     _write_report(out_dir / "eval_report.md", traj_rows, per_ckpt_rows, lr_rows, manifest)
+    if wb is not None:
+        try:
+            import wandb as _wb
+            cols = ["checkpoint", "step", "language", "adherence_rel_mean",
+                    "adherence_signed_mean", "length_slope_probe",
+                    "length_slope_population", "chrf_mean", "semantic_mean",
+                    "semantic_degraded_frac", "ce_mean"]
+            tbl = _wb.Table(columns=cols)
+            for r in per_ckpt_rows:
+                tbl.add_data(*[r.get(c) for c in cols])
+            wb.log({"per_language": tbl})
+            v = stopping_verdict(traj_rows)
+            wb.summary["stopping_verdict"] = v["verdict"]
+            wb.summary["stopping_reason"] = v.get("reason", "")
+            wb.summary["ruler"] = manifest.get("ruler")
+            wb.finish()
+            logger.info("wandb run CLOSED")
+        except Exception as e:  # noqa: BLE001
+            logger.error("wandb finalisation failed: %s", e)
     logger.info("Wrote outputs to %s", out_dir)
+
+
+def wandb_init(manifest: dict, project: str, entity: Optional[str],
+               run_name: Optional[str], required: bool = False):
+    """Opens the W&B run BEFORE evaluation starts, so metrics can stream.
+
+    The first version of this logged everything in one call at the end of `run()`. That
+    makes W&B useless for its actual job here: Kaggle publishes a notebook's log only when
+    the session ends, so W&B is the only live signal during a multi-hour run — and a
+    channel that reports nothing until the run is over is not a live signal. Metrics are
+    now logged after each checkpoint completes, matching the CSV writes.
+
+    `required=True` turns every failure below into a hard exit. Session 02i is why: Kaggle's
+    secrets service returned a connection error, the notebook logged a warning and carried
+    on, and 12 GPU-hours ran with no observability at all. "The artifacts land on disk
+    anyway" is a fair argument for a five-minute local run and a bad one for a session that
+    costs a third of the weekly quota. Pass it for anything running on Kaggle.
+    """
+    def _fail(msg: str):
+        if required:
+            raise SystemExit(
+                f"W&B is required for this run and could not start: {msg}\n"
+                f"  This is fatal by design — a multi-hour GPU session with no live channel\n"
+                f"  is unobservable until it ends. Fix the credential and re-push, or drop\n"
+                f"  --wandb_required if you accept running blind."
+            )
+        logger.error("%s — continuing without it. The evaluation artifacts on disk are "
+                     "unaffected.", msg)
+        return None
+
+    try:
+        import wandb
+    except ImportError:
+        return _fail("wandb not installed (pip install wandb)")
+
+    # Check the credential before anything expensive. Without this the run discovers the
+    # problem after loading an 8B model, or not at all.
+    if required and not (os.environ.get("WANDB_API_KEY") or
+                         (Path.home() / ".netrc").exists()):
+        return _fail("no WANDB_API_KEY in the environment and no ~/.netrc")
+
+    try:
+        run = wandb.init(project=project, entity=entity, name=run_name,
+                         job_type="evaluation", config=manifest, reinit=True)
+        logger.info("wandb run OPEN: %s", getattr(run, "url", ""))
+        return run
+    except Exception as e:  # noqa: BLE001
+        return _fail(f"wandb.init failed ({e})")
+
+
+def wandb_log_checkpoint(run, traj_row: dict, lang_rows: list[dict]) -> None:
+    """Streams one checkpoint's metrics as soon as it finishes."""
+    if run is None:
+        return
+    step = traj_row["step"] if traj_row["step"] >= 0 else 0
+    payload = {f"agg/{k}": v for k, v in traj_row.items()
+               if k not in ("checkpoint", "step") and v is not None}
+    for r in lang_rows:
+        lang = r.get("language")
+        for k in ("adherence_rel_mean", "adherence_signed_mean", "length_slope_probe",
+                  "length_slope_population", "chrf_mean", "semantic_mean",
+                  "semantic_degraded_frac", "ce_mean"):
+            if r.get(k) is not None:
+                payload[f"{lang}/{k}"] = r[k]
+    try:
+        run.log(payload, step=step)
+        logger.info("wandb: logged %d metrics at step %d", len(payload), step)
+    except Exception as e:  # noqa: BLE001
+        logger.error("wandb log failed at step %s: %s", step, e)
+
+
+def log_to_wandb(traj: list[dict], per_ckpt: list[dict], manifest: dict,
+                 project: str, entity: Optional[str], run_name: Optional[str]) -> None:
+    """Mirrors the report into Weights & Biases.
+
+    What gets logged is deliberately not what was logged last time. CE and perplexity go up
+    as *diagnostics*; the panels that matter are `length_slope_probe`, signed adherence, and
+    the semantic degraded rate — the metrics that measure the objective. Logging CE
+    prominently is how a run gets stopped on the wrong signal, and this project has already
+    paid for that once.
+
+    Per-language series are logged individually (`as/length_slope_probe`, …) because the
+    aggregate hides that eleven languages across two families do not plateau together.
+    """
+    try:
+        import wandb
+    except ImportError:
+        logger.warning("wandb not installed — skipping (pip install wandb)")
+        return
+
+    try:
+        run = wandb.init(project=project, entity=entity, name=run_name,
+                         job_type="evaluation", config=manifest, reinit=True)
+    except Exception as e:  # noqa: BLE001
+        logger.error("wandb.init failed (%s) — continuing without it. The evaluation "
+                     "artifacts on disk are unaffected.", e)
+        return
+
+    for t in sorted(traj, key=lambda x: x["step"]):
+        step = t["step"] if t["step"] >= 0 else 0
+        payload = {f"agg/{k}": v for k, v in t.items()
+                   if k not in ("checkpoint", "step") and v is not None}
+        for r in per_ckpt:
+            if r["step"] != t["step"]:
+                continue
+            lang = r.get("language")
+            for k in ("adherence_rel_mean", "adherence_signed_mean", "length_slope_probe",
+                      "length_slope_population", "chrf_mean", "semantic_mean",
+                      "semantic_degraded_frac", "ce_mean"):
+                if r.get(k) is not None:
+                    payload[f"{lang}/{k}"] = r[k]
+        run.log(payload, step=step)
+
+    cols = ["checkpoint", "step", "language", "adherence_rel_mean", "adherence_signed_mean",
+            "length_slope_probe", "length_slope_population", "chrf_mean", "semantic_mean",
+            "semantic_degraded_frac", "ce_mean"]
+    tbl = wandb.Table(columns=cols)
+    for r in per_ckpt:
+        tbl.add_data(*[r.get(c) for c in cols])
+    run.log({"per_language": tbl})
+
+    v = stopping_verdict(traj)
+    run.summary["stopping_verdict"] = v["verdict"]
+    run.summary["stopping_reason"] = v.get("reason", "")
+    run.summary["ruler"] = manifest.get("ruler")
+    run.finish()
+    logger.info("wandb run: %s", getattr(run, "url", ""))
 
 
 def _write_csv(path, rows):
@@ -745,10 +921,15 @@ def _write_csv(path, rows):
     cols = list({k for r in rows for k in r.keys()})
     order = ["checkpoint", "step", "language"]
     cols = [c for c in order if c in cols] + sorted(c for c in cols if c not in order)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(",".join(cols) + "\n")
+    # csv.writer rather than manual joining: any value containing a comma — a ruler string,
+    # a language name, a failure message — silently shifts every subsequent column when you
+    # join by hand, and the file still parses, just wrongly.
+    import csv
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(cols)
         for r in rows:
-            f.write(",".join("" if r.get(c) is None else str(r.get(c)) for c in cols) + "\n")
+            w.writerow(["" if r.get(c) is None else r.get(c) for c in cols])
 
 
 def _fmt(x, p=3):
@@ -840,6 +1021,17 @@ def _cli():
     p.add_argument("--semantic_device", default=None)
     p.add_argument("--no_semantic", action="store_true",
                    help="Skip semantic scoring (faster; loses the production-side fidelity axis).")
+    p.add_argument("--wandb", action="store_true", help="Mirror the report into W&B.")
+    p.add_argument("--wandb_project", default="indic-dubbing-v3")
+    # The personal namespace `nktthegreat` holds ZERO projects; everything lives
+    # under the team entity. Getting this wrong sends metrics to a namespace nobody
+    # looks at, and the run appears to have logged nothing.
+    p.add_argument("--wandb_entity", default="nktthegreat-soccernet")
+    p.add_argument("--wandb_run_name", default=None)
+    p.add_argument("--wandb_required", action="store_true",
+                   help="Abort before loading a model if W&B cannot start. Pass this for "
+                        "any Kaggle session: session 02i burned ~12 GPU-hours with no live "
+                        "channel because a secrets-service outage was only a warning.")
     p.add_argument("--dump_samples_langs", nargs="*", default=[])
     p.add_argument("--dump_samples_n", type=int, default=8)
     run(p.parse_args())
