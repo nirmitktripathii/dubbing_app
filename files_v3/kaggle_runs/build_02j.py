@@ -21,6 +21,70 @@ OUT = REPO / "files_v3" / "kaggle_runs" / "02j_budget_sweep.ipynb"
 SRC = REPO / "files_v3" / "kaggle_runs" / "02i_corrected_eval.ipynb"
 
 # Modules written into /kaggle/working/pipeline_v3, in dependency order.
+# The credential cell, generated rather than reused, so every notebook this builder makes
+# gets the identical one. Two secrets, both looked up only if not already in the
+# environment, and the failure policy differs between them on purpose.
+CREDENTIALS = '''# Kaggle secrets. This runs BEFORE anything expensive, on purpose.
+#
+# A secret lives on the account but must be ticked for EACH notebook individually
+# (Add-ons -> Secrets). An unattached secret does not report as missing: it raises
+# "Connection error trying to communicate with service", which reads like a transient
+# outage and invites a retry loop that can never succeed. Sessions 02i and 02j both hit
+# this. 02i treated it as a warning and burned ~12 GPU-hours with no live channel.
+import os
+
+_WANTED = {
+    # name             fatal   why
+    "WANDB_API_KEY":  (True,  "Kaggle publishes a notebook log only when the session ENDS, "
+                              "so W&B is the only channel that reports while this runs. A "
+                              "blind multi-hour session is not cheaper than no session."),
+    "HF_TOKEN":       (False, "Needed for gated repos such as meta-llama/*. Unsloth "
+                              "resolves to its own non-gated 4-bit mirror, so a run can "
+                              "survive without this - but it will fail late and "
+                              "confusingly if it ever does need it."),
+}
+
+_client = None
+_status = {}
+for _name, (_fatal, _why) in _WANTED.items():
+    if os.environ.get(_name):
+        _status[_name] = "already in environment"
+        continue
+    try:
+        if _client is None:
+            from kaggle_secrets import UserSecretsClient
+            _client = UserSecretsClient()
+        os.environ[_name] = _client.get_secret(_name)
+        _status[_name] = "loaded from Kaggle secrets"
+    except Exception as _e:
+        _status[_name] = f"UNAVAILABLE ({type(_e).__name__}: {_e})"
+        if _fatal:
+            raise RuntimeError(
+                "{} could not be loaded: {}\\n"
+                "  Open this notebook -> Add-ons -> Secrets -> tick {}.\\n"
+                "  Note: an UNATTACHED secret reports as a connection error, so this is "
+                "almost always an attachment problem rather than an outage.\\n"
+                "  Refusing to start. {}".format(_name, _e, _name, _why)) from _e
+        print("WARNING: {} {} - {}".format(_name, _status[_name], _why))
+
+# Aliases the HF libraries actually read.
+if os.environ.get("HF_TOKEN"):
+    os.environ.setdefault("HUGGING_FACE_HUB_TOKEN", os.environ["HF_TOKEN"])
+
+os.environ.setdefault("WANDB_ENTITY", "nktthegreat-soccernet")
+os.environ.setdefault("WANDB_PROJECT", "indic-dubbing-v3")
+
+# Never print a value. A W&B key is 40 hex characters; anything else is the wrong string,
+# and catching that here beats catching it at wandb.init after the model is loaded.
+for _name, _s in _status.items():
+    _v = os.environ.get(_name) or ""
+    _len = "{} chars".format(len(_v)) if _v else "absent"
+    _flag = ""
+    if _name == "WANDB_API_KEY" and _v and len(_v) != 40:
+        _flag = "  <-- expected 40, check the secret"
+    print("{:<16} {:<28} {}{}".format(_name, _s, _len, _flag))
+'''
+
 MODULES = [
     ("common/__init__.py", None),
     ("common/languages.py", PV3 / "common/languages.py"),
@@ -55,9 +119,10 @@ def writefile(dest: str, path) -> dict:
 
 def build() -> None:
     src_nb = json.loads(SRC.read_text(encoding="utf-8"))
-    # Cells 2-5 are the credential, torch-record, install and CUDA preflight. They are
-    # environment setup that took six attempts to get right; reuse them verbatim.
-    setup = src_nb["cells"][2:6]
+    # Cells 3-5 are the torch-record, install and CUDA preflight: environment setup that
+    # took six attempts to get right, reused verbatim. The credential cell (02i's cell 2)
+    # is regenerated instead, so every notebook this builder produces has the same one.
+    setup = [code(CREDENTIALS)] + src_nb["cells"][3:6]
 
     cells: list[dict] = [md("""# 02j — Budget-response sweep: WHY five languages ignore the phoneme budget
 

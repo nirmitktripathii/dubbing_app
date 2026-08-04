@@ -50,6 +50,23 @@ W&B is the only channel that reports anything at all.
 - Lead with the objective. Cross-entropy and perplexity are diagnostics and must be
   labelled as such.
 
+**Every Kaggle notebook loads both secrets in its first cell**, checking the environment
+before asking Kaggle for them:
+
+```python
+from kaggle_secrets import UserSecretsClient
+user_secrets = UserSecretsClient()
+user_secrets.get_secret("HF_TOKEN")        # gated HF repos; warn if absent
+user_secrets.get_secret("WANDB_API_KEY")   # the live channel; FATAL if absent
+```
+
+`build_*.py` generates this cell, so it is identical everywhere and cannot drift. A secret
+lives on the account but must be **ticked for each notebook individually** (Add-ons →
+Secrets), and an unattached secret raises `Connection error trying to communicate with
+service` rather than reporting as missing — so a retry loop can never succeed and the
+message points at the wrong problem. Never print a secret's value; a W&B key is 40 hex
+characters, and checking the length catches a wrong paste before a model is loaded.
+
 **And it must be watched, not merely written.** While any run is live:
 
 ```bash
