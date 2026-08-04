@@ -284,8 +284,26 @@ def check_ruler(rows: list[dict], label: str) -> Check:
         return Check("ruler", FAIL,
                      f"{label}: ruler is {only!r}, not a phoneme ruler — run "
                      f"tools/relabel_dataset.py first", {"ruler": only})
-    return Check("ruler", PASS, f"{label}: uniform {only!r} across {len(rows)} rows",
-                 {"ruler": only})
+
+    # Version skew is the original bug wearing a different hat. espeak-ng 1.50 and 1.52
+    # do not have to agree on phoneme counts, so labels written by one and measured by the
+    # other are mismatched units all over again — and the prefix check above passes
+    # happily. Kaggle's apt gives 1.50; a winget install on Windows gives 1.52.0.
+    try:
+        from common.phonemes import ruler_id
+        here = ruler_id()
+    except Exception:  # noqa: BLE001
+        here = None
+    if here and here != only:
+        return Check("ruler", FAIL,
+                     f"{label}: corpus was labelled with {only!r} but this machine counts "
+                     f"with {here!r}. Relabel where you will train, or pin espeak to the "
+                     f"same version in both places — a version skew is a units mismatch "
+                     f"with a friendlier name.",
+                     {"corpus_ruler": only, "local_ruler": here})
+    return Check("ruler", PASS, f"{label}: uniform {only!r} across {len(rows)} rows"
+                 + (f", matching this machine" if here else ""),
+                 {"ruler": only, "local_ruler": here})
 
 
 # ========================================================================================

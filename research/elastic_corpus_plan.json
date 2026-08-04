@@ -1,0 +1,110 @@
+{
+  "base_rows": 53349,
+  "target_frac": 0.2,
+  "variants": 2,
+  "compress_share": 0.6,
+  "groups_needed": 4104,
+  "total_build_groups": 3167,
+  "total_new_rows": 6334,
+  "per_language": {
+    "as": {
+      "base_rows": 4839,
+      "target_groups": 372,
+      "have_groups": 123,
+      "build_groups": 249,
+      "new_rows": 498,
+      "compress_rows": 299,
+      "expand_rows": 199
+    },
+    "bn": {
+      "base_rows": 4855,
+      "target_groups": 373,
+      "have_groups": 138,
+      "build_groups": 235,
+      "new_rows": 470,
+      "compress_rows": 282,
+      "expand_rows": 188
+    },
+    "gu": {
+      "base_rows": 4855,
+      "target_groups": 373,
+      "have_groups": 137,
+      "build_groups": 236,
+      "new_rows": 472,
+      "compress_rows": 283,
+      "expand_rows": 189
+    },
+    "hi": {
+      "base_rows": 4869,
+      "target_groups": 375,
+      "have_groups": 144,
+      "build_groups": 231,
+      "new_rows": 462,
+      "compress_rows": 277,
+      "expand_rows": 185
+    },
+    "kn": {
+      "base_rows": 4839,
+      "target_groups": 372,
+      "have_groups": 170,
+      "build_groups": 202,
+      "new_rows": 404,
+      "compress_rows": 242,
+      "expand_rows": 162
+    },
+    "ml": {
+      "base_rows": 4851,
+      "target_groups": 373,
+      "have_groups": 170,
+      "build_groups": 203,
+      "new_rows": 406,
+      "compress_rows": 244,
+      "expand_rows": 162
+    },
+    "mr": {
+      "base_rows": 4836,
+      "target_groups": 372,
+      "have_groups": 53,
+      "build_groups": 319,
+      "new_rows": 638,
+      "compress_rows": 383,
+      "expand_rows": 255
+    },
+    "or": {
+      "base_rows": 4839,
+      "target_groups": 372,
+      "have_groups": 0,
+      "build_groups": 372,
+      "new_rows": 744,
+      "compress_rows": 446,
+      "expand_rows": 298
+    },
+    "pa": {
+      "base_rows": 4875,
+      "target_groups": 375,
+      "have_groups": 0,
+      "build_groups": 375,
+      "new_rows": 750,
+      "compress_rows": 450,
+      "expand_rows": 300
+    },
+    "ta": {
+      "base_rows": 4836,
+      "target_groups": 372,
+      "have_groups": 0,
+      "build_groups": 372,
+      "new_rows": 744,
+      "compress_rows": 446,
+      "expand_rows": 298
+    },
+    "te": {
+      "base_rows": 4855,
+      "target_groups": 373,
+      "have_groups": 0,
+      "build_groups": 373,
+      "new_rows": 746,
+      "compress_rows": 448,
+      "expand_rows": 298
+    }
+  }
+}
