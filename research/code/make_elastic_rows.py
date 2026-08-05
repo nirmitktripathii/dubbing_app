@@ -87,27 +87,32 @@ MIN_LENGTH_CHANGE = 0.10     # and moved at least 10% from the original, in the 
 
 PROMPT_TEMPLATE = '[Translate to {language}] [Target Phonemes: {n}] "{english}"'
 
+# One call carries several SENTENCES, each needing several scales. This is not a
+# micro-optimisation: the free tier is metered in requests per day, not tokens, so the
+# number of calls is the binding constraint. 3,167 groups one-per-call is 3,167 requests —
+# four days at flash-lite's ~1,000 RPD. Five sentences per call is ~634 requests, which
+# finishes inside a single day's quota on any of the candidate models.
 INSTRUCTION = """You rewrite sentences in {language} to be longer or shorter while keeping \
 their meaning.
 
-Original {language} sentence:
-{target}
-
-Its English source (for meaning only — do not translate it again):
-{english}
-
-Produce {k} rewrites of the ORIGINAL {language} SENTENCE, each at a different length:
+You will be given {n} numbered {language} sentences. For EACH one, produce {k} rewrites at \
+these lengths relative to the original:
 {spec}
 
 Rules:
 - Stay in {language}. Same script. Never answer in English.
 - Preserve the meaning. Do not drop facts, names, numbers or negation to hit a length.
-- To shorten: prefer shorter synonyms, drop redundancy, tighten grammar. Do not truncate.
+- To shorten: prefer shorter synonyms, drop redundancy, tighten grammar. Do NOT truncate
+  the sentence or leave it unfinished.
 - To lengthen: add natural elaboration that is already implied. Do not invent new facts.
-- Natural, fluent sentences a native speaker would say.
+- Natural, fluent sentences a native speaker would actually say.
 
-Return ONLY a JSON array of {k} objects, no prose, no code fence:
-[{{"scale": <the requested scale>, "text": "<rewrite>"}}]"""
+Sentences:
+{items}
+
+Return ONLY a JSON array, no prose and no code fence. One object per rewrite, so
+{n} x {k} = {total} objects:
+[{{"id": <sentence number>, "scale": <the requested scale>, "text": "<rewrite>"}}]"""
 
 
 EMBEDDER = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
@@ -208,26 +213,84 @@ def call_model(client, model: str, prompt: str, attempts: int = 5) -> list[dict]
     raise RuntimeError(str(last))
 
 
-def build_group(client, model: str, gate: Optional[Gate], row: dict,
-                scales: list[float]) -> list[dict]:
-    """One English sentence -> verified rewrites at several lengths."""
-    lang = row["language"]
-    lang_name = get_language(lang).name
-    ref = row.get("completion") or row.get("target") or ""
-    eng = row.get("english") or ""
-    if not ref or not eng:
-        return []
+def verify(lang: str, ref: str, eng: str, natural: int, text: str, scale: float,
+           gate: Optional[Gate], model: str, thresholds: dict) -> Optional[dict]:
+    """The two gates. Both ours; the generator's opinion does not enter here."""
+    text = (text or "").strip()
+    if not text or text == ref:
+        return None
 
-    natural = count_phonemes(ref, lang)
-    if not natural:
+    # GATE 1 — did it land at the requested length? Measured with the exact counter.
+    try:
+        n = count_phonemes(text, lang)
+    except Exception:  # noqa: BLE001
+        return None
+    if not n:
+        return None
+    want = max(1, round(natural * scale))
+    if abs(n - want) / want > SCALE_TOLERANCE:
+        return None
+    change = (n - natural) / natural
+    wanted_dir = -1 if scale < 1 else 1
+    if wanted_dir * change < MIN_LENGTH_CHANGE:
+        return None            # "shorter" that is barely shorter teaches nothing
+
+    # GATE 2 — or did it hit the length by deleting content? Threshold is PER LANGUAGE:
+    # measured on Kaggle 2026-08-05, a true Tamil paraphrase scored 0.556 where the
+    # equivalent Hindi pair scored 0.997, so one global 0.80 would have starved Tamil of
+    # exactly the rows it most needs.
+    sim = None
+    if gate is not None:
+        sim = gate.similarity(ref, text)
+        if sim < thresholds.get(lang, MIN_SIMILARITY):
+            return None
+
+    lang_name = get_language(lang).name
+    return {
+        "language": lang, "english": eng, "target": text, "completion": text,
+        "n_phonemes": n, "ruler": ruler_id(),
+        "prompt": PROMPT_TEMPLATE.format(language=lang_name, n=n, english=eng),
+        "augmentation": {
+            "direction": "compress" if scale < 1 else "expand",
+            "requested_scale": scale,
+            "source_phonemes": natural,
+            "relative_change": round(change, 4),
+            "similarity": round(sim, 4) if sim is not None else None,
+            "generator": model,
+        },
+    }
+
+
+def build_batch(client, model: str, gate: Optional[Gate], rows: list[dict],
+                scales: list[float], thresholds: dict) -> list[dict]:
+    """Several sentences of ONE language -> verified rewrites at several lengths."""
+    if not rows:
+        return []
+    lang = rows[0]["language"]
+    lang_name = get_language(lang).name
+
+    prepared = []
+    for r in rows:
+        ref = r.get("completion") or r.get("target") or ""
+        eng = r.get("english") or ""
+        if not ref or not eng:
+            continue
+        try:
+            natural = count_phonemes(ref, lang)
+        except Exception:  # noqa: BLE001
+            continue
+        if natural:
+            prepared.append((eng, ref, natural))
+    if not prepared:
         return []
 
     spec = "\n".join(
         f"  - scale {s}: about {abs(1 - s) * 100:.0f}% "
         f"{'shorter' if s < 1 else 'longer'} than the original"
         for s in scales)
-    prompt = INSTRUCTION.format(language=lang_name, target=ref, english=eng,
-                                k=len(scales), spec=spec)
+    items = "\n".join(f"{i + 1}. {ref}" for i, (_, ref, _) in enumerate(prepared))
+    prompt = INSTRUCTION.format(language=lang_name, n=len(prepared), k=len(scales),
+                                total=len(prepared) * len(scales), spec=spec, items=items)
 
     try:
         cands = call_model(client, model, prompt)
@@ -237,49 +300,17 @@ def build_group(client, model: str, gate: Optional[Gate], row: dict,
 
     out = []
     for c in cands:
-        text = (c.get("text") or "").strip()
         try:
+            idx = int(c.get("id")) - 1
             scale = float(c.get("scale"))
         except (TypeError, ValueError):
             continue
-        if not text or text == ref:
+        if not (0 <= idx < len(prepared)):
             continue
-
-        # GATE 1 — did it actually land at the requested length? Measured by us.
-        try:
-            n = count_phonemes(text, lang)
-        except Exception:  # noqa: BLE001
-            continue
-        if not n:
-            continue
-        want = max(1, round(natural * scale))
-        if abs(n - want) / want > SCALE_TOLERANCE:
-            continue
-        change = (n - natural) / natural
-        wanted_dir = -1 if scale < 1 else 1
-        if wanted_dir * change < MIN_LENGTH_CHANGE:
-            continue        # "shorter" that is barely shorter teaches nothing
-
-        # GATE 2 — did it keep the meaning, or hit the length by deleting content?
-        sim = None
-        if gate is not None:
-            sim = gate.similarity(ref, text)
-            if sim < MIN_SIMILARITY:
-                continue
-
-        out.append({
-            "language": lang, "english": eng, "target": text, "completion": text,
-            "n_phonemes": n, "ruler": ruler_id(),
-            "prompt": PROMPT_TEMPLATE.format(language=lang_name, n=n, english=eng),
-            "augmentation": {
-                "direction": "compress" if scale < 1 else "expand",
-                "requested_scale": scale,
-                "source_phonemes": natural,
-                "relative_change": round(change, 4),
-                "similarity": round(sim, 4) if sim is not None else None,
-                "generator": model,
-            },
-        })
+        eng, ref, natural = prepared[idx]
+        row = verify(lang, ref, eng, natural, c.get("text"), scale, gate, model, thresholds)
+        if row:
+            out.append(row)
     return out
 
 
@@ -296,15 +327,53 @@ def main() -> int:
     p.add_argument("--model", default=DEFAULT_MODEL)
     p.add_argument("--scales", nargs="*", type=float, default=None)
     p.add_argument("--languages", nargs="*", default=None)
-    p.add_argument("--workers", type=int, default=8)
+    p.add_argument("--sentences_per_call", type=int, default=5,
+                   help="The free tier meters REQUESTS per day, so this is the knob that "
+                        "decides whether the job fits in one day's quota.")
+    p.add_argument("--thresholds", default=None,
+                   help="JSON {lang: min_similarity} from the calibration run. Without it "
+                        "every language uses the global 0.80, which is known to be wrong "
+                        "for Tamil.")
+    p.add_argument("--list_models", action="store_true",
+                   help="Ask the account which models it can actually use, and exit. "
+                        "Ground truth beats a blog post about rate limits.")
+    p.add_argument("--workers", type=int, default=4)
     p.add_argument("--no_semantic_gate", action="store_true",
                    help="Skip gate 2. Only for a plumbing test — never for real data.")
     p.add_argument("--seed", type=int, default=13)
     args = p.parse_args()
 
+    if args.list_models:
+        client = make_client()
+        rows = []
+        for m in client.models.list():
+            methods = list(getattr(m, "supported_actions", None)
+                           or getattr(m, "supported_generation_methods", None) or [])
+            if "generateContent" not in methods:
+                continue
+            rows.append((m.name.replace("models/", ""),
+                         getattr(m, "input_token_limit", "") or "",
+                         getattr(m, "output_token_limit", "") or ""))
+        print(f"\n{len(rows)} models on this account support generateContent:\n")
+        print(f"{'model id (use as --model)':<48}{'in-tokens':>12}{'out-tokens':>12}")
+        print("-" * 72)
+        for name, i, o in sorted(rows):
+            print(f"{name:<48}{i:>12}{o:>12}")
+        print("\nRate limits are per-account and are not exposed by the API — check them at")
+        print("  https://aistudio.google.com/app/rate-limit")
+        return 0
+
     assert_g2p_available()
     logger.info("counter ready — ruler=%s", ruler_id())
     scales = args.scales or TARGET_SCALES
+    thresholds = (json.loads(Path(args.thresholds).read_text(encoding="utf-8"))
+                  if args.thresholds else {})
+    if thresholds:
+        logger.info("per-language similarity thresholds: %s", thresholds)
+    else:
+        logger.warning("no --thresholds: every language uses the global %.2f. The Kaggle "
+                       "calibration showed this is wrong for at least Tamil.",
+                       MIN_SIMILARITY)
 
     # Resume: never regenerate a sentence we already have rows for.
     out_path = Path(args.out)
@@ -341,21 +410,29 @@ def main() -> int:
         if lg in wanted_langs and (lg, r.get("english")) not in done:
             by_lang[lg].append(r)
 
+    # Batches never mix languages: one instruction, one script, one set of rules.
     rnd = random.Random(args.seed)
-    todo: list[dict] = []
+    batches: list[list[dict]] = []
+    n_sentences = 0
     for lg in wanted_langs:
         pool = by_lang.get(lg, [])
         need = per_lang_target.get(lg, 0)
         if need <= 0 or not pool:
             continue
         rnd.shuffle(pool)
-        todo += pool[:need]
-    if not todo:
+        chosen = pool[:need]
+        n_sentences += len(chosen)
+        step = max(1, args.sentences_per_call)
+        batches += [chosen[i:i + step] for i in range(0, len(chosen), step)]
+    if not batches:
         logger.info("nothing to do — the plan is already satisfied")
         return 0
 
-    logger.info("%d sentences to expand, %d scales each, model=%s",
-                len(todo), len(scales), args.model)
+    rnd.shuffle(batches)   # spread languages over time so a rate-limit stall is not all one
+    logger.info("%d sentences in %d requests (%d per call), %d scales each, model=%s",
+                n_sentences, len(batches), args.sentences_per_call, len(scales), args.model)
+    logger.info("free-tier RPD is the binding constraint — this job needs %d requests",
+                len(batches))
 
     client = make_client()
     gate = None if args.no_semantic_gate else Gate()
@@ -369,37 +446,46 @@ def main() -> int:
 
     with open(out_path, "a", encoding="utf-8") as sink, \
             ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = {pool.submit(build_group, client, args.model, gate, r, scales): r
-                   for r in todo}
+        futures = {pool.submit(build_batch, client, args.model, gate, b, scales,
+                               thresholds): b for b in batches}
         for i, fut in enumerate(as_completed(futures), 1):
             src = futures[fut]
+            lg = src[0].get("language") if src else "?"
             try:
                 got = fut.result()
             except Exception as e:  # noqa: BLE001
-                logger.error("%s: %s", src.get("language"), e)
+                logger.error("%s: %s", lg, e)
                 got = []
             with lock:
+                seen_english = set()
                 for g in got:
                     sink.write(json.dumps(g, ensure_ascii=False) + "\n")
                     stats[(g["language"], g["augmentation"]["direction"])] += 1
+                    seen_english.add(g["english"])
                     written += 1
-                if got:
-                    stats[("groups", src["language"])] += 1
+                stats[("groups", lg)] += len(seen_english)
+                stats[("attempted", lg)] += len(src)
                 sink.flush()
-            if i % 50 == 0 or i == len(todo):
+            if i % 20 == 0 or i == len(batches):
                 rate = i / max(1e-6, time.time() - t0)
-                logger.info("%d/%d sentences  %d rows  %.1f/s  eta %.0fs",
-                            i, len(todo), written, rate, (len(todo) - i) / max(rate, 1e-6))
+                logger.info("%d/%d requests  %d rows  %.2f req/s  eta %.0fs",
+                            i, len(batches), written, rate,
+                            (len(batches) - i) / max(rate, 1e-6))
 
     print(f"\n{written} verified rows written to {out_path}")
-    print(f"{'lang':<6}{'groups':>8}{'compress':>10}{'expand':>8}{'yield/group':>13}")
-    print("-" * 45)
+    print(f"{'lang':<6}{'tried':>7}{'groups':>8}{'compress':>10}{'expand':>8}"
+          f"{'rows/try':>10}")
+    print("-" * 49)
     for lg in wanted_langs:
+        a = stats[("attempted", lg)]
         g = stats[("groups", lg)]
         c = stats[(lg, "compress")]
         e = stats[(lg, "expand")]
-        if g or c or e:
-            print(f"{lg:<6}{g:>8}{c:>10}{e:>8}{((c + e) / g if g else 0):>13.2f}")
+        if a or g:
+            # rows-per-attempted is the number to watch: a language whose yield collapses
+            # is one where the gates are rejecting nearly everything, and that is a finding
+            # about the language, not a throughput problem to tune away.
+            print(f"{lg:<6}{a:>7}{g:>8}{c:>10}{e:>8}{((c + e) / a if a else 0):>10.2f}")
     tot_c = sum(v for k, v in stats.items() if k[1] == "compress")
     tot_e = sum(v for k, v in stats.items() if k[1] == "expand")
     tot = tot_c + tot_e

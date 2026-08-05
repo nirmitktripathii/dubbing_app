@@ -1,9 +1,38 @@
 import os
 import json
 import time
-import ssl
 from google import genai
 from google.genai import types
+
+# TLS on this machine
+# -------------------
+# Antivirus (Avast) intercepts HTTPS and re-signs it with its own root, which is in the
+# Windows certificate store but not in the CA bundle Python ships. Requests then fail with
+# CERTIFICATE_VERIFY_FAILED.
+#
+# This module used to work around that with ssl.CERT_NONE — which does not just trust the
+# antivirus, it trusts ANY certificate from ANY host, on a client that carries the user's
+# API key and the video content being dubbed. It turns a local certificate-store problem
+# into an open door for anyone able to sit on the connection.
+#
+# `truststore` fixes the actual problem instead: it makes Python verify through the
+# operating system's certificate store, which already contains the antivirus root. So the
+# antivirus is trusted, everything else is still checked, and verification stays ON.
+#
+#     pip install truststore
+try:
+    import truststore
+
+    truststore.inject_into_ssl()
+except ImportError:  # pragma: no cover - environment without truststore
+    import warnings
+
+    warnings.warn(
+        "truststore is not installed. On a machine whose antivirus intercepts HTTPS, "
+        "Gemini calls will fail with CERTIFICATE_VERIFY_FAILED. Install it with "
+        "`pip install truststore` — do NOT disable certificate verification instead.",
+        RuntimeWarning,
+    )
 
 def generate_content_with_retry(client, **kwargs):
     """
@@ -37,17 +66,10 @@ def translate_segments(segments: list, target_language: str, api_key: str):
     if not api_key:
         raise ValueError("Gemini API key is required for translation.")
         
-    ssl_context = ssl.create_default_context()
-    ssl_context.check_hostname = False
-    ssl_context.verify_mode = ssl.CERT_NONE
-
-    client = genai.Client(
-        api_key=api_key,
-        http_options=types.HttpOptions(
-            client_args={"verify": ssl_context},
-            async_client_args={"verify": ssl_context}
-        )
-    )
+    # No custom SSL context: truststore (injected at import) already routes verification
+    # through the OS certificate store, which is what makes the antivirus root trusted
+    # without trusting everything else.
+    client = genai.Client(api_key=api_key)
     
     texts_to_translate = [
         {"text": seg["text"], "duration_seconds": round(seg["end"] - seg["start"], 1)}
