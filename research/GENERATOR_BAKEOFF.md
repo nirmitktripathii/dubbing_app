@@ -69,6 +69,50 @@ request**. Ask for a more aggressive scale than you want, measure where it actua
 and the same generator clears the same gate far more often. That is the next change, and it
 should raise yield without touching a single threshold.
 
+## Follow-up: the "systematic bias" was oversold, and correcting it does nothing
+
+The 88%-too-long figure above came from three scales, two of which were compressions. Re-run
+across 0.5×–1.45× (433 landings, every candidate recorded including rejects), the profile is
+much more two-sided:
+
+| | bake-off (0.6 / 0.75 / 1.3) | wide probe (0.5 … 1.45) |
+|---|---|---|
+| missed: too long | 88% | 59% |
+| missed: too short | 12% | 33% |
+
+So "the model systematically under-compresses" was largely an artifact of the scale set used
+to measure it. A real bias remains — mean `achieved − asked` = **+0.081** — and the fit is
+
+```
+achieved = -0.080 + 1.174 x asked     R2 = 0.62, n = 433
+```
+
+The slope above 1 says the generator *over-responds*: it exaggerates whatever change is
+asked for. Per language the slope runs 0.888 (ml) to 1.603 (gu), with R² between 0.48 (ta)
+and 0.86 (hi).
+
+**A/B, same 66 sentences, same scales, same gates, one arm asking for the target scale and
+one asking for the calibrated scale:**
+
+| arm | rows | of 198 | yield | mean \|landing error\| | compress |
+|---|---|---|---|---|---|
+| uncalibrated | 109 | 198 | 55% | 0.181 | 63% |
+| calibrated | 109 | 198 | **55%** | 0.164 | 60% |
+
+**Identical yield.** Pre-compensation shrank the mean landing error by 9% and produced
+exactly zero extra rows. The bias was never the binding constraint — the residual spread is,
+and shifting a distribution by 0.081 does not change how much of it falls inside a ±15%
+window.
+
+Decision: **do not use the scale calibration.** It buys nothing measurable and adds a
+per-language fit that can misfire where R² is low. The fitting tool and the raw-landing
+recorder are kept, because they are how this was answered and how it would be re-answered
+for a different generator.
+
+Worth noting for its own sake: yield was 55% here against 46% in the bake-off, on different
+sentences. Sample-to-sample variance at this size is large, which is why both arms of the
+A/B ran on identical sentences.
+
 ## Arithmetic for the full run
 
 At 46% yield, the 6,334 rows the corpus plan needs require ~13,800 requested rewrites =

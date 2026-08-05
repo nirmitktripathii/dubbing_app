@@ -240,7 +240,8 @@ MIN_SCRIPT_PURITY = 0.90
 
 def verify(lang: str, ref: str, eng: str, natural: int, text: str, scale: float,
            gate: Optional[Gate], model: str, thresholds: dict,
-           reject: Optional[collections.Counter] = None) -> Optional[dict]:
+           reject: Optional[collections.Counter] = None,
+           raw: Optional[list] = None, asked_scale: Optional[float] = None) -> Optional[dict]:
     """The three gates. All ours; the generator's opinion does not enter here.
 
     `reject` accumulates WHY candidates were dropped. Without it, a low yield is just a
@@ -279,6 +280,15 @@ def verify(lang: str, ref: str, eng: str, natural: int, text: str, scale: float,
         return no("phonemization failed")
     if not n:
         return no("phonemization empty")
+    # Where it ACTUALLY landed, recorded for every candidate including the ones about to be
+    # thrown away. The rejects are the whole signal: 88% of them missed in the same
+    # direction, which is a bias to correct rather than a tolerance to widen — and a bias
+    # can only be fitted from the misses.
+    if raw is not None:
+        raw.append({"language": lang, "asked_scale": asked_scale if asked_scale is not None
+                    else scale, "target_scale": scale, "achieved_scale": n / natural,
+                    "natural_n": natural, "produced_n": n})
+
     want = max(1, round(natural * scale))
     err = (n - want) / want
     if abs(err) > SCALE_TOLERANCE:
@@ -314,9 +324,29 @@ def verify(lang: str, ref: str, eng: str, natural: int, text: str, scale: float,
     }
 
 
+def ask_for(target: float, lang: str, calib: dict) -> float:
+    """What to REQUEST so the model actually lands on `target`.
+
+    The generators under-compress systematically: asked for 0.60 they return above 0.69.
+    Fitting achieved = a + b*asked per language and inverting it means asking for the scale
+    that produces the length we want. This is the correct response to a *systematic* miss;
+    widening the tolerance would be the response to a random one, and would let genuinely
+    wrong lengths into the corpus.
+    """
+    c = calib.get(lang) or calib.get("_all")
+    if not c:
+        return target
+    a, b = c.get("a", 0.0), c.get("b", 1.0)
+    if abs(b) < 1e-6:
+        return target
+    # Clamped: extrapolating a linear fit far outside the fitted range invents numbers.
+    return max(0.25, min(2.5, (target - a) / b))
+
+
 def build_batch(client, model: str, gate: Optional[Gate], rows: list[dict],
                 scales: list[float], thresholds: dict,
-                reject: Optional[collections.Counter] = None) -> list[dict]:
+                reject: Optional[collections.Counter] = None,
+                raw: Optional[list] = None, calib: Optional[dict] = None) -> list[dict]:
     """Several sentences of ONE language -> verified rewrites at several lengths."""
     if not rows:
         return []
@@ -338,10 +368,16 @@ def build_batch(client, model: str, gate: Optional[Gate], rows: list[dict],
     if not prepared:
         return []
 
+    # Ask for the pre-compensated scale; VERIFY against the target. The model is told the
+    # number that makes it land where we want, and the gate still checks where we wanted.
+    calib = calib or {}
+    asked = [round(ask_for(s, lang, calib), 2) for s in scales]
+    asked_to_target = dict(zip(asked, scales))
+
     spec = "\n".join(
-        f"  - scale {s}: about {abs(1 - s) * 100:.0f}% "
-        f"{'shorter' if s < 1 else 'longer'} than the original"
-        for s in scales)
+        f"  - scale {a}: about {abs(1 - a) * 100:.0f}% "
+        f"{'shorter' if a < 1 else 'longer'} than the original"
+        for a in asked)
     items = "\n".join(f"{i + 1}. {ref}" for i, (_, ref, _) in enumerate(prepared))
     prompt = INSTRUCTION.format(language=lang_name, n=len(prepared), k=len(scales),
                                 total=len(prepared) * len(scales), spec=spec, items=items)
@@ -356,14 +392,22 @@ def build_batch(client, model: str, gate: Optional[Gate], rows: list[dict],
     for c in cands:
         try:
             idx = int(c.get("id")) - 1
-            scale = float(c.get("scale"))
+            asked_scale = float(c.get("scale"))
         except (TypeError, ValueError):
             continue
         if not (0 <= idx < len(prepared)):
             continue
+        # The model echoes back the scale it was asked for; map it to the target we are
+        # actually gating against. Nearest match, because models round.
+        target_scale = asked_to_target.get(round(asked_scale, 2))
+        if target_scale is None:
+            nearest = min(asked, key=lambda a: abs(a - asked_scale))
+            if abs(nearest - asked_scale) > 0.12:
+                continue
+            target_scale = asked_to_target[nearest]
         eng, ref, natural = prepared[idx]
-        row = verify(lang, ref, eng, natural, c.get("text"), scale, gate, model,
-                     thresholds, reject)
+        row = verify(lang, ref, eng, natural, c.get("text"), target_scale, gate, model,
+                     thresholds, reject, raw, asked_scale)
         if row:
             out.append(row)
     if reject is not None:
@@ -395,6 +439,12 @@ def main() -> int:
                    help="JSON {lang: min_similarity} from the calibration run. Without it "
                         "every language uses the global 0.80, which is known to be wrong "
                         "for Tamil.")
+    p.add_argument("--raw_out", default=None,
+                   help="Record where EVERY candidate landed, including rejects. This is "
+                        "what tools/fit_scale_calibration.py fits the bias from.")
+    p.add_argument("--scale_calibration", default=None,
+                   help="JSON {lang: {a, b}} mapping achieved = a + b*asked. Used to ask "
+                        "for the scale that actually lands on the target.")
     p.add_argument("--list_models", action="store_true",
                    help="Ask the account which models it can actually use, and exit. "
                         "Ground truth beats a blog post about rate limits.")
@@ -429,6 +479,18 @@ def main() -> int:
     scales = args.scales or TARGET_SCALES
     thresholds = (json.loads(Path(args.thresholds).read_text(encoding="utf-8"))
                   if args.thresholds else {})
+    calib = (json.loads(Path(args.scale_calibration).read_text(encoding="utf-8"))
+             if args.scale_calibration else {})
+    if calib:
+        for lg in sorted(set(calib) - {"_all", "_meta"}):
+            c = calib[lg]
+            logger.info("scale calibration %s: achieved = %.3f + %.3f*asked  ->  to get "
+                        "0.60 ask for %.2f", lg, c.get("a", 0), c.get("b", 1),
+                        ask_for(0.60, lg, calib))
+    else:
+        logger.warning("no --scale_calibration: asking for the target scale directly. The "
+                       "bake-off showed 88%% of misses were the model UNDER-compressing, "
+                       "so expect a lower yield than necessary.")
     if thresholds:
         logger.info("per-language similarity thresholds: %s", thresholds)
     else:
@@ -503,13 +565,23 @@ def main() -> int:
     written = 0
     stats = collections.Counter()
     reject = collections.Counter()
+    raw: Optional[list] = [] if args.raw_out else None
     lock = threading.Lock()
     t0 = time.time()
+
+    # Both sinks are appended to after every batch, never held to the end. The full run is
+    # hours long, and repo rule 2 exists because a job whose output only lands on clean
+    # exit is a job that pays twice when it is interrupted.
+    raw_path = Path(args.raw_out) if args.raw_out else None
+    if raw_path:
+        raw_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_sink = open(raw_path, "a", encoding="utf-8") if raw_path else None
+    n_raw_flushed = 0
 
     with open(out_path, "a", encoding="utf-8") as sink, \
             ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {pool.submit(build_batch, client, args.model, gate, b, scales,
-                               thresholds, reject): b for b in batches}
+                               thresholds, reject, raw, calib): b for b in batches}
         for i, fut in enumerate(as_completed(futures), 1):
             src = futures[fut]
             lg = src[0].get("language") if src else "?"
@@ -528,13 +600,22 @@ def main() -> int:
                 stats[("groups", lg)] += len(seen_english)
                 stats[("attempted", lg)] += len(src)
                 sink.flush()
+                if raw_sink is not None and raw is not None:
+                    for r in raw[n_raw_flushed:]:
+                        raw_sink.write(json.dumps(r) + "\n")
+                    n_raw_flushed = len(raw)
+                    raw_sink.flush()
             if i % 20 == 0 or i == len(batches):
                 rate = i / max(1e-6, time.time() - t0)
                 logger.info("%d/%d requests  %d rows  %.2f req/s  eta %.0fs",
                             i, len(batches), written, rate,
                             (len(batches) - i) / max(rate, 1e-6))
+    if raw_sink is not None:
+        raw_sink.close()
 
     print(f"\n{written} verified rows written to {out_path}")
+    if raw is not None:
+        print(f"{len(raw)} raw landings (kept and rejected) -> {args.raw_out}")
     print(f"{'lang':<6}{'tried':>7}{'groups':>8}{'compress':>10}{'expand':>8}"
           f"{'rows/try':>10}")
     print("-" * 49)
