@@ -79,3 +79,26 @@ task.md
 
 # W&B local run cache (the run of record is the hosted project, not this)
 wandb/
+
+# Pulled Kaggle session output.
+# `kaggle_session --pull` downloads everything a notebook left in /kaggle/working, which
+# includes the staged LoRA checkpoints and four copies of tokenizer.json — 420 MB and
+# ~1.25M lines for session 02i alone. It is a local cache of something the Kaggle session
+# already holds, so committing it costs a lot and preserves nothing.
+#
+# The findings from these runs ARE version-controlled: the reports, per-language CSVs and
+# diagnosis JSON are copied into research/evaluation/results/, and the modules that
+# produced them into research/code/. Curate into research/, never commit the raw pull.
+files_v3/kaggle_runs/results_*/
+*.safetensors
+*.pt
+*.pth
+optimizer.pt
+scheduler.pt
+
+# Corpora. Regenerable from Samanantar by dataset_generator.py + relabel_dataset.py, and
+# large enough (train.phonemes.jsonl is 31 MB) that git is the wrong place for them.
+data/
+augmented_dataset/
+*.jsonl
+!research/**/*.jsonl
