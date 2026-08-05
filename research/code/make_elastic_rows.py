@@ -213,27 +213,80 @@ def call_model(client, model: str, prompt: str, attempts: int = 5) -> list[dict]
     raise RuntimeError(str(last))
 
 
+def dominant_script(text: str) -> tuple[Optional[str], float]:
+    """Which Unicode script is this text written in, and how purely?
+
+    Derived from the text rather than a hardcoded range table: Unicode character names
+    begin with their script ("DEVANAGARI LETTER KA"), so the reference translation defines
+    what the rewrite is allowed to look like. Nothing to keep in sync per language.
+    """
+    import unicodedata
+    counts: collections.Counter = collections.Counter()
+    for ch in text:
+        if not ch.isalpha():
+            continue
+        try:
+            counts[unicodedata.name(ch).split()[0]] += 1
+        except ValueError:
+            continue
+    if not counts:
+        return None, 0.0
+    script, n = counts.most_common(1)[0]
+    return script, n / sum(counts.values())
+
+
+MIN_SCRIPT_PURITY = 0.90
+
+
 def verify(lang: str, ref: str, eng: str, natural: int, text: str, scale: float,
-           gate: Optional[Gate], model: str, thresholds: dict) -> Optional[dict]:
-    """The two gates. Both ours; the generator's opinion does not enter here."""
-    text = (text or "").strip()
-    if not text or text == ref:
+           gate: Optional[Gate], model: str, thresholds: dict,
+           reject: Optional[collections.Counter] = None) -> Optional[dict]:
+    """The three gates. All ours; the generator's opinion does not enter here.
+
+    `reject` accumulates WHY candidates were dropped. Without it, a low yield is just a
+    number and the obvious response is to loosen a threshold — which is how a gate quietly
+    stops gating. With it, "the model drifts out of script" and "the model cannot hit the
+    length" are distinguishable, and they call for different fixes.
+    """
+    def no(reason: str):
+        if reject is not None:
+            reject[reason] += 1
         return None
+
+    text = (text or "").strip()
+    if not text:
+        return no("empty")
+    if text == ref:
+        return no("identical to source")
+
+    # GATE 0 — is it even in the right script?
+    #
+    # This is not paranoia. espeak will happily phonemize Latin text through an Assamese
+    # voice and return a plausible count, so a model that drifts into English — or into
+    # Hindi when asked for Odia, which is a real failure mode for low-resource targets —
+    # can sail straight through the length gate. Cheapest gate, checked first.
+    ref_script, _ = dominant_script(ref)
+    cand_script, purity = dominant_script(text)
+    if ref_script and cand_script != ref_script:
+        return no(f"wrong script ({cand_script} for {ref_script})")
+    if ref_script and purity < MIN_SCRIPT_PURITY:
+        return no("script not pure enough (code-mixed)")
 
     # GATE 1 — did it land at the requested length? Measured with the exact counter.
     try:
         n = count_phonemes(text, lang)
     except Exception:  # noqa: BLE001
-        return None
+        return no("phonemization failed")
     if not n:
-        return None
+        return no("phonemization empty")
     want = max(1, round(natural * scale))
-    if abs(n - want) / want > SCALE_TOLERANCE:
-        return None
+    err = (n - want) / want
+    if abs(err) > SCALE_TOLERANCE:
+        return no("missed length: too long" if err > 0 else "missed length: too short")
     change = (n - natural) / natural
     wanted_dir = -1 if scale < 1 else 1
     if wanted_dir * change < MIN_LENGTH_CHANGE:
-        return None            # "shorter" that is barely shorter teaches nothing
+        return no("moved too little from the source")
 
     # GATE 2 — or did it hit the length by deleting content? Threshold is PER LANGUAGE:
     # measured on Kaggle 2026-08-05, a true Tamil paraphrase scored 0.556 where the
@@ -243,7 +296,7 @@ def verify(lang: str, ref: str, eng: str, natural: int, text: str, scale: float,
     if gate is not None:
         sim = gate.similarity(ref, text)
         if sim < thresholds.get(lang, MIN_SIMILARITY):
-            return None
+            return no("semantic below threshold")
 
     lang_name = get_language(lang).name
     return {
@@ -262,7 +315,8 @@ def verify(lang: str, ref: str, eng: str, natural: int, text: str, scale: float,
 
 
 def build_batch(client, model: str, gate: Optional[Gate], rows: list[dict],
-                scales: list[float], thresholds: dict) -> list[dict]:
+                scales: list[float], thresholds: dict,
+                reject: Optional[collections.Counter] = None) -> list[dict]:
     """Several sentences of ONE language -> verified rewrites at several lengths."""
     if not rows:
         return []
@@ -308,9 +362,16 @@ def build_batch(client, model: str, gate: Optional[Gate], rows: list[dict],
         if not (0 <= idx < len(prepared)):
             continue
         eng, ref, natural = prepared[idx]
-        row = verify(lang, ref, eng, natural, c.get("text"), scale, gate, model, thresholds)
+        row = verify(lang, ref, eng, natural, c.get("text"), scale, gate, model,
+                     thresholds, reject)
         if row:
             out.append(row)
+    if reject is not None:
+        # Rewrites the model simply did not return are a distinct failure from ones it
+        # returned badly, and only shows up as a gap in the arithmetic.
+        missing = len(prepared) * len(scales) - len(cands)
+        if missing > 0:
+            reject["not returned by the model"] += missing
     return out
 
 
@@ -441,13 +502,14 @@ def main() -> int:
 
     written = 0
     stats = collections.Counter()
+    reject = collections.Counter()
     lock = threading.Lock()
     t0 = time.time()
 
     with open(out_path, "a", encoding="utf-8") as sink, \
             ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {pool.submit(build_batch, client, args.model, gate, b, scales,
-                               thresholds): b for b in batches}
+                               thresholds, reject): b for b in batches}
         for i, fut in enumerate(as_completed(futures), 1):
             src = futures[fut]
             lg = src[0].get("language") if src else "?"
@@ -493,9 +555,17 @@ def main() -> int:
     print(f"{'TOTAL':<6}{'':>8}{tot_c:>10}{tot_e:>8}")
     if tot:
         print(f"\ncompression share: {tot_c / tot:.0%}  (gate floor 40%)")
-    print("Everything above passed BOTH gates: landed within "
-          f"{SCALE_TOLERANCE:.0%} of the requested length, and stayed above "
-          f"{MIN_SIMILARITY} similarity to the original reference.")
+    if reject:
+        total_rej = sum(reject.values())
+        print(f"\n{total_rej} candidates rejected. A low yield is only actionable if you "
+              f"know which gate did the rejecting:")
+        for reason, n in reject.most_common():
+            print(f"    {n:>6}  {n / total_rej:>5.0%}  {reason}")
+    print(f"\nEverything above passed every gate: right script, landed within "
+          f"{SCALE_TOLERANCE:.0%} of the requested length, moved at least "
+          f"{MIN_LENGTH_CHANGE:.0%} from the source"
+          + ("." if gate is None else ", and stayed above the language's similarity "
+                                      "threshold."))
     return 0
 
 
