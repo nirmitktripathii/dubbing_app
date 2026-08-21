@@ -15,8 +15,18 @@ Approach:
 No ML model is loaded here — this is deliberately CPU-only and instant.
 """
 
+import logging
 import re
 import unicodedata
+
+logger = logging.getLogger(__name__)
+
+# Set True the first time the espeak-ng phonemizer path is unavailable and this counter
+# drops to rule-based syllable counting. Project lesson (CLAUDE.md rule 5): a phonemizer
+# that has fallen back must SAY SO — a silent `except: pass` here is exactly the pattern
+# that once let a whole corpus be mislabelled in the wrong unit, undetected. This is the
+# deployed V2 path, so it degrades VISIBLY rather than crashing: warn once, then continue.
+_FALLBACK_WARNED = False
 
 # ---------------------------------------------------------------------------
 # Language expansion ratios (empirically derived from dubbing datasets).
@@ -197,8 +207,19 @@ def count_indic_phonemes(text: str, language: str) -> int:
                 vowels = len(re.findall(r'[aeiouɑɔəɛɪʊʌæɯʊ]', cleaned))
                 return max(1, vowels)
     except Exception as e:
-        # Gracefully fall back to rule-based counting
-        pass
+        # Degrade VISIBLY, not silently: warn once that we are no longer using the
+        # espeak-ng phonemizer, then fall back to rule-based syllable counting below. The
+        # fallback counts are a DIFFERENT unit from the espeak path, so a silent drop would
+        # let that unit-shift pass unnoticed (CLAUDE.md rule 5). Returns are unchanged.
+        global _FALLBACK_WARNED
+        if not _FALLBACK_WARNED:
+            logger.warning(
+                "phoneme_counter: espeak-ng/phonemizer unavailable (%s: %s); falling back "
+                "to rule-based syllable counting for '%s' and subsequent segments. Counts "
+                "are now syllable-approximate, not espeak phonemes.",
+                type(e).__name__, e, language,
+            )
+            _FALLBACK_WARNED = True
 
     if language in ("hindi", "marathi", "nepali"):
         return _count_devanagari_phonemes(text)
