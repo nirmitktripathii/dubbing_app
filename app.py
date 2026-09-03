@@ -112,6 +112,8 @@ uploaded_file = st.file_uploader(
 )
 
 if uploaded_file:
+    _size_mb = getattr(uploaded_file, "size", 0) / (1024 * 1024)
+    st.caption(f"✓ Received **{uploaded_file.name}** — {_size_mb:.1f} MB")
     st.video(uploaded_file)
 
 col_start, _ = st.columns([1, 4])
@@ -135,8 +137,30 @@ if start_btn:
     os.makedirs(temp_dir, exist_ok=True)
 
     video_path = os.path.join(temp_dir, "input_video.mp4")
+
+    # Save the uploaded file to disk in chunks so we can show a real progress
+    # bar. NOTE: Streamlit's st.file_uploader already streams the browser→server
+    # network upload with its own built-in progress indicator; by the time this
+    # code runs the bytes are fully in memory. This bar therefore reports the
+    # disk-write (buffer → temp file) phase, which is the part we control.
+    buffer = uploaded_file.getbuffer()
+    total_bytes = buffer.nbytes
+    save_progress = st.progress(0.0)
+    save_status = st.empty()
+    chunk_size = 4 * 1024 * 1024  # 4 MB
+    written = 0
     with open(video_path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
+        while written < total_bytes:
+            chunk = buffer[written:written + chunk_size]
+            f.write(chunk)
+            written += len(chunk)
+            frac = written / total_bytes if total_bytes else 1.0
+            save_progress.progress(frac)
+            save_status.caption(
+                f"Saving upload… {written / (1024*1024):.1f} / "
+                f"{total_bytes / (1024*1024):.1f} MB ({frac*100:.0f}%)"
+            )
+    save_status.caption(f"✓ Upload saved ({total_bytes / (1024*1024):.1f} MB)")
 
     progress = st.progress(0)
     status = st.empty()
@@ -181,7 +205,7 @@ if start_btn:
         # ── Step 3: Transcription ─────────────────────────────────────────
         status.markdown(f"**Step 3/7** — Transcribing with Whisper {model_size}...")
         log(f"Step 3: Transcribing audio with Whisper ({model_size})...")
-        segments = transcribe_audio(vocals_path, model_size=model_size)
+        segments = transcribe_audio(vocals_path, model_size=model_size, log_fn=log)
         english_srt_path = os.path.join(temp_dir, "english_subtitles.srt")
         generate_srt(segments, english_srt_path)
         log(f"  ✓ {len(segments)} segments transcribed.")

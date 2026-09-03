@@ -119,6 +119,7 @@ pkgs = [
     "huggingface_hub",
     "safetensors",
     "faster-whisper",
+    "openai-whisper",        # transcription fallback if faster-whisper fails at runtime
     "demucs",
     "phonemizer",
     "indic-nlp-library",     # orthographic normalization for the real phoneme counter
