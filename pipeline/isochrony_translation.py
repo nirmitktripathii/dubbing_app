@@ -40,9 +40,12 @@ Language support: All 11 Indic languages supported by IndicF5.
 """
 
 import json
+import os
 import time
 import ssl
 import re
+import random
+import threading
 from typing import Optional
 import builtins
 
@@ -72,6 +75,7 @@ from pipeline.phoneme_counter import (
     active_ruler,
 )
 from pipeline import semantic_similarity
+from pipeline import translation_cache
 
 # Minimum isochrony score to accept without further refinement (legacy knob, kept
 # for backward-compatible callers; the iterative loop below uses the richer
@@ -100,6 +104,195 @@ MAX_ITERATIONS = 3
 # small timing gap; it cannot fix wrong words).
 SEMANTIC_WEIGHT = 0.6
 PHONEME_WEIGHT = 0.4
+
+
+# --- v2.5.1 rate-limit / hybrid-model config ----------------------------------
+# gemini-3.1-flash-lite has a strict free-tier limit (both per-minute and
+# per-day). To stay under it we split the work by PHASE:
+#
+#   • BULK phase (iteration 0) — the many first-draft candidates for every
+#     segment — runs on lenient-limit Gemma models by default. This is the bulk
+#     of all API calls.
+#   • REFINE phase — the few Chain-of-Thought rounds on only the hard segments —
+#     runs on gemini-3.1-flash-lite (quality where it matters, few calls).
+#
+# Both chains keep the full Gemini fallback ladder, so if a Gemma id is not
+# available on a given key (or is renamed) the call self-heals to Gemini with a
+# visible log line — it never hard-fails on a model-name guess.
+#
+# Every id is env-overridable so no code change is needed to retune:
+#   DUBBING_GEMINI_BULK_MODEL     head of the bulk (Gemma) chain
+#   DUBBING_GEMINI_REFINE_MODEL   head of the refine (Gemini) chain
+#   DUBBING_GEMINI_MODEL          legacy alias for the refine head
+#   DUBBING_GEMINI_RPM            client-side requests/minute pace (per model)
+#   DUBBING_GEMINI_RPD            optional per-model requests/day hard cap
+_GEMINI_FALLBACK = ["gemini-3.1-flash-lite", "gemini-2.5-flash",
+                    "gemini-2.0-flash", "gemini-1.5-flash"]
+_GEMMA_BULK_DEFAULT = ["gemma-4-31b", "gemma-4-26b"]
+
+
+def _bulk_models() -> List[str]:
+    """Model chain for the iteration-0 bulk batch: lenient Gemma first, then the
+    Gemini ladder as a safety net."""
+    head = os.environ.get("DUBBING_GEMINI_BULK_MODEL")
+    chain = [head] if head else list(_GEMMA_BULK_DEFAULT)
+    for m in _GEMINI_FALLBACK:
+        if m not in chain:
+            chain.append(m)
+    return chain
+
+
+def _refine_models() -> List[str]:
+    """Model chain for refinement rounds: gemini-3.1-flash-lite first (quality),
+    then the rest of the Gemini ladder."""
+    head = os.environ.get("DUBBING_GEMINI_REFINE_MODEL") or os.environ.get("DUBBING_GEMINI_MODEL")
+    if head:
+        return [head] + [m for m in _GEMINI_FALLBACK if m != head]
+    return list(_GEMINI_FALLBACK)
+
+
+def _is_gemma(model: str) -> bool:
+    """Gemma models on the Gemini API do NOT support structured output
+    (`response_schema`); they must be driven text-mode + robust JSON parsing."""
+    return "gemma" in (model or "").lower()
+
+
+# ── Client-side throttle (per-model min interval derived from RPM) ───────────
+_RATE_LOCK = threading.RLock()
+_LAST_CALL: dict = {}  # model_name -> monotonic timestamp of last request
+
+
+def _rpm_for(model: str) -> float:
+    env = os.environ.get("DUBBING_GEMINI_RPM")
+    if env:
+        try:
+            v = float(env)
+            if v > 0:
+                return v
+        except ValueError:
+            pass
+    # Gemma free tiers are more generous per-minute than flash-lite.
+    return 30.0 if _is_gemma(model) else 15.0
+
+
+def _throttle(model: str) -> None:
+    """Enforce a minimum spacing between requests to the same model so we never
+    burst past the per-minute limit. Serialized under a lock (the app processes
+    one dub at a time), which keeps pacing strict even if called concurrently."""
+    interval = 60.0 / _rpm_for(model)
+    with _RATE_LOCK:
+        now = time.monotonic()
+        wait = interval - (now - _LAST_CALL.get(model, 0.0))
+        if wait > 0:
+            time.sleep(wait)
+        _LAST_CALL[model] = time.monotonic()
+
+
+_RETRY_DELAY_RE = re.compile(
+    r"retry[_ ]?delay['\"]?\s*[:=]\s*['\"]?(\d+(?:\.\d+)?)\s*s?", re.IGNORECASE
+)
+
+
+def _parse_retry_delay(err: str) -> Optional[float]:
+    """Honour the server-suggested `retryDelay` in a 429 body when present
+    (capped so a pathological value can't stall the run)."""
+    m = _RETRY_DELAY_RE.search(err or "")
+    if not m:
+        return None
+    try:
+        return min(float(m.group(1)), 90.0)
+    except ValueError:
+        return None
+
+
+# ── Robust JSON extraction (text-mode path for Gemma / fenced output) ───────
+
+def _extract_json(text: str):
+    """Parse JSON that may be wrapped in ```json fences or surrounded by prose.
+    Gemma has no structured-output mode, so its replies arrive as text; this also
+    hardens the Gemini path against the occasional stray fence."""
+    if not text:
+        return None
+    t = text.strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", t)
+        t = re.sub(r"\s*```$", "", t).strip()
+    try:
+        return json.loads(t)
+    except Exception:
+        pass
+    # Fall back to bracket-matching the first balanced array or object.
+    for open_ch, close_ch in (("[", "]"), ("{", "}")):
+        start = t.find(open_ch)
+        if start == -1:
+            continue
+        depth, in_str, esc = 0, False, False
+        for idx in range(start, len(t)):
+            ch = t[idx]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == open_ch:
+                depth += 1
+            elif ch == close_ch:
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(t[start:idx + 1])
+                    except Exception:
+                        break
+    return None
+
+
+def _parse_batch(raw: str) -> dict:
+    """Normalize a batch reply into {segment_id: [candidate, ...]}. Accepts both
+    the schema shape ({"translations": [...]}) and the bare array a schema-less
+    Gemma reply follows from the prompt."""
+    data = _extract_json(raw)
+    if isinstance(data, dict):
+        items = data.get("translations") or data.get("segments") or data.get("results") or []
+    elif isinstance(data, list):
+        items = data
+    else:
+        items = []
+    out = {}
+    for item in items:
+        if not isinstance(item, dict) or "segment_id" not in item:
+            continue
+        try:
+            sid = int(item["segment_id"])
+        except (TypeError, ValueError):
+            continue
+        cands = item.get("candidates")
+        if isinstance(cands, str):
+            cands = [cands]
+        if isinstance(cands, list) and cands:
+            out[sid] = [str(c) for c in cands if str(c).strip()]
+    return out
+
+
+def _parse_candidates(raw: str) -> list:
+    """Normalize a single-segment reply into a candidate list. Accepts the schema
+    shape ({"candidates": [...]}) and a bare array/string."""
+    data = _extract_json(raw)
+    if isinstance(data, dict):
+        c = data.get("candidates")
+    elif isinstance(data, list):
+        c = data
+    else:
+        c = None
+    if isinstance(c, str):
+        c = [c]
+    if isinstance(c, list):
+        return [str(x) for x in c if str(x).strip()]
+    return []
 
 
 # Language name → IndicF5 language code mapping
@@ -167,28 +360,73 @@ def _call_gemini(
     temperature: float = 0.4,
     response_schema=None,
     response_mime_type=None,
-    log_fn: Optional[Callable[[str], None]] = None
+    log_fn: Optional[Callable[[str], None]] = None,
+    models: Optional[List[str]] = None,
 ) -> str:
-    """Call Gemini with logging, latency measurement, and fallback models."""
-    # NOTE: DO NOT change the default model 'gemini-3.1-flash-lite' unless explicitly instructed by the user.
-    models_to_try = ["gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+    """Call Gemini with logging, throttling, rate-limit-aware retries, and a
+    model fallback chain.
 
-    for attempt in range(5):
-        # Pick model based on attempt count or fallback requirements
-        model_name = models_to_try[min(attempt, len(models_to_try) - 1)]
-        msg = f"  [Gemini API] Calling model '{model_name}' (attempt {attempt+1}/5, prompt len: {len(prompt)})..."
+    `models` is the chain to walk (default: the refine/Gemini ladder). Behaviour
+    that keeps us under the free-tier limits:
+
+      • THROTTLE — before each call we space requests to the same model by
+        60/RPM seconds (client-side), so we never burst past the per-minute cap.
+      • 429 BACK-OFF ON THE SAME MODEL — a rate-limit error backs off (honouring
+        the server's `retryDelay` when given, else exponential + jitter) and
+        retries the SAME model, instead of burning down the fallback chain. Only
+        after several rate retries do we advance to the next model. This fixes
+        the old bug where one 429 skipped straight to a weaker model.
+      • GEMMA HAS NO STRUCTURED OUTPUT — for a Gemma model we drop
+        `response_schema`/`response_mime_type` (unsupported) and rely on
+        text-mode JSON parsing at the call site.
+      • MODEL-NOT-FOUND SELF-HEAL — a 404 / unsupported id advances to the next
+        model immediately (so a Gemma id that doesn't exist on this key falls
+        through to Gemini automatically).
+      • DAILY CAP — each real request is recorded; if a model is over the
+        optional DUBBING_GEMINI_RPD cap we skip it and advance; only when every
+        model is capped do we raise.
+    """
+    chain = list(models) if models else _refine_models()
+    rpd = translation_cache.rpd_limit()
+
+    def _emit(m: str):
         if log_fn:
-            log_fn(msg)
-        print(msg)
+            log_fn(m)
+        print(m)
+
+    idx = 0
+    rate_retries = 0
+    total_tries = 0
+    max_total_tries = 10
+    max_rate_retries = 4
+
+    while total_tries < max_total_tries and idx < len(chain):
+        model_name = chain[idx]
+
+        # Daily-cap guard: skip a model that is already over its RPD for today.
+        if rpd is not None and translation_cache.count_today(model_name) >= rpd:
+            _emit(f"  [Gemini API] '{model_name}' hit daily cap ({rpd}); advancing model.")
+            idx += 1
+            rate_retries = 0
+            continue
+
+        total_tries += 1
+        _throttle(model_name)
+        _emit(f"  [Gemini API] Calling '{model_name}' "
+              f"(try {total_tries}/{max_total_tries}, prompt len: {len(prompt)})...")
         start_time = time.time()
 
         try:
             config_args = {"temperature": temperature}
-            if response_schema is not None:
-                config_args["response_schema"] = response_schema
-            if response_mime_type is not None:
-                config_args["response_mime_type"] = response_mime_type
+            # Gemma on the Gemini API rejects response_schema / json mime — send
+            # a plain text-mode request and let the caller parse the JSON.
+            if not _is_gemma(model_name):
+                if response_schema is not None:
+                    config_args["response_schema"] = response_schema
+                if response_mime_type is not None:
+                    config_args["response_mime_type"] = response_mime_type
 
+            translation_cache.record_request(model_name)
             response = client.models.generate_content(
                 model=model_name,
                 contents=prompt,
@@ -196,42 +434,53 @@ def _call_gemini(
             )
             elapsed = time.time() - start_time
             resp_text = response.text.strip() if response.text else ""
-            success_msg = f"  [Gemini API] ✓ Success in {elapsed:.2f}s. Response len: {len(resp_text)} chars."
-            if log_fn:
-                log_fn(success_msg)
-            print(success_msg)
+            _emit(f"  [Gemini API] ✓ '{model_name}' in {elapsed:.2f}s. "
+                  f"Response len: {len(resp_text)} chars.")
             return resp_text
         except Exception as e:
             err = str(e)
             elapsed = time.time() - start_time
-            err_msg = f"  [Gemini API] ⚠️ Attempt {attempt+1}/5 failed in {elapsed:.2f}s: {err[:120]}"
-            if log_fn:
-                log_fn(err_msg)
-            print(err_msg)
+            _emit(f"  [Gemini API] ⚠️ '{model_name}' failed in {elapsed:.2f}s: {err[:140]}")
 
-            # Check if error is model-not-found (404/INVALID_ARGUMENT for unsupported model)
-            is_model_error = "not found" in err.lower() or "not support" in err.lower() or "404" in err
-            transient = any(
-                code in err
-                for code in ["503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "overloaded"]
-            )
+            is_model_error = ("not found" in err.lower()
+                              or "not support" in err.lower()
+                              or "404" in err)
+            is_rate = any(code in err for code in ["429", "RESOURCE_EXHAUSTED"])
+            is_transient = any(code in err for code in ["503", "UNAVAILABLE", "overloaded"])
 
-            if (transient or is_model_error) and attempt < 4:
-                # If it's a model error, try next model immediately without waiting
-                wait = 0 if is_model_error else (attempt + 1) * 3
-                if wait > 0:
-                    wait_msg = f"  [Gemini API] Retrying in {wait}s..."
-                    if log_fn:
-                        log_fn(wait_msg)
-                    print(wait_msg)
-                    time.sleep(wait)
+            if is_model_error:
+                # Wrong/renamed id → next model immediately (self-heal to Gemini).
+                _emit(f"  [Gemini API] '{model_name}' unavailable; advancing to next model.")
+                idx += 1
+                rate_retries = 0
+                continue
+
+            if is_rate and rate_retries < max_rate_retries:
+                # Back off and retry the SAME model — do not waste the fallback.
+                rate_retries += 1
+                server_delay = _parse_retry_delay(err)
+                if server_delay is not None:
+                    wait = server_delay
                 else:
-                    fallback_msg = f"  [Gemini API] Falling back to next model immediately..."
-                    if log_fn:
-                        log_fn(fallback_msg)
-                    print(fallback_msg)
-            else:
-                raise
+                    wait = min(2.0 ** rate_retries + random.uniform(0, 1.5), 90.0)
+                _emit(f"  [Gemini API] rate limited; backing off {wait:.1f}s "
+                      f"then retrying '{model_name}' (rate retry {rate_retries}/{max_rate_retries}).")
+                time.sleep(wait)
+                continue
+
+            if (is_rate or is_transient) and idx < len(chain) - 1:
+                # Exhausted same-model retries (or transient) → next model.
+                _emit(f"  [Gemini API] advancing from '{model_name}' to next model.")
+                idx += 1
+                rate_retries = 0
+                continue
+
+            raise
+
+    raise RuntimeError(
+        f"[Gemini API] exhausted model chain {chain} without a successful response "
+        f"(tries={total_tries}, likely daily/rate caps)."
+    )
 
 
 
@@ -445,6 +694,7 @@ def translate_segments_isochrony(
     semantic_threshold: float = SEMANTIC_THRESHOLD,
     phoneme_tolerance: float = PHONEME_TOLERANCE,
     max_iterations: int = MAX_ITERATIONS,
+    use_cache: bool = True,
 ) -> list:
     """
     Translate a list of transcribed segments into an Indic language with
@@ -457,7 +707,14 @@ def translate_segments_isochrony(
     gates or the combined objective stops improving, up to `max_iterations` rounds.
 
     Backward compatible: the first three args and `n_candidates` / `min_score` /
-    `log_fn` are unchanged; the three v2.5 knobs are optional with sensible defaults.
+    `log_fn` are unchanged; the v2.5 knobs (including `use_cache`) are optional
+    with sensible defaults.
+
+    Rate-limit strategy (v2.5.1): the iteration-0 BULK batch runs on lenient
+    Gemma models; only the few REFINEMENT rounds use gemini-3.1-flash-lite. A
+    persistent candidate cache (keyed by language+source) seeds each segment
+    before any API call, so a re-run — or a video with repeated phrases — selects
+    its final lines with far fewer requests, often zero.
     """
     if not api_key:
         raise ValueError("Gemini API key is required.")
@@ -470,6 +727,7 @@ def translate_segments_isochrony(
         )
 
     client = _build_client(api_key)
+    cache = translation_cache.TranslationCache(enabled=use_cache)
 
     def _log(msg):
         if log_fn:
@@ -521,8 +779,10 @@ def translate_segments_isochrony(
     # --- Step 2: Iteration 0 — batch generate initial candidates for all segs ---
     batch_size = 15
 
-    def _generate_batch(items, prompt_builder, temperature):
-        """Run one batched Gemini generation; returns {seg_id: [candidate,...]}."""
+    def _generate_batch(items, prompt_builder, temperature, models):
+        """Run one batched Gemini generation on the given model chain; returns
+        {seg_id: [candidate,...]}. `models` selects the phase — Gemma-first for
+        the iteration-0 bulk, the Gemini ladder for refinement."""
         out = {}
         for bstart in range(0, len(items), batch_size):
             chunk = items[bstart:bstart + batch_size]
@@ -536,10 +796,14 @@ def translate_segments_isochrony(
                     response_schema=BatchTranslationResponse,
                     response_mime_type="application/json",
                     log_fn=log_fn,
+                    models=models,
                 )
-                data = json.loads(raw)
-                for item in data.get("translations", []):
-                    out[item["segment_id"]] = item["candidates"]
+                # Robust parse: handles the schema shape (Gemini) AND the bare
+                # array a schema-less Gemma reply follows from the prompt.
+                parsed = _parse_batch(raw)
+                if not parsed:
+                    raise ValueError("no parseable segments in batch reply")
+                out.update(parsed)
             except Exception as e:
                 _log(f"    [IsochronyTranslation] Batch {bnum} failed: {e}. Falling back sequentially...")
                 # Sequential fallback expects the enriched-item shape.
@@ -547,21 +811,53 @@ def translate_segments_isochrony(
                     it if "phoneme_budget" in it else enriched[it["segment_id"]]
                     for it in chunk
                 ]
-                out.update(_translate_sequential(client, seq_items, internal_lang, n_candidates, log_fn=log_fn))
+                out.update(_translate_sequential(
+                    client, seq_items, internal_lang, n_candidates,
+                    log_fn=log_fn, models=models,
+                ))
         return out
 
-    _log(f"[IsochronyTranslation] Iteration 0: generating {n_candidates} candidates/segment...")
-    gen = _generate_batch(
-        enriched,
-        lambda chunk: _build_batch_prompt(chunk, internal_lang, n_candidates),
-        temperature=0.5,
-    )
+    # --- Step 2a: Seed from the persistent cache (free — no API calls) ---------
+    # Selection is local, so any cached candidate that already clears both gates
+    # removes that segment from the generation batch entirely.
+    cache_hits = 0
     for i in range(len(segments)):
-        recs = _evaluate_candidates(
-            segments[i]["text"], gen.get(i, []), internal_lang,
-            source_duration=enriched[i]["duration_seconds"],
+        cached = cache.get(internal_lang, segments[i]["text"])
+        if cached:
+            recs = _evaluate_candidates(
+                segments[i]["text"], cached, internal_lang,
+                source_duration=enriched[i]["duration_seconds"],
+            )
+            _merge(i, recs)
+            if satisfied[i]:
+                cache_hits += 1
+    if cache.enabled:
+        _log(f"[IsochronyTranslation] Cache: {cache_hits}/{len(segments)} segment(s) "
+             f"satisfied from cache before any API call ({cache.stats()['keys']} keys on disk).")
+
+    # --- Step 2b: Iteration 0 — bulk-generate ONLY the still-unsatisfied segs ---
+    to_generate = [enriched[i] for i in range(len(segments)) if not satisfied[i]]
+    if to_generate:
+        _log(f"[IsochronyTranslation] Iteration 0: bulk-generating {n_candidates} "
+             f"candidates/segment for {len(to_generate)} segment(s) on the Gemma chain...")
+        gen = _generate_batch(
+            to_generate,
+            lambda chunk: _build_batch_prompt(chunk, internal_lang, n_candidates),
+            temperature=0.5,
+            models=_bulk_models(),
         )
-        _merge(i, recs)
+        for i in range(len(segments)):
+            new_cands = gen.get(i, [])
+            if not new_cands:
+                continue
+            cache.add(internal_lang, segments[i]["text"], new_cands)
+            recs = _evaluate_candidates(
+                segments[i]["text"], new_cands, internal_lang,
+                source_duration=enriched[i]["duration_seconds"],
+            )
+            _merge(i, recs)
+    else:
+        _log("[IsochronyTranslation] Iteration 0 skipped — every segment satisfied from cache.")
 
     # --- Step 3: Iterative refinement until both gates pass or global minima ---
     for iteration in range(1, max_iterations + 1):
@@ -613,12 +909,16 @@ def translate_segments_isochrony(
             feedback_items,
             lambda chunk: _build_feedback_prompt(chunk, internal_lang, n_candidates),
             temperature=0.4,
+            models=_refine_models(),
         )
 
         any_improved = False
         for i in pending:
+            new_cands = gen.get(i, [])
+            if new_cands:
+                cache.add(internal_lang, segments[i]["text"], new_cands)
             recs = _evaluate_candidates(
-                segments[i]["text"], gen.get(i, []), internal_lang,
+                segments[i]["text"], new_cands, internal_lang,
                 source_duration=enriched[i]["duration_seconds"],
             )
             if _merge(i, recs):
@@ -630,6 +930,9 @@ def translate_segments_isochrony(
             _log(f"[IsochronyTranslation] Iteration {iteration}: no segment improved "
                  f"(global minimum reached). Stopping refinement.")
             break
+
+    # Persist the accumulated candidate pool so future runs get cache hits.
+    cache.save()
 
     # --- Step 4: Assemble output ---
     translated_segments = []
@@ -694,21 +997,18 @@ def _translate_sequential(
     internal_lang: str,
     n_candidates: int,
     log_fn: Optional[Callable[[str], None]] = None,
+    models: Optional[List[str]] = None,
 ) -> dict:
-    """Translate one segment at a time. Returns candidates_map dict."""
+    """Translate one segment at a time. Returns candidates_map dict.
+
+    Pacing is handled centrally by `_call_gemini`'s per-model throttle, so there
+    is no fixed sleep here — the client-side RPM limiter already spaces requests
+    to the active model."""
     candidates_map = {}
     lang_cap = internal_lang.capitalize()
     for idx, item in enumerate(enriched):
         i = item["segment_id"]
         budget = item["phoneme_budget"]
-
-        # 5.0 seconds delay between sequential fallback requests to stay under 15 RPM
-        if idx > 0:
-            delay_msg = "  [IsochronyTranslation] Rate-limit safeguard: sleeping 5.0 seconds..."
-            if log_fn:
-                log_fn(delay_msg)
-            print(delay_msg)
-            time.sleep(5.0)
 
         prompt = (
             f"Translate this English dubbing segment into {lang_cap}, preserving the meaning.\n"
@@ -730,22 +1030,23 @@ def _translate_sequential(
                 temperature=0.5,
                 response_schema=SegmentCandidatesResponse,
                 response_mime_type="application/json",
-                log_fn=log_fn
+                log_fn=log_fn,
+                models=models,
             )
-            data = json.loads(raw)
-            candidates = data.get("candidates", [])
-            if not isinstance(candidates, list):
-                candidates = [str(candidates)]
-        except Exception as e:
+            candidates = _parse_candidates(raw)
+            if not candidates:
+                raise ValueError("no parseable candidates in reply")
+        except Exception:
             # Last resort: return a single direct translation
             try:
                 simple = _call_gemini(
                     client,
                     f"Translate to {lang_cap}: \"{item['english_text']}\". Return only the translation.",
                     temperature=0.3,
-                    log_fn=log_fn
+                    log_fn=log_fn,
+                    models=models,
                 )
-                candidates = [simple]
+                candidates = [simple.strip()] if simple.strip() else [item["english_text"]]
             except Exception:
                 candidates = [item["english_text"]]
         candidates_map[i] = candidates

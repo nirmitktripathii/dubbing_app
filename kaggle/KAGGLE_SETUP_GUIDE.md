@@ -133,7 +133,10 @@ Video Upload (MP4)
 [Step 3] Faster-Whisper (large-v3) → Timestamped English segments
     ↓
 [Step 4] Isochrony-Aware Translation  ★ v2.5 core ★
-         Gemini (gemini-3.1-flash-lite) → 3 candidates/segment, then:
+         Hybrid routing → 3 candidates/segment:
+           • Bulk iteration-0 batch on lenient Gemma (gemma-4-31b/26b)
+           • Refinement rounds on gemini-3.1-flash-lite
+         (client-side throttle + disk cache keep it under free-tier limits), then:
            • Gate A · MEANING  → IndicSBERT cross-lingual cosine ≥ 0.70   (runs on CPU)
            • Gate B · TIMING   → espeak-ng phoneme count vs duration budget (±15%)
          Iterative CoT: refine misses up to 3 rounds, keep the global best,
@@ -171,6 +174,23 @@ per-run summary line the loop prints: `... | Both gates passed: N/total | ruler:
 **Confirm the real ruler is active.** That summary line (and the app logs) should say
 `ruler: phonemes:espeak-ng-1.50`. If it says `chars:heuristic-fallback`, Cell 3's `espeak-ng`
 install didn't take — re-run Cell 3, then restart the kernel.
+
+**Rate limits are handled for you.** `gemini-3.1-flash-lite` has a tight free-tier quota
+(per-minute *and* per-day). v2.5.1 keeps you under it three ways, all automatic: the **bulk
+iteration-0 batch runs on the more lenient Gemma models** (`gemma-4-31b` → `gemma-4-26b`) and
+only refinement rounds touch Gemini; a **client-side throttle** paces each model; and a
+**disk cache** (under `/kaggle/working/.dubbing_cache/` by default) pools candidates so a
+re-run selects final lines with **zero** API calls. On a 429 the stage reads the server's
+`retryDelay` and waits, rather than retrying blind. Optional env overrides you can set before
+launching Streamlit (Cell 10) if you have paid quota or want to force a model:
+
+| Env var | Default | Effect |
+|---|---|---|
+| `DUBBING_GEMINI_BULK_MODEL` | `gemma-4-31b` | Model for the high-volume first pass. |
+| `DUBBING_GEMINI_REFINE_MODEL` / `DUBBING_GEMINI_MODEL` | `gemini-3.1-flash-lite` | Model for refinement rounds. |
+| `DUBBING_GEMINI_RPM` | 30 Gemma / 15 Gemini | Requests-per-minute throttle. |
+| `DUBBING_GEMINI_RPD` | *(unset)* | Optional per-model daily cap; a capped model is skipped with a clear error. |
+| `DUBBING_CACHE_DIR` | `./.dubbing_cache` | Where the candidate pool + usage counter live. |
 
 ---
 
