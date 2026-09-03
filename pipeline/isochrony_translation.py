@@ -363,6 +363,8 @@ def _call_gemini(
     log_fn: Optional[Callable[[str], None]] = None,
     models: Optional[List[str]] = None,
     served: Optional[List[str]] = None,
+    validate_fn: Optional[Callable[[str], object]] = None,
+    max_parse_retries: int = 2,
 ) -> str:
     """Call Gemini with logging, throttling, rate-limit-aware retries, and a
     model fallback chain.
@@ -370,6 +372,15 @@ def _call_gemini(
     If `served` is provided, the name of the model that actually returned the
     response is appended to it — so the caller can report which model (Gemma vs
     Gemini) really served a phase, rather than which chain it *intended* to use.
+
+    If `validate_fn` is provided, each raw reply is run through it before we
+    accept it. `validate_fn(resp_text)` returns a truthy value when the reply is
+    usable (e.g. `_parse_batch` returning a non-empty dict) and a falsy value (or
+    raises) when it is not. On a parse failure we RE-ASK THE SAME MODEL up to
+    `max_parse_retries` times with an explicit "return ONLY the JSON array"
+    instruction at temperature 0, and only after those are exhausted do we fall
+    through to the next model in the chain. This keeps a Gemma reformat glitch on
+    the lenient Gemma quota instead of escalating it to the scarce Gemini one.
 
     `models` is the chain to walk (default: the refine/Gemini ladder). Behaviour
     that keeps us under the free-tier limits:
@@ -401,9 +412,17 @@ def _call_gemini(
 
     idx = 0
     rate_retries = 0
+    parse_retries = 0          # reask budget for the CURRENT model; reset on advance
     total_tries = 0
-    max_total_tries = 10
+    # Hard ceiling on real API calls. Sized to allow a couple of parse-reasks on
+    # the first model(s) without starving the chain walk that follows.
+    max_total_tries = 16
     max_rate_retries = 4
+    _reformat_suffix = (
+        "\n\nIMPORTANT: Return ONLY the JSON array requested above — no prose, no "
+        "markdown fences, no explanation. Output must start with '[' and end with "
+        "']' and be valid JSON."
+    )
 
     while total_tries < max_total_tries and idx < len(chain):
         model_name = chain[idx]
@@ -413,16 +432,22 @@ def _call_gemini(
             _emit(f"  [Gemini API] '{model_name}' hit daily cap ({rpd}); advancing model.")
             idx += 1
             rate_retries = 0
+            parse_retries = 0
             continue
 
         total_tries += 1
+        # On a parse-reask, nudge the SAME model toward clean JSON at temp 0.
+        reasking = parse_retries > 0
+        call_prompt = prompt + _reformat_suffix if reasking else prompt
+        call_temp = 0.0 if reasking else temperature
         _throttle(model_name)
         _emit(f"  [Gemini API] Calling '{model_name}' "
-              f"(try {total_tries}/{max_total_tries}, prompt len: {len(prompt)})...")
+              f"(try {total_tries}/{max_total_tries}, prompt len: {len(call_prompt)}"
+              f"{', JSON-reask' if reasking else ''})...")
         start_time = time.time()
 
         try:
-            config_args = {"temperature": temperature}
+            config_args = {"temperature": call_temp}
             # Gemma on the Gemini API rejects response_schema / json mime — send
             # a plain text-mode request and let the caller parse the JSON.
             if not _is_gemma(model_name):
@@ -434,13 +459,35 @@ def _call_gemini(
             translation_cache.record_request(model_name)
             response = client.models.generate_content(
                 model=model_name,
-                contents=prompt,
+                contents=call_prompt,
                 config=types.GenerateContentConfig(**config_args),
             )
             elapsed = time.time() - start_time
             resp_text = response.text.strip() if response.text else ""
             _emit(f"  [Gemini API] ✓ '{model_name}' in {elapsed:.2f}s. "
                   f"Response len: {len(resp_text)} chars.")
+
+            # Content validation (e.g. JSON parse). A reply that comes back but
+            # doesn't parse is NOT a success — reask the same model, then advance.
+            if validate_fn is not None:
+                try:
+                    valid = bool(validate_fn(resp_text))
+                except Exception:
+                    valid = False
+                if not valid:
+                    if parse_retries < max_parse_retries:
+                        parse_retries += 1
+                        _emit(f"  [Gemini API] '{model_name}' reply did not parse; "
+                              f"re-asking same model for clean JSON "
+                              f"(parse retry {parse_retries}/{max_parse_retries}).")
+                        continue
+                    _emit(f"  [Gemini API] '{model_name}' still unparseable after "
+                          f"{max_parse_retries} reask(s); advancing to next model.")
+                    idx += 1
+                    parse_retries = 0
+                    rate_retries = 0
+                    continue
+
             if served is not None:
                 served.append(model_name)
             return resp_text
@@ -460,6 +507,7 @@ def _call_gemini(
                 _emit(f"  [Gemini API] '{model_name}' unavailable; advancing to next model.")
                 idx += 1
                 rate_retries = 0
+                parse_retries = 0
                 continue
 
             if is_rate and rate_retries < max_rate_retries:
@@ -480,6 +528,7 @@ def _call_gemini(
                 _emit(f"  [Gemini API] advancing from '{model_name}' to next model.")
                 idx += 1
                 rate_retries = 0
+                parse_retries = 0
                 continue
 
             raise
@@ -807,6 +856,9 @@ def translate_segments_isochrony(
                     log_fn=log_fn,
                     models=models,
                     served=served,
+                    # On an unparseable reply, reask the SAME model for clean JSON
+                    # (up to twice) before falling through the chain.
+                    validate_fn=_parse_batch,
                 )
                 # Robust parse: handles the schema shape (Gemini) AND the bare
                 # array a schema-less Gemma reply follows from the prompt.
