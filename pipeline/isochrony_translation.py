@@ -362,9 +362,14 @@ def _call_gemini(
     response_mime_type=None,
     log_fn: Optional[Callable[[str], None]] = None,
     models: Optional[List[str]] = None,
+    served: Optional[List[str]] = None,
 ) -> str:
     """Call Gemini with logging, throttling, rate-limit-aware retries, and a
     model fallback chain.
+
+    If `served` is provided, the name of the model that actually returned the
+    response is appended to it — so the caller can report which model (Gemma vs
+    Gemini) really served a phase, rather than which chain it *intended* to use.
 
     `models` is the chain to walk (default: the refine/Gemini ladder). Behaviour
     that keeps us under the free-tier limits:
@@ -436,6 +441,8 @@ def _call_gemini(
             resp_text = response.text.strip() if response.text else ""
             _emit(f"  [Gemini API] ✓ '{model_name}' in {elapsed:.2f}s. "
                   f"Response len: {len(resp_text)} chars.")
+            if served is not None:
+                served.append(model_name)
             return resp_text
         except Exception as e:
             err = str(e)
@@ -779,11 +786,13 @@ def translate_segments_isochrony(
     # --- Step 2: Iteration 0 — batch generate initial candidates for all segs ---
     batch_size = 15
 
-    def _generate_batch(items, prompt_builder, temperature, models):
+    def _generate_batch(items, prompt_builder, temperature, models, phase="batch"):
         """Run one batched Gemini generation on the given model chain; returns
         {seg_id: [candidate,...]}. `models` selects the phase — Gemma-first for
-        the iteration-0 bulk, the Gemini ladder for refinement."""
+        the iteration-0 bulk, the Gemini ladder for refinement. `phase` is only a
+        label for the "served by" confirmation line."""
         out = {}
+        served: List[str] = []
         for bstart in range(0, len(items), batch_size):
             chunk = items[bstart:bstart + batch_size]
             bnum = (bstart // batch_size) + 1
@@ -797,6 +806,7 @@ def translate_segments_isochrony(
                     response_mime_type="application/json",
                     log_fn=log_fn,
                     models=models,
+                    served=served,
                 )
                 # Robust parse: handles the schema shape (Gemini) AND the bare
                 # array a schema-less Gemma reply follows from the prompt.
@@ -813,8 +823,13 @@ def translate_segments_isochrony(
                 ]
                 out.update(_translate_sequential(
                     client, seq_items, internal_lang, n_candidates,
-                    log_fn=log_fn, models=models,
+                    log_fn=log_fn, models=models, served=served,
                 ))
+        if served:
+            # Confirm which model(s) ACTUALLY served this phase — for the bulk
+            # phase this is the check that Gemma (not Gemini) took the load.
+            uniq = ", ".join(dict.fromkeys(served))
+            _log(f"  [IsochronyTranslation] {phase} phase served by: {uniq}")
         return out
 
     # --- Step 2a: Seed from the persistent cache (free — no API calls) ---------
@@ -845,6 +860,7 @@ def translate_segments_isochrony(
             lambda chunk: _build_batch_prompt(chunk, internal_lang, n_candidates),
             temperature=0.5,
             models=_bulk_models(),
+            phase="Iteration 0 (bulk)",
         )
         for i in range(len(segments)):
             new_cands = gen.get(i, [])
@@ -910,6 +926,7 @@ def translate_segments_isochrony(
             lambda chunk: _build_feedback_prompt(chunk, internal_lang, n_candidates),
             temperature=0.4,
             models=_refine_models(),
+            phase=f"Iteration {iteration} (refine)",
         )
 
         any_improved = False
@@ -998,8 +1015,13 @@ def _translate_sequential(
     n_candidates: int,
     log_fn: Optional[Callable[[str], None]] = None,
     models: Optional[List[str]] = None,
+    served: Optional[List[str]] = None,
 ) -> dict:
     """Translate one segment at a time. Returns candidates_map dict.
+
+    `served`, if given, collects the model that served each call (forwarded to
+    `_call_gemini`) so a batch's "served by" line stays accurate even when it
+    falls back to the sequential path.
 
     Pacing is handled centrally by `_call_gemini`'s per-model throttle, so there
     is no fixed sleep here — the client-side RPM limiter already spaces requests
@@ -1032,6 +1054,7 @@ def _translate_sequential(
                 response_mime_type="application/json",
                 log_fn=log_fn,
                 models=models,
+                served=served,
             )
             candidates = _parse_candidates(raw)
             if not candidates:
@@ -1045,6 +1068,7 @@ def _translate_sequential(
                     temperature=0.3,
                     log_fn=log_fn,
                     models=models,
+                    served=served,
                 )
                 candidates = [simple.strip()] if simple.strip() else [item["english_text"]]
             except Exception:
