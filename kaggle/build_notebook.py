@@ -115,7 +115,7 @@ pkgs = [
     "pydub",
     "scipy",
     "resampy",
-    "numpy",
+    "numpy==1.26.4",         # pin <2 — demucs/numba + torch 2.5 expect the NumPy 1.x ABI
     "huggingface_hub",
     "safetensors",
     "faster-whisper",
@@ -176,6 +176,25 @@ else:
 print("\nInstalling streamlit...")
 subprocess.run([sys.executable, "-m", "pip", "install", "-q", "streamlit"], check=True)
 print("  ✓ streamlit")
+
+# ── Re-assert numpy 1.x AFTER f5-tts/IndicF5/vocos ────────────────────────────
+# Those installs can silently drag in a wheel built against numpy 2.x, leaving
+# the env with a 2.x-built extension over a 1.26 runtime -> "numpy.dtype size
+# changed (Expected 96 ... got 88)" ABI errors when transformers/torch import
+# during the IndicF5 load. Force numpy back to the pinned 1.x last so the final
+# environment is coherent when the model actually loads at dubbing time.
+print("\nRe-asserting numpy==1.26.4 (guards against a 2.x ABI mismatch)...")
+subprocess.run(
+    [sys.executable, "-m", "pip", "install", "-q", "--force-reinstall",
+     "--no-deps", "numpy==1.26.4"],
+    check=True,
+)
+import importlib, numpy as _np
+importlib.reload(_np)
+print(f"  ✓ numpy now {_np.__version__} (must be 1.26.x)")
+if not _np.__version__.startswith("1.26"):
+    print("  ⚠ numpy is NOT 1.26.x — restart the kernel and re-run this cell "
+          "before loading IndicF5, or the DiT/vocoder load may hit an ABI error.")
 
 print("\n✅ AI/TTS packages installed!")
 """
