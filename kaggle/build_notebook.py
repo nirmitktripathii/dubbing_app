@@ -121,6 +121,8 @@ pkgs = [
     "faster-whisper",
     "demucs",
     "phonemizer",
+    "indic-nlp-library",     # orthographic normalization for the real phoneme counter
+    "sentence-transformers", # IndicSBERT cross-lingual semantic gate
     "pyrubberband",
 ]
 
@@ -232,6 +234,7 @@ def _make_write_cell():
     file_map = [
         (os.path.join(base, "app.py"),                          "/kaggle/working/app.py"),
         (os.path.join(base, "pipeline", "phoneme_counter.py"), "/kaggle/working/pipeline/phoneme_counter.py"),
+        (os.path.join(base, "pipeline", "semantic_similarity.py"), "/kaggle/working/pipeline/semantic_similarity.py"),
         (os.path.join(base, "pipeline", "source_separation.py"),"/kaggle/working/pipeline/source_separation.py"),
         (os.path.join(base, "pipeline", "voice_manager.py"),    "/kaggle/working/pipeline/voice_manager.py"),
         (os.path.join(base, "pipeline", "isochrony_translation.py"), "/kaggle/working/pipeline/isochrony_translation.py"),
@@ -821,6 +824,8 @@ def _generate_large_files_module():
 
     large_files = [
         (os.path.join(base, "app.py"),                               f"{WORK_DIR}/app.py"),
+        (os.path.join(base, "pipeline", "phoneme_counter.py"),       f"{WORK_DIR}/pipeline/phoneme_counter.py"),
+        (os.path.join(base, "pipeline", "semantic_similarity.py"),   f"{WORK_DIR}/pipeline/semantic_similarity.py"),
         (os.path.join(base, "pipeline", "source_separation.py"),     f"{WORK_DIR}/pipeline/source_separation.py"),
         (os.path.join(base, "pipeline", "voice_manager.py"),         f"{WORK_DIR}/pipeline/voice_manager.py"),
         (os.path.join(base, "pipeline", "isochrony_translation.py"), f"{WORK_DIR}/pipeline/isochrony_translation.py"),

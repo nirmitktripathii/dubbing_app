@@ -80,6 +80,7 @@ send_log("Step 2/7: Installing Python packages (this takes ~8 minutes)...")
 pip_pkgs = [
     "soundfile", "pydub", "scipy", "resampy", "huggingface_hub",
     "safetensors", "faster-whisper", "demucs", "phonemizer",
+    "indic-nlp-library", "sentence-transformers",
     "pyrubberband", "google-genai", "vocos", "streamlit", "requests",
 ]
 
@@ -122,97 +123,12 @@ for init in [f"{WORK_DIR}/pipeline/__init__.py", f"{WORK_DIR}/utils/__init__.py"
 PIPELINE_FILES = {}   # Will be populated below
 
 
-# ─── pipeline/phoneme_counter.py ─────────────────────────────────────────────
-PIPELINE_FILES["pipeline/phoneme_counter.py"] = r'''
-import re
-import unicodedata
-
-EXPANSION_RATIOS = {
-    "hindi": 1.30, "bengali": 1.25, "marathi": 1.28, "gujarati": 1.27,
-    "punjabi": 1.22, "tamil": 1.35, "telugu": 1.38, "kannada": 1.36,
-    "malayalam": 1.40, "odia": 1.28, "assamese": 1.26,
-}
-
-def _count_english_syllables(word):
-    word = word.lower().strip(".,!?;:\"\'()-")
-    if not word:
-        return 0
-    count = len(re.findall(r"[aeiouy]+", word))
-    if word.endswith("e") and not word.endswith("le") and count > 1:
-        count -= 1
-    return max(1, count)
-
-def count_english_phonemes(text):
-    words = re.findall(r"[a-zA-Z\']+", text)
-    return sum(_count_english_syllables(w) for w in words)
-
-def _count_devanagari_phonemes(text):
-    count = 0
-    chars = list(text)
-    i = 0
-    while i < len(chars):
-        cp = ord(chars[i])
-        if 0x0915 <= cp <= 0x0939 or 0x0958 <= cp <= 0x095F:
-            if i + 1 < len(chars) and ord(chars[i + 1]) == 0x094D:
-                i += 2
-                continue
-            count += 1
-        elif 0x0904 <= cp <= 0x0914:
-            count += 1
-        i += 1
-    return max(1, count) if count else _fallback_char_count(text)
-
-def _count_brahmic_phonemes(text):
-    count = sum(1 for ch in text if unicodedata.category(ch) not in ("Mn","Mc","Me","Zs","Po","Ps","Pe"))
-    return max(1, count // 2)
-
-def _fallback_char_count(text):
-    stripped = re.sub(r"\s+", "", text)
-    return max(1, len(stripped) // 3)
-
-def count_indic_phonemes(text, language):
-    if not text.strip():
-        return 0
-    language = language.lower()
-    try:
-        from phonemizer import phonemize
-        codes = {"hindi":"hi","bengali":"bn","marathi":"mr","gujarati":"gu",
-                 "punjabi":"pa","tamil":"ta","telugu":"te","kannada":"kn",
-                 "malayalam":"ml","odia":"or","assamese":"as"}
-        code = codes.get(language)
-        if code:
-            ps = phonemize(text, language=code, backend="espeak", strip=True)
-            cleaned = re.sub(r"[\s\.!\?,\-\_]", "", ps)
-            if cleaned:
-                vowels = len(re.findall(r"[aeiouɑɔəɛɪʊʌæɯʊ]", cleaned))
-                return max(1, vowels)
-    except Exception:
-        pass
-    if language in ("hindi","marathi","nepali"):
-        return _count_devanagari_phonemes(text)
-    return _count_brahmic_phonemes(text)
-
-def isochrony_score(source_text, target_text, target_language):
-    src = count_english_phonemes(source_text)
-    tgt = count_indic_phonemes(target_text, target_language)
-    ratio = EXPANSION_RATIOS.get(target_language.lower(), 1.3)
-    ideal = src * ratio
-    if ideal == 0:
-        return 1.0
-    return round(max(0.0, 1.0 - abs(tgt - ideal) / ideal), 4)
-
-def compute_target_budget(source_text, target_language, tolerance=0.15):
-    src = count_english_phonemes(source_text)
-    ratio = EXPANSION_RATIOS.get(target_language.lower(), 1.3)
-    ideal = src * ratio
-    return {
-        "source_phonemes": src,
-        "ideal_target": round(ideal, 1),
-        "min_target": max(1, int(ideal * (1 - tolerance))),
-        "max_target": int(ideal * (1 + tolerance)),
-        "expansion_ratio": ratio,
-    }
-'''
+# NOTE: pipeline/phoneme_counter.py is NO LONGER inlined here. The old copy was a
+# syllable-counting heuristic that has since been replaced by the canonical
+# espeak-ng real-phoneme counter. Both phoneme_counter.py and semantic_similarity.py
+# are now written from the CANONICAL source by kaggle_generated_files.py (imported
+# below), so there is a single source of truth and no drift. Regenerate that module
+# with:  python kaggle/build_notebook.py
 
 # ─── utils/audio_extraction.py ───────────────────────────────────────────────
 PIPELINE_FILES["utils/audio_extraction.py"] = r'''

@@ -8,6 +8,12 @@ openai-whisper          # Fallback if faster-whisper is unavailable
 # ── Translation ───────────────────────────────────────────────────────────
 google-genai            # Gemini API for isochrony-aware translation
 
+# ── Isochrony scoring (real phonemes) & semantic gating ───────────────────
+# espeak-ng must ALSO be installed as a system package (apt: espeak-ng / winget).
+phonemizer              # espeak-ng G2P backend — real phoneme counts (phoneme_counter.py)
+indic-nlp-library       # Orthographic normalization before G2P (phoneme_counter.py)
+sentence-transformers   # IndicSBERT cross-lingual semantic gate (semantic_similarity.py)
+
 # ── Source separation ─────────────────────────────────────────────────────
 demucs                  # Vocal/background separation (htdemucs model)
 
