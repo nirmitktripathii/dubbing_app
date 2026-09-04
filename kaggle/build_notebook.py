@@ -741,7 +741,27 @@ if not HF_TOKEN:
     print("⚠ WARNING: HF_TOKEN is not set. Model download will fail.")
 
 env = os.environ.copy()
-env.update({"GEMINI_API_KEY": GEMINI_KEY, "HF_TOKEN": HF_TOKEN, "PYTHONIOENCODING": "utf-8"})
+# UTF-8 everywhere in the app subprocess. Kaggle spawns this notebook kernel
+# under a C/ASCII locale, so WITHOUT this any implicit str->bytes encode inside
+# the pipeline (a library doing s.encode() that falls back to
+# locale.getpreferredencoding(), a text-mode open(), httpx) defaults to ASCII and
+# dies on the first non-ASCII char. The Indic pipeline is saturated with
+# non-ASCII (Devanagari/Tamil output, plus — → Δ ✓ in prompts and logs), so this
+# surfaces as e.g. "'ascii' codec can't encode character '✓'" and every
+# translation call fails in 0.00s.
+#   • PYTHONIOENCODING only fixes stdout/stderr/stdin.
+#   • PYTHONUTF8=1 forces CPython UTF-8 Mode: it ALSO flips the default open()
+#     encoding AND locale.getpreferredencoding() to UTF-8 — this is the switch
+#     that actually stops the crash.
+#   • LANG/LC_ALL back it up for any C-extension that reads the locale directly.
+env.update({
+    "GEMINI_API_KEY": GEMINI_KEY,
+    "HF_TOKEN": HF_TOKEN,
+    "PYTHONIOENCODING": "utf-8",
+    "PYTHONUTF8": "1",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+})
 
 # ── Launch Streamlit ──────────────────────────────────────────────────────────
 print("🚀 Starting Streamlit app...")
