@@ -113,7 +113,8 @@ CELL_PYTHON_DEPS_1 = r"""import subprocess, sys
 pkgs = [
     "soundfile",
     "pydub",
-    "scipy",
+    "scipy==1.13.1",         # last scipy built for the numpy 1.x ABI — MUST pair with numpy 1.26.4
+                             # (unpinned pulls a numpy-2.x wheel -> scipy.special sph_legendre_p ABI crash)
     "resampy",
     "numpy==1.26.4",         # pin <2 — demucs/numba + torch 2.5 expect the NumPy 1.x ABI
     "huggingface_hub",
@@ -190,12 +191,35 @@ subprocess.run(
      "--no-deps", "numpy==1.26.4"],
     check=True,
 )
-import importlib, numpy as _np
-importlib.reload(_np)
-print(f"  ✓ numpy now {_np.__version__} (must be 1.26.x)")
-if not _np.__version__.startswith("1.26"):
-    print("  ⚠ numpy is NOT 1.26.x — restart the kernel and re-run this cell "
-          "before loading IndicF5, or the DiT/vocoder load may hit an ABI error.")
+
+# Verify coherence the way it actually matters. The dubbing pipeline runs inside
+# the `streamlit run app.py` SUBPROCESS, which imports a FRESH numpy/scipy from
+# disk — so what counts is on-disk coherence, NOT this kernel's already-loaded
+# numpy. importlib.reload() cannot hot-swap a loaded C-extension, so it only ever
+# printed a misleading "green". Instead we probe in a throwaway subprocess that
+# mirrors the app: import numpy + scipy.special (where the sph_legendre_p ufunc
+# lives) and exercise a compiled scipy path. If scipy was built against numpy 2.x
+# over a 1.26 runtime, this fails LOUDLY here instead of mid-dub.
+_probe = (
+    "import numpy, scipy, scipy.special\n"
+    "from scipy.spatial.distance import cosine\n"
+    "cosine([1.0, 0.0], [0.0, 1.0])\n"
+    "print(numpy.__version__ + '|' + scipy.__version__)\n"
+)
+_r = subprocess.run([sys.executable, "-c", _probe], capture_output=True, text=True)
+if _r.returncode == 0:
+    _nv, _sv = _r.stdout.strip().split("|")
+    print(f"  ✓ Fresh-process import OK — numpy {_nv}, scipy {_sv} (ABI coherent)")
+    if not _nv.startswith("1.26"):
+        print(f"  ⚠ numpy resolved to {_nv}, not 1.26.x — the app subprocess may "
+              "hit an ABI error. Restart the kernel and Run All before launching.")
+else:
+    _last = _r.stderr.strip().splitlines()[-1] if _r.stderr.strip() else "(no stderr)"
+    print("  ✗ Fresh-process numpy/scipy import FAILED — this is the ABI mismatch "
+          "that would crash the dubbing run:")
+    print("   ", _last)
+    print("    Fix: ensure scipy==1.13.1 (the numpy-1.x ABI pair) installed above, "
+          "then Restart Kernel and Run All.")
 
 print("\n✅ AI/TTS packages installed!")
 """

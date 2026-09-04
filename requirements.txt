@@ -42,6 +42,8 @@ huggingface_hub==0.36.2
 soundfile==0.14.0            # Fast audio I/O (replaces pydub for new pipeline)
 pydub==0.25.1                # Kept for legacy compatibility
 numpy==1.26.4                # Pinned <2 — demucs/numba and torch 2.5 expect the NumPy 1.x ABI
+scipy==1.13.1                # Last scipy built for the numpy 1.x ABI — MUST pair with numpy 1.26.4
+                             # (unpinned pulls a numpy-2.x wheel -> scipy.special sph_legendre_p ABI crash)
 pyrubberband==0.4.0          # Safety-net drift correction (pitch-preserving stretch)
 
 # ── Video processing ──────────────────────────────────────────────────────
