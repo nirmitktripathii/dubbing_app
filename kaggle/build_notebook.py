@@ -179,6 +179,31 @@ print("\nInstalling streamlit...")
 subprocess.run([sys.executable, "-m", "pip", "install", "-q", "streamlit"], check=True)
 print("  ✓ streamlit")
 
+# ── Re-assert transformers < 5.0.0 AFTER f5-tts/IndicF5 ───────────────────────
+# f5-tts / IndicF5 can resolve transformers to a 5.x release. On 5.x the IndicF5
+# DiT/vocoder load hits a meta-tensor error (the low_cpu_mem_usage default path
+# changed), crashing Step 6 (TTS). Force it back into the tested 4.x range LAST
+# so the model actually loads. This runs BEFORE the numpy re-assert on purpose —
+# a transformers (re)install can itself drag in numpy 2.x, so numpy stays last.
+print("\nRe-asserting transformers<5.0.0 (guards the IndicF5 meta-tensor crash)...")
+subprocess.run(
+    [sys.executable, "-m", "pip", "install", "-q", "transformers<5.0.0"],
+    check=True,
+)
+_tv = subprocess.run(
+    [sys.executable, "-c", "import transformers; print(transformers.__version__)"],
+    capture_output=True, text=True,
+)
+if _tv.returncode == 0:
+    _tvs = _tv.stdout.strip()
+    print(f"  ✓ transformers now {_tvs}")
+    if _tvs.split(".")[0].isdigit() and int(_tvs.split(".")[0]) >= 5:
+        print(f"  ⚠ transformers is {_tvs} (>=5) — IndicF5 will likely hit a "
+              "meta-tensor error at Step 6. Restart the kernel and Run All.")
+else:
+    print("  ⚠ could not verify transformers version:",
+          _tv.stderr.strip().splitlines()[-1] if _tv.stderr.strip() else "(no stderr)")
+
 # ── Re-assert numpy 1.x AFTER f5-tts/IndicF5/vocos ────────────────────────────
 # Those installs can silently drag in a wheel built against numpy 2.x, leaving
 # the env with a 2.x-built extension over a 1.26 runtime -> "numpy.dtype size
