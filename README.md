@@ -161,8 +161,8 @@ streamlit run app.py
 
 | Setting | Env var | Default | Purpose |
 |---|---|---|---|
-| Bulk (iteration-0) model | `DUBBING_GEMINI_BULK_MODEL` | `gemma-4-31b` → `gemma-4-26b` | High-volume first pass on the lenient Gemma limits. Falls through the Gemini ladder if Gemma is unavailable. |
-| Refine model | `DUBBING_GEMINI_REFINE_MODEL` / `DUBBING_GEMINI_MODEL` | `gemini-3.1-flash-lite` | Used only for refinement rounds on hard segments. Falls back to 2.5/2.0/1.5-flash. |
+| Bulk (iteration-0) model | `DUBBING_GEMINI_BULK_MODEL` | `gemma-4-31b-it` → `gemma-4-26b-a4b-it` | High-volume first pass on the lenient Gemma limits. Falls through the Gemini ladder if Gemma is unavailable. |
+| Refine model | `DUBBING_GEMINI_REFINE_MODEL` / `DUBBING_GEMINI_MODEL` | `gemini-3.1-flash-lite` | Used only for refinement rounds on hard segments. Falls back to `gemini-3.5-flash-lite`. |
 | Requests-per-minute cap | `DUBBING_GEMINI_RPM` | `30` (Gemma) / `15` (Gemini) | Client-side throttle: min interval between calls = `60/RPM`. |
 | Requests-per-day cap | `DUBBING_GEMINI_RPD` | *(unset)* | Optional hard per-model daily cap; a capped model is skipped so the job degrades with a clear error instead of hammering 429s. |
 | Cache directory | `DUBBING_CACHE_DIR` | `./.dubbing_cache` | Where the candidate pool + daily-usage counter live. |
