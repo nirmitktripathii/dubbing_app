@@ -134,7 +134,7 @@ _indicf5_device = None
 
 
 
-def _load_indicf5(device: str = "auto"):
+def _load_indicf5(device: str = "auto", log_fn=None):
     """
     Load IndicF5 model onto device. Cached after first call.
 
@@ -165,7 +165,13 @@ def _load_indicf5(device: str = "auto"):
     from datetime import datetime
     def load_log(msg: str):
         t = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-        print(f"[{t}] [DurationTTS_Load] {msg}", flush=True)
+        line = f"[{t}] [DurationTTS_Load] {msg}"
+        print(line, flush=True)
+        if log_fn is not None:
+            try:
+                log_fn(f"    {msg}")
+            except Exception:
+                pass
 
     load_log(f"Requesting load on device={device}...")
 
@@ -204,17 +210,22 @@ def _load_indicf5(device: str = "auto"):
         # hf_hub_download + load_vocoder + load_model. No from_pretrained needed.
         # Direct importlib instantiation runs __init__ with real tensors.
 
-        _cache_dir = os.path.expandvars(
-            r"%USERPROFILE%\.cache\huggingface\modules\transformers_modules"
-            r"\ai4bharat\IndicF5\ba85abedf18dc479a447eaa0eccbd76ab78a47d5"
-        )
-        _model_py = os.path.join(_cache_dir, "model.py")
+        # Locate the cached IndicF5 model.py in a platform-independent way.
+        # The remote-code module lands under the HF cache with a commit-hash
+        # subdirectory, so glob the hash rather than hardcoding a path (the old
+        # Windows-only %USERPROFILE% literal never resolved on Kaggle/Linux).
+        import glob as _glob
+        _patterns = _glob.glob(os.path.expanduser(
+            "~/.cache/huggingface/modules/transformers_modules/ai4bharat/IndicF5/*/model.py"
+        ))
+        _model_py = _patterns[0] if _patterns else None
 
         # If the cached model.py doesn't exist yet, trigger a one-time download
-        # via a throwaway from_pretrained with a NO-OP config so HF caches files.
-        if not os.path.exists(_model_py):
-            load_log("HF cache miss — triggering one-time model file download...")
+        # via a throwaway from_pretrained so HF caches the remote-code files.
+        if not _model_py or not os.path.exists(_model_py):
+            load_log("HF cache miss - triggering one-time model file download...")
             try:
+                from transformers import AutoModel
                 AutoModel.from_pretrained(
                     "ai4bharat/IndicF5",
                     trust_remote_code=True,
@@ -222,6 +233,10 @@ def _load_indicf5(device: str = "auto"):
                 )
             except Exception:
                 pass  # Crash expected; we only needed the cache to populate
+            _patterns = _glob.glob(os.path.expanduser(
+                "~/.cache/huggingface/modules/transformers_modules/ai4bharat/IndicF5/*/model.py"
+            ))
+            _model_py = _patterns[0] if _patterns else None
 
         load_log(f"Loading INF5Model directly from cached model.py: {_model_py}")
         _spec = _ilu.spec_from_file_location("indicf5_model", _model_py)
@@ -282,6 +297,7 @@ def _generate_single_segment(
     ref_audio_path: Optional[str],
     ref_text: str,
     lang_code: str,
+    log_fn=None,
 ) -> np.ndarray:
     """
     Generate audio for a single text segment with precise duration conditioning.
@@ -303,6 +319,11 @@ def _generate_single_segment(
     def seg_log(msg: str):
         t = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         print(f"[{t}] [SegGen] {msg}", flush=True)
+        if log_fn is not None:
+            try:
+                log_fn(f"      {msg}")
+            except Exception:
+                pass
 
     if not ref_audio_path or not os.path.exists(ref_audio_path):
         raise ValueError(
@@ -437,6 +458,7 @@ def generate_tts_for_segments(
     reference_audio_path: Optional[str] = None,
     reference_text: Optional[str] = None,
     device: str = "auto",
+    log_fn=None,
 ) -> list:
     """
     Generate duration-controlled TTS audio for each translated segment.
@@ -450,6 +472,10 @@ def generate_tts_for_segments(
         reference_text:        Transcript of the reference audio clip.
                                Required if reference_audio_path is provided.
         device:                'auto', 'cuda', or 'cpu'.
+        log_fn:                Optional callable(str) that receives every progress
+                               line so a UI (e.g. the Streamlit Pipeline Log) can
+                               show download / model-load / per-segment progress.
+                               When None, output goes to stdout only (prior behaviour).
 
     Returns:
         Same list of segments, with 'audio_path' added to each element.
@@ -461,6 +487,11 @@ def generate_tts_for_segments(
     def tts_log(msg: str):
         t = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         print(f"[{t}] [DurationTTS] {msg}", flush=True)
+        if log_fn is not None:
+            try:
+                log_fn(f"  {msg}")
+            except Exception:
+                pass
 
     lang_code = LANGUAGE_TO_CODE.get(target_language)
     if not lang_code:
@@ -507,7 +538,7 @@ def generate_tts_for_segments(
 
     # Load model
     tts_log("Loading/resolving IndicF5 model...")
-    model, resolved_device = _load_indicf5(device)
+    model, resolved_device = _load_indicf5(device, log_fn=log_fn)
     tts_log(f"IndicF5 model ready on device: {resolved_device}")
 
     results = []
@@ -537,6 +568,7 @@ def generate_tts_for_segments(
                 ref_audio_path=ref_audio,
                 ref_text=ref_text,
                 lang_code=lang_code,
+                log_fn=log_fn,
             )
 
             actual_duration = len(audio) / INDICF5_SAMPLE_RATE

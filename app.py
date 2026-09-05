@@ -164,13 +164,27 @@ if start_btn:
 
     progress = st.progress(0)
     status = st.empty()
-    log_expander = st.expander("📋 Pipeline Log", expanded=False)
+    log_expander = st.expander("📋 Pipeline Log", expanded=True)
     log_area = log_expander.empty()
     logs = []
 
     def log(msg):
+        # Keep the FULL history (no truncation) and render it in a fixed-height,
+        # scrollable, monospace box so long-running steps (esp. Step 6 TTS) stay
+        # visible and reviewable in the UI instead of scrolling off the top.
         logs.append(msg)
-        log_area.text("\n".join(logs[-30:]))
+        import html as _html
+        body = _html.escape("\n".join(logs))
+        log_area.markdown(
+            '<div id="pipeline-log-box" style="height:340px;overflow-y:auto;'
+            'white-space:pre-wrap;word-break:break-word;font-family:monospace;'
+            'font-size:12px;line-height:1.45;background:#0e1117;color:#d4d4d4;'
+            'padding:10px 12px;border-radius:6px;border:1px solid #262730;">'
+            f'{body}</div>'
+            '<script>var _b=document.getElementById("pipeline-log-box");'
+            'if(_b){_b.scrollTop=_b.scrollHeight;}</script>',
+            unsafe_allow_html=True,
+        )
 
     try:
         # ── Step 1: Audio extraction ──────────────────────────────────────
@@ -256,6 +270,7 @@ if start_btn:
             output_dir=tts_dir,
             reference_audio_path=ref_audio_path,
             reference_text=ref_text,
+            log_fn=log,
         )
         log(f"  ✓ TTS complete: {len(translated_segments)} audio chunks generated.")
 
