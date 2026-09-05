@@ -126,6 +126,7 @@ def sync_audio_segments(
     output_path: str,
     background_audio_path: str = None,
     background_volume: float = 0.35,
+    log_fn=None,
 ) -> str:
     """
     Assemble dubbed audio segments onto a timeline and optionally mix with background.
@@ -141,6 +142,14 @@ def sync_audio_segments(
     Returns:
         output_path (str)
     """
+    def _emit(msg):
+        print(msg)
+        if log_fn:
+            try:
+                log_fn(f"    {msg}")
+            except Exception:
+                pass
+
     if not SOUNDFILE_AVAILABLE:
         raise RuntimeError("soundfile is required. Run: pip install soundfile")
 
@@ -154,17 +163,17 @@ def sync_audio_segments(
             last_end = max(seg["end"] for seg in segments)
             total_samples = int(last_end * SAMPLE_RATE) + int(0.5 * SAMPLE_RATE)
     else:
-        print("[AudioSync] No segments to process.")
+        _emit("[AudioSync] No segments to process.")
         return output_path
 
-    print(f"[AudioSync] Building dubbed vocal timeline: {total_samples/SAMPLE_RATE:.2f}s")
+    _emit(f"[AudioSync] Building dubbed vocal timeline: {total_samples/SAMPLE_RATE:.2f}s")
     vocal_timeline = np.zeros(total_samples, dtype=np.float32)
     crossfade_samples = int(CROSSFADE_MS / 1000 * SAMPLE_RATE)
 
     for i, seg in enumerate(segments):
         audio_path = seg.get("audio_path")
         if not audio_path or not os.path.exists(audio_path):
-            print(f"  [Segment {i}] Missing audio_path — skipping.")
+            _emit(f"  [Segment {i}] Missing audio_path — skipping.")
             continue
 
         start_sample = int(seg["start"] * SAMPLE_RATE)
@@ -173,7 +182,7 @@ def sync_audio_segments(
         try:
             chunk = _load_audio_np(audio_path)
         except Exception as e:
-            print(f"  [Segment {i}] Failed to load {audio_path}: {e}")
+            _emit(f"  [Segment {i}] Failed to load {audio_path}: {e}")
             continue
 
         if len(chunk) == 0:
@@ -181,7 +190,7 @@ def sync_audio_segments(
 
         # Log sync accuracy
         drift_ms = abs(len(chunk) - target_samples) / SAMPLE_RATE * 1000
-        print(
+        _emit(
             f"  [Segment {i}] start={seg['start']:.2f}s "
             f"target={target_samples/SAMPLE_RATE:.3f}s "
             f"actual={len(chunk)/SAMPLE_RATE:.3f}s "
@@ -197,7 +206,7 @@ def sync_audio_segments(
 
     # Mix with background if provided
     if background_audio_path and os.path.exists(background_audio_path):
-        print(f"[AudioSync] Mixing background track: {background_audio_path}")
+        _emit(f"[AudioSync] Mixing background track: {background_audio_path}")
         try:
             bg = _load_audio_np(background_audio_path)
             # Match lengths
@@ -208,7 +217,7 @@ def sync_audio_segments(
             bg = _peak_normalize(bg, target_peak=0.25) * background_volume
             final = (vocal_timeline + bg).clip(-1.0, 1.0).astype(np.float32)
         except Exception as e:
-            print(f"[AudioSync] Background mix failed: {e}. Using vocals only.")
+            _emit(f"[AudioSync] Background mix failed: {e}. Using vocals only.")
             final = vocal_timeline
     else:
         final = vocal_timeline
@@ -231,9 +240,9 @@ def sync_audio_segments(
             # FFmpeg MP3 conversion failed — just rename the WAV
             os.replace(tmp_wav, output_path.replace(".mp3", ".wav"))
             output_path = output_path.replace(".mp3", ".wav")
-            print("[AudioSync] MP3 conversion failed — saved as WAV instead.")
+            _emit("[AudioSync] MP3 conversion failed — saved as WAV instead.")
     else:
         sf.write(output_path, final, SAMPLE_RATE, subtype="PCM_16")
 
-    print(f"[AudioSync] Final dubbed audio saved: {output_path}")
+    _emit(f"[AudioSync] Final dubbed audio saved: {output_path}")
     return output_path

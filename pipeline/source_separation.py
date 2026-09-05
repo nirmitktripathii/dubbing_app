@@ -34,6 +34,7 @@ def separate_audio(
     output_dir: str,
     model: str = "htdemucs",
     device: str = "auto",
+    log_fn=None,
 ) -> dict:
     """
     Separate vocals from background audio using Demucs.
@@ -54,6 +55,14 @@ def separate_audio(
         RuntimeError: if demucs is not installed or separation fails.
         FileNotFoundError: if audio_path does not exist.
     """
+    def _emit(msg):
+        print(msg)
+        if log_fn:
+            try:
+                log_fn(f"    {msg}")
+            except Exception:
+                pass
+
     if not os.path.exists(audio_path):
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
@@ -79,8 +88,9 @@ def separate_audio(
         except ImportError:
             device = "cpu"
 
-    print(f"[SourceSeparation] Model: {model} | Device: {device}")
-    print(f"[SourceSeparation] Input: {audio_path}")
+    _emit(f"[SourceSeparation] Model: {model} | Device: {device}")
+    _emit(f"[SourceSeparation] Input: {audio_path}")
+    _emit("[SourceSeparation] Separating (GPU ~30-90s / CPU several min)...")
 
     # Build demucs CLI command.
     # demucs writes to: <output_dir>/<model>/<track_name>/{vocals,no_vocals,drums,bass,other}.wav
@@ -94,19 +104,46 @@ def separate_audio(
         audio_path,
     ]
 
-    print(f"[SourceSeparation] Running: {' '.join(cmd)}")
-    result = subprocess.run(
+    _emit(f"[SourceSeparation] Running: {' '.join(cmd)}")
+
+    # Stream Demucs output line-by-line so its progress is visible in the UI
+    # instead of buffering silently until the whole (minute-plus) run finishes.
+    proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
+        bufsize=1,
     )
+    tail = []
+    last_pct = -10
+    for raw in iter(proc.stdout.readline, ""):
+        # Demucs draws a tqdm bar with carriage returns; split on them so each
+        # progress update is its own line rather than one giant blob.
+        for line in raw.replace("\r", "\n").split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            tail.append(line)
+            tail[:] = tail[-40:]
+            import re as _re
+            m = _re.search(r"(\d+)%", line)
+            if m:
+                # Throttle progress lines to every ~10% to avoid flooding the log.
+                pct = int(m.group(1))
+                if pct >= last_pct + 10 or pct >= 100:
+                    last_pct = pct
+                    _emit(f"[Demucs] {line}")
+            else:
+                _emit(f"[Demucs] {line}")
+    proc.stdout.close()
+    returncode = proc.wait()
 
-    if result.returncode != 0:
-        print(f"[SourceSeparation] stderr:\n{result.stderr}")
+    if returncode != 0:
+        _emit(f"[SourceSeparation] Demucs failed (exit {returncode}).")
         raise RuntimeError(
-            f"Demucs failed with exit code {result.returncode}.\n"
-            f"stderr: {result.stderr[-2000:]}"
+            f"Demucs failed with exit code {returncode}.\n"
+            f"last output:\n" + "\n".join(tail[-30:])
         )
 
     # Locate the output stems.
@@ -133,8 +170,8 @@ def separate_audio(
     shutil.copy2(vocals_path, flat_vocals)
     shutil.copy2(bg_path, flat_bg)
 
-    print(f"[SourceSeparation] Vocals  -> {flat_vocals}")
-    print(f"[SourceSeparation] Background -> {flat_bg}")
+    _emit(f"[SourceSeparation] Vocals  -> {flat_vocals}")
+    _emit(f"[SourceSeparation] Background -> {flat_bg}")
 
     return {
         "vocals": flat_vocals,

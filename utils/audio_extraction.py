@@ -2,7 +2,7 @@ import os
 import subprocess
 
 
-def extract_audio(video_path, output_audio_path):
+def extract_audio(video_path, output_audio_path, log_fn=None):
     """
     Extracts the audio track from a video file and saves it as a WAV file.
     Uses FFmpeg directly via subprocess — works on any system without
@@ -11,8 +11,17 @@ def extract_audio(video_path, output_audio_path):
     Args:
         video_path (str): Path to the input video file.
         output_audio_path (str): Path to save the extracted audio file.
+        log_fn (callable): Optional UI logger; receives progress strings.
     """
-    print(f"Extracting audio from {video_path}...")
+    def _emit(msg):
+        print(msg)
+        if log_fn:
+            try:
+                log_fn(f"    {msg}")
+            except Exception:
+                pass
+
+    _emit(f"Extracting audio from {video_path}...")
 
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Video file not found: {video_path}")
@@ -37,4 +46,4 @@ def extract_audio(video_path, output_audio_path):
             f"FFmpeg audio extraction failed:\n{result.stderr}"
         )
 
-    print(f"Audio extracted to: {output_audio_path}")
+    _emit(f"Audio extracted to: {output_audio_path}")

@@ -75,6 +75,7 @@ def extract_reference_clip(
     clip_seconds: int = REFERENCE_CLIP_SECONDS,
     prefer_start_offset: float = 5.0,
     segments: list = None,
+    log_fn=None,
 ) -> tuple:
     """
     Extract the cleanest reference audio clip from a vocal stem.
@@ -89,6 +90,14 @@ def extract_reference_clip(
     Returns:
         A tuple of (Path to the reference clip WAV file, Aligned reference text).
     """
+    def _emit(msg):
+        print(msg)
+        if log_fn:
+            try:
+                log_fn(f"    {msg}")
+            except Exception:
+                pass
+
     if not SOUNDFILE_AVAILABLE:
         raise RuntimeError(
             "soundfile is not installed. Run: pip install soundfile"
@@ -97,7 +106,7 @@ def extract_reference_clip(
     if not os.path.exists(vocals_path):
         raise FileNotFoundError(f"Vocals file not found: {vocals_path}")
 
-    print(f"[VoiceManager] Extracting reference clip from: {vocals_path}")
+    _emit(f"[VoiceManager] Extracting reference clip from: {vocals_path}")
 
     audio, sr = sf.read(vocals_path, dtype="float32", always_2d=False)
 
@@ -113,7 +122,7 @@ def extract_reference_clip(
     skip_samples = int(prefer_start_offset * sr)
 
     if total_seconds < clip_seconds:
-        print(
+        _emit(
             f"[VoiceManager] Audio ({total_seconds:.1f}s) shorter than clip_seconds "
             f"({clip_seconds}s). Using full audio."
         )
@@ -134,7 +143,7 @@ def extract_reference_clip(
                 best_start = start
             start += hop_samples
 
-        print(
+        _emit(
             f"[VoiceManager] Best window at {best_start/sr:.1f}s "
             f"(RMS={best_rms:.4f})"
         )
@@ -144,7 +153,7 @@ def extract_reference_clip(
 
     # Resample to IndicF5's native 24kHz
     if sr != INDICF5_SAMPLE_RATE:
-        print(f"[VoiceManager] Resampling {sr}Hz -> {INDICF5_SAMPLE_RATE}Hz")
+        _emit(f"[VoiceManager] Resampling {sr}Hz -> {INDICF5_SAMPLE_RATE}Hz")
         clip = _resample_if_needed(clip, sr, INDICF5_SAMPLE_RATE)
 
     # Normalize to [-1, 1] to avoid clipping
@@ -154,7 +163,7 @@ def extract_reference_clip(
 
     os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else ".", exist_ok=True)
     sf.write(output_path, clip, INDICF5_SAMPLE_RATE, subtype="PCM_16")
-    print(f"[VoiceManager] Reference clip saved: {output_path} ({len(clip)/INDICF5_SAMPLE_RATE:.1f}s)")
+    _emit(f"[VoiceManager] Reference clip saved: {output_path} ({len(clip)/INDICF5_SAMPLE_RATE:.1f}s)")
 
     # Find the aligned text corresponding to the extracted audio window
     ref_text = ""
@@ -173,5 +182,5 @@ def extract_reference_clip(
     if not ref_text:
         ref_text = "Hello, this is a reference audio clip."
 
-    print(f"[VoiceManager] Extracted aligned reference text: \"{ref_text}\"")
+    _emit(f"[VoiceManager] Extracted aligned reference text: \"{ref_text}\"")
     return output_path, ref_text

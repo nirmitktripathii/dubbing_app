@@ -358,11 +358,19 @@ def _make_kaggle_video_merge():
     content = r'''import os
 import subprocess
 
-def merge_video_audio_subs(video_path: str, audio_path: str, srt_path: str, output_path: str):
+def merge_video_audio_subs(video_path: str, audio_path: str, srt_path: str, output_path: str, log_fn=None):
     """
     Merges the original video, the new dubbed audio, and the subtitle file using FFmpeg.
     Linux-compatible (no Windows path escaping needed).
     """
+    def _emit(msg):
+        print(msg)
+        if log_fn:
+            try:
+                log_fn(f"    {msg}")
+            except Exception:
+                pass
+
     cmd = [
         "ffmpeg", "-y",
         "-i", video_path,
@@ -375,12 +383,12 @@ def merge_video_audio_subs(video_path: str, audio_path: str, srt_path: str, outp
         "-shortest",
         output_path
     ]
-    print(f"Running FFmpeg: {' '.join(cmd)}")
+    _emit("Encoding final video with FFmpeg (burning subtitles, this can take a minute)...")
     try:
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
-        print("Video merging complete.")
+        _emit("Video merging complete.")
     except subprocess.CalledProcessError as e:
-        print(f"FFmpeg Error:\n{e.stderr}")
+        _emit(f"FFmpeg failed:\n{e.stderr[-1500:]}")
         raise RuntimeError(f"FFmpeg failed:\n{e.stderr}")
     return output_path
 '''

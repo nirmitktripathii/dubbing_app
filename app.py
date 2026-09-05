@@ -191,7 +191,7 @@ if start_btn:
         status.markdown("**Step 1/7** — Extracting audio from video...")
         log("Step 1: Extracting audio...")
         audio_path = os.path.join(temp_dir, "original_audio.wav")
-        extract_audio(video_path, audio_path)
+        extract_audio(video_path, audio_path, log_fn=log)
         log(f"  ✓ Audio extracted: {audio_path}")
         progress.progress(5)
 
@@ -204,7 +204,7 @@ if start_btn:
             log("Step 2: Running Demucs source separation...")
             sep_dir = os.path.join(temp_dir, "separated")
             try:
-                stems = separate_audio(audio_path, sep_dir)
+                stems = separate_audio(audio_path, sep_dir, log_fn=log)
                 vocals_path = stems["vocals"]
                 background_path = stems["background"]
                 log(f"  ✓ Vocals: {vocals_path}")
@@ -250,7 +250,7 @@ if start_btn:
             log("Step 5: Extracting reference voice clip...")
             ref_audio_path = os.path.join(temp_dir, "voice_reference.wav")
             try:
-                ref_audio_path, ref_text = extract_reference_clip(vocals_path, ref_audio_path, segments=segments)
+                ref_audio_path, ref_text = extract_reference_clip(vocals_path, ref_audio_path, segments=segments, log_fn=log)
                 log(f"  ✓ Voice reference saved: {ref_audio_path}")
             except Exception as e:
                 log(f"  ⚠️ Voice extraction failed: {e}. Synthesis may fail.")
@@ -287,12 +287,13 @@ if start_btn:
             synced_audio_path,
             background_audio_path=background_path,
             background_volume=bg_volume,
+            log_fn=log,
         )
 
         log("  Merging video, audio, and subtitles with FFmpeg...")
         final_video_path = os.path.join(temp_dir, "final_dubbed_video.mp4")
         merge_video_audio_subs(
-            video_path, synced_audio_path, translated_srt_path, final_video_path
+            video_path, synced_audio_path, translated_srt_path, final_video_path, log_fn=log
         )
         progress.progress(100)
         status.markdown("✅ **Dubbing complete!**")
