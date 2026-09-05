@@ -82,7 +82,8 @@ Stage 2 · Transcription  ── Faster-Whisper large-v3 (INT8)
     │
     ▼
 Stage 3 · Isochrony-Aware Translation  ★ v2.5 core ★
-    │   Gemini (gemini-3.1-flash-lite) generates 3 candidates/segment
+    │   Gemma-bulk / Gemini-refine hybrid generates 3 candidates/segment
+    │   (throttled + disk-cached to stay under free-tier rate limits)
     │      ├─ Gate A · MEANING   → IndicSBERT cross-lingual cosine ≥ 0.70
     │      └─ Gate B · TIMING    → espeak-ng phoneme count vs duration budget (±15%)
     │   Iterative CoT: refine misses up to 3 rounds, keep global best, report honestly
@@ -147,13 +148,28 @@ streamlit run app.py
 
 | Setting | Where | Default | Purpose |
 |---|---|---|---|
-| Translation model | `pipeline/isochrony_translation.py` | `gemini-3.1-flash-lite` | Falls back to 2.5/2.0/1.5-flash if unavailable. |
 | Semantic threshold | `SEMANTIC_THRESHOLD` | `0.70` | Meaning floor a candidate must clear. |
 | Phoneme tolerance | `PHONEME_TOLERANCE` | `0.15` | Allowed relative gap from the ideal length. |
 | Candidates/segment | `N_CANDIDATES` | `3` | Breadth of the per-round search. |
 | Refinement rounds | `MAX_ITERATIONS` | `3` | How hard the loop tries before reporting the best. |
 | Objective weights | `SEMANTIC_WEIGHT` / `PHONEME_WEIGHT` | `0.6` / `0.4` | Meaning-vs-timing trade-off. |
 | Embedder override | `DUBBING_SBERT_MODEL` (env) | `l3cube-pune/indic-sentence-similarity-sbert` | Swap the IndicSBERT model. |
+
+### 🚦 Rate-limit knobs (v2.5.1 — hybrid routing, throttle & cache)
+
+`gemini-3.1-flash-lite` has a tight free-tier limit (per-minute *and* per-day). To avoid 429s and cut API calls, the translation stage now **routes the bulk iteration-0 batch through the more lenient Gemma models** and reserves Gemini for the smaller refinement rounds, paces every model with a client-side throttle, honours the server's `retryDelay` on a 429, and **caches candidate pools to disk** so a re-run of the same video selects its final lines with *zero* API calls (selection is local and free).
+
+| Setting | Env var | Default | Purpose |
+|---|---|---|---|
+| Bulk (iteration-0) model | `DUBBING_GEMINI_BULK_MODEL` | `gemma-4-31b-it` → `gemma-4-26b-a4b-it` | High-volume first pass on the lenient Gemma limits. Falls through the Gemini ladder if Gemma is unavailable. |
+| Refine model | `DUBBING_GEMINI_REFINE_MODEL` / `DUBBING_GEMINI_MODEL` | `gemini-3.1-flash-lite` | Used only for refinement rounds on hard segments. Falls back to `gemini-3.5-flash-lite`. |
+| Requests-per-minute cap | `DUBBING_GEMINI_RPM` | `30` (Gemma) / `15` (Gemini) | Client-side throttle: min interval between calls = `60/RPM`. |
+| Requests-per-day cap | `DUBBING_GEMINI_RPD` | *(unset)* | Optional hard per-model daily cap; a capped model is skipped so the job degrades with a clear error instead of hammering 429s. |
+| Cache directory | `DUBBING_CACHE_DIR` | `./.dubbing_cache` | Where the candidate pool + daily-usage counter live. |
+| Candidate cache path | `DUBBING_TRANSLATION_CACHE` | `<cache_dir>/translations.json` | Full override for the candidate-pool file. |
+| Cache on/off | `use_cache` param | `True` | Pass `use_cache=False` to `translate_segments_isochrony` to bypass the disk cache for a run. |
+
+> **Gemma on the Gemini API doesn't support structured output (`response_schema`).** The stage detects a Gemma model and parses JSON from plain text instead (fence-strip + balanced-bracket match), so the hybrid routing is transparent to the caller. The candidate cache **accumulates across runs** — quality only improves, and repeated phrases within a single video are served from cache after the first generation.
 
 ---
 

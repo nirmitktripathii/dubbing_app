@@ -1,40 +1,54 @@
+# Indic AI Dubbing Platform — Python dependencies (v2.5.1)
+#
+# Versions are PINNED to the set this pipeline is currently tested against
+# (Python 3.12). The v2.5 translation core (real phonemes + IndicSBERT gate)
+# and the v2.5.1 rate-limit work (hybrid Gemma/Gemini routing, throttle, and
+# the on-disk translation cache) added NO new third-party packages beyond the
+# v2.5 line below — the cache and throttling use only the standard library.
+#
+# torch / torchaudio are intentionally NOT pinned here: they are pulled in
+# transitively (demucs / faster-whisper / sentence-transformers) and the right
+# build is platform-specific (CUDA vs CPU). On Kaggle they are preinstalled;
+# tested locally against torch 2.5.1+cu121.
+
 # ── Core framework ────────────────────────────────────────────────────────
-streamlit
+streamlit==1.57.0
 
 # ── Transcription ─────────────────────────────────────────────────────────
-faster-whisper          # Upgraded from openai-whisper (4-8x faster, INT8 quant)
-openai-whisper          # Fallback if faster-whisper is unavailable
+faster-whisper==1.2.1        # Upgraded from openai-whisper (4-8x faster, INT8 quant)
+openai-whisper==20250625     # Fallback if faster-whisper is unavailable
 
 # ── Translation ───────────────────────────────────────────────────────────
-google-genai            # Gemini API for isochrony-aware translation
+google-genai==2.10.0         # Gemini + Gemma API for isochrony-aware translation (v2.5.1 hybrid routing)
 
 # ── Isochrony scoring (real phonemes) & semantic gating ───────────────────
 # espeak-ng must ALSO be installed as a system package (apt: espeak-ng / winget).
-phonemizer              # espeak-ng G2P backend — real phoneme counts (phoneme_counter.py)
-indic-nlp-library       # Orthographic normalization before G2P (phoneme_counter.py)
-sentence-transformers   # IndicSBERT cross-lingual semantic gate (semantic_similarity.py)
+phonemizer==3.4.0            # espeak-ng G2P backend — real phoneme counts (phoneme_counter.py)
+indic-nlp-library==0.92      # Orthographic normalization before G2P (phoneme_counter.py)
+sentence-transformers==5.6.1 # IndicSBERT cross-lingual semantic gate (semantic_similarity.py)
 
 # ── Source separation ─────────────────────────────────────────────────────
-demucs                  # Vocal/background separation (htdemucs model)
+demucs==4.0.1                # Vocal/background separation (htdemucs model)
 
 # ── TTS (IndicF5) ─────────────────────────────────────────────────────────
 # IndicF5 is installed from source:
 #   pip install git+https://github.com/ai4bharat/IndicF5.git
 # The following are its dependencies:
-transformers>=4.30.0,<5.0.0   # Pin <5 to avoid "meta tensor" crash with IndicF5 (v5 defaults low_cpu_mem_usage=True)
-accelerate
-huggingface_hub
+transformers==4.57.6         # MUST stay <5.0.0 — v5 defaults low_cpu_mem_usage=True → IndicF5 "meta tensor" crash
+accelerate==1.14.0
+huggingface_hub==0.36.2
 
 # ── Audio processing ──────────────────────────────────────────────────────
-soundfile               # Fast audio I/O (replaces pydub for new pipeline)
-pydub                   # Kept for legacy compatibility
-numpy
-pyrubberband            # Safety-net drift correction (pitch-preserving stretch)
+soundfile==0.14.0            # Fast audio I/O (replaces pydub for new pipeline)
+pydub==0.25.1                # Kept for legacy compatibility
+numpy==1.26.4                # Pinned <2 — demucs/numba and torch 2.5 expect the NumPy 1.x ABI
+scipy==1.13.1                # Last scipy built for the numpy 1.x ABI — MUST pair with numpy 1.26.4
+                             # (unpinned pulls a numpy-2.x wheel -> scipy.special sph_legendre_p ABI crash)
+pyrubberband==0.4.0          # Safety-net drift correction (pitch-preserving stretch)
 
 # ── Video processing ──────────────────────────────────────────────────────
 # FFmpeg must be installed on system PATH separately.
 # Windows: winget install ffmpeg  OR  choco install ffmpeg
 
 # ── Optional (resampling quality) ────────────────────────────────────────
-resampy                 # High-quality resampling for voice_manager.py
-
+resampy==0.4.3               # High-quality resampling for voice_manager.py

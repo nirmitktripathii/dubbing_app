@@ -43,51 +43,76 @@ def generate_srt(segments: list, output_path: str):
             f.write(f"{text}\n\n")
 
 
-def transcribe_audio(audio_path: str, model_size: str = "large-v3"):
+def transcribe_audio(audio_path: str, model_size: str = "large-v3", log_fn=None):
     """
     Transcribes audio and returns timestamped segments.
 
     Attempts to use Faster-Whisper first (recommended). Falls back to the
-    original openai-whisper if not installed.
+    original openai-whisper if faster-whisper is unavailable or fails.
 
     Args:
         audio_path:  Path to input audio file (.wav, .mp3, etc.)
         model_size:  Whisper model size. Recommended: 'large-v3'.
                      For CPU-only / low VRAM: use 'base' or 'small'.
+        log_fn:      Optional callable(str) that receives progress messages, so
+                     the caller (e.g. the Streamlit UI) can surface them. When
+                     omitted, messages go to stdout. Backward-compatible: existing
+                     callers that pass only (audio_path, model_size) are unaffected.
 
     Returns:
         list: Dicts with 'start' (float), 'end' (float), 'text' (str).
+
+    Raises:
+        RuntimeError: if BOTH backends are unavailable/fail. The message names the
+            real faster-whisper failure and the fallback status — never a bare
+            ``ModuleNotFoundError: No module named 'whisper'`` that hides the cause.
     """
+    _log = log_fn if callable(log_fn) else print
+
     if not os.path.exists(audio_path):
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
     device = "cuda" if (_TORCH_AVAILABLE and torch.cuda.is_available()) else "cpu"
 
     # --- Attempt 1: Faster-Whisper (preferred) ---
+    fw_reason = None
     try:
-        return _transcribe_faster_whisper(audio_path, model_size, device)
-    except ImportError:
-        print(
-            "[Transcription] faster-whisper not installed. "
-            "Falling back to openai-whisper (slower).\n"
-            "  Install with: pip install faster-whisper"
+        return _transcribe_faster_whisper(audio_path, model_size, device, _log)
+    except ImportError as e:
+        fw_reason = f"not installed ({e})"
+        _log(
+            "[Transcription] faster-whisper is not installed — falling back to "
+            "openai-whisper (slower). Install with: pip install faster-whisper"
         )
     except Exception as e:
-        print(f"[Transcription] faster-whisper failed: {e}. Falling back to openai-whisper.")
+        fw_reason = f"{type(e).__name__}: {e}"
+        _log(
+            f"[Transcription] faster-whisper failed ({fw_reason}) — "
+            "falling back to openai-whisper."
+        )
 
     # --- Fallback: openai-whisper ---
-    return _transcribe_openai_whisper(audio_path, model_size, device)
+    try:
+        return _transcribe_openai_whisper(audio_path, model_size, device, _log)
+    except ImportError as e:
+        raise RuntimeError(
+            "Transcription failed — no usable Whisper backend.\n"
+            f"  • Primary  (faster-whisper): {fw_reason}\n"
+            f"  • Fallback (openai-whisper): not installed ({e})\n"
+            "Fix: get faster-whisper working (it is the intended fast path), or "
+            "`pip install openai-whisper` so the fallback can run."
+        ) from e
 
 
-def _transcribe_faster_whisper(audio_path: str, model_size: str, device: str) -> list:
+def _transcribe_faster_whisper(audio_path: str, model_size: str, device: str, log=print) -> list:
     """Transcribe using Faster-Whisper with INT8 quantization."""
     from faster_whisper import WhisperModel
 
     compute_type = "int8_float16" if device == "cuda" else "int8"
-    print(f"[Transcription] Loading Faster-Whisper ({model_size}) on {device} ({compute_type})...")
+    log(f"[Transcription] Loading Faster-Whisper ({model_size}) on {device} ({compute_type})...")
 
     model = WhisperModel(model_size, device=device, compute_type=compute_type)
-    print(f"[Transcription] Transcribing: {audio_path}")
+    log(f"[Transcription] Transcribing: {audio_path}")
 
     segments, info = model.transcribe(
         audio_path,
@@ -99,7 +124,7 @@ def _transcribe_faster_whisper(audio_path: str, model_size: str, device: str) ->
         ),
     )
 
-    print(f"[Transcription] Detected language: {info.language} (confidence: {info.language_probability:.2f})")
+    log(f"[Transcription] Detected language: {info.language} (confidence: {info.language_probability:.2f})")
 
     formatted = []
     for seg in segments:
@@ -116,17 +141,18 @@ def _transcribe_faster_whisper(audio_path: str, model_size: str, device: str) ->
     if _TORCH_AVAILABLE and torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    print(f"[Transcription] Done. {len(formatted)} segments extracted.")
+    log(f"[Transcription] Done. {len(formatted)} segments extracted.")
     return formatted
 
 
-def _transcribe_openai_whisper(audio_path: str, model_size: str, device: str) -> list:
+def _transcribe_openai_whisper(audio_path: str, model_size: str, device: str, log=print) -> list:
     """Fallback: Transcribe using original openai-whisper."""
     import whisper
 
-    # openai-whisper doesn't have large-v3 in older versions; map it
-    safe_size = model_size if model_size not in ("large-v3",) else "large"
-    print(f"[Transcription] Loading Whisper ({safe_size}) on {device}...")
+    # Map only if the requested size is not one this install actually ships.
+    available = set(getattr(whisper, "available_models", lambda: [])())
+    safe_size = model_size if (not available or model_size in available) else "large"
+    log(f"[Transcription] Loading Whisper ({safe_size}) on {device}...")
 
     model = whisper.load_model(safe_size, device=device)
     result = model.transcribe(audio_path, word_timestamps=False)
@@ -144,5 +170,5 @@ def _transcribe_openai_whisper(audio_path: str, model_size: str, device: str) ->
     if _TORCH_AVAILABLE and torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    print(f"[Transcription] Done. {len(formatted)} segments extracted.")
+    log(f"[Transcription] Done. {len(formatted)} segments extracted.")
     return formatted

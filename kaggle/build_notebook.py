@@ -113,12 +113,14 @@ CELL_PYTHON_DEPS_1 = r"""import subprocess, sys
 pkgs = [
     "soundfile",
     "pydub",
-    "scipy",
+    "scipy==1.13.1",         # last scipy built for the numpy 1.x ABI — MUST pair with numpy 1.26.4
+                             # (unpinned pulls a numpy-2.x wheel -> scipy.special sph_legendre_p ABI crash)
     "resampy",
-    "numpy",
+    "numpy==1.26.4",         # pin <2 — demucs/numba + torch 2.5 expect the NumPy 1.x ABI
     "huggingface_hub",
     "safetensors",
     "faster-whisper",
+    "openai-whisper",        # transcription fallback if faster-whisper fails at runtime
     "demucs",
     "phonemizer",
     "indic-nlp-library",     # orthographic normalization for the real phoneme counter
@@ -176,6 +178,73 @@ else:
 print("\nInstalling streamlit...")
 subprocess.run([sys.executable, "-m", "pip", "install", "-q", "streamlit"], check=True)
 print("  ✓ streamlit")
+
+# ── Re-assert transformers < 5.0.0 AFTER f5-tts/IndicF5 ───────────────────────
+# f5-tts / IndicF5 can resolve transformers to a 5.x release. On 5.x the IndicF5
+# DiT/vocoder load hits a meta-tensor error (the low_cpu_mem_usage default path
+# changed), crashing Step 6 (TTS). Force it back into the tested 4.x range LAST
+# so the model actually loads. This runs BEFORE the numpy re-assert on purpose —
+# a transformers (re)install can itself drag in numpy 2.x, so numpy stays last.
+print("\nRe-asserting transformers<5.0.0 (guards the IndicF5 meta-tensor crash)...")
+subprocess.run(
+    [sys.executable, "-m", "pip", "install", "-q", "transformers<5.0.0"],
+    check=True,
+)
+_tv = subprocess.run(
+    [sys.executable, "-c", "import transformers; print(transformers.__version__)"],
+    capture_output=True, text=True,
+)
+if _tv.returncode == 0:
+    _tvs = _tv.stdout.strip()
+    print(f"  ✓ transformers now {_tvs}")
+    if _tvs.split(".")[0].isdigit() and int(_tvs.split(".")[0]) >= 5:
+        print(f"  ⚠ transformers is {_tvs} (>=5) — IndicF5 will likely hit a "
+              "meta-tensor error at Step 6. Restart the kernel and Run All.")
+else:
+    print("  ⚠ could not verify transformers version:",
+          _tv.stderr.strip().splitlines()[-1] if _tv.stderr.strip() else "(no stderr)")
+
+# ── Re-assert numpy 1.x AFTER f5-tts/IndicF5/vocos ────────────────────────────
+# Those installs can silently drag in a wheel built against numpy 2.x, leaving
+# the env with a 2.x-built extension over a 1.26 runtime -> "numpy.dtype size
+# changed (Expected 96 ... got 88)" ABI errors when transformers/torch import
+# during the IndicF5 load. Force numpy back to the pinned 1.x last so the final
+# environment is coherent when the model actually loads at dubbing time.
+print("\nRe-asserting numpy==1.26.4 (guards against a 2.x ABI mismatch)...")
+subprocess.run(
+    [sys.executable, "-m", "pip", "install", "-q", "--force-reinstall",
+     "--no-deps", "numpy==1.26.4"],
+    check=True,
+)
+
+# Verify coherence the way it actually matters. The dubbing pipeline runs inside
+# the `streamlit run app.py` SUBPROCESS, which imports a FRESH numpy/scipy from
+# disk — so what counts is on-disk coherence, NOT this kernel's already-loaded
+# numpy. importlib.reload() cannot hot-swap a loaded C-extension, so it only ever
+# printed a misleading "green". Instead we probe in a throwaway subprocess that
+# mirrors the app: import numpy + scipy.special (where the sph_legendre_p ufunc
+# lives) and exercise a compiled scipy path. If scipy was built against numpy 2.x
+# over a 1.26 runtime, this fails LOUDLY here instead of mid-dub.
+_probe = (
+    "import numpy, scipy, scipy.special\n"
+    "from scipy.spatial.distance import cosine\n"
+    "cosine([1.0, 0.0], [0.0, 1.0])\n"
+    "print(numpy.__version__ + '|' + scipy.__version__)\n"
+)
+_r = subprocess.run([sys.executable, "-c", _probe], capture_output=True, text=True)
+if _r.returncode == 0:
+    _nv, _sv = _r.stdout.strip().split("|")
+    print(f"  ✓ Fresh-process import OK — numpy {_nv}, scipy {_sv} (ABI coherent)")
+    if not _nv.startswith("1.26"):
+        print(f"  ⚠ numpy resolved to {_nv}, not 1.26.x — the app subprocess may "
+              "hit an ABI error. Restart the kernel and Run All before launching.")
+else:
+    _last = _r.stderr.strip().splitlines()[-1] if _r.stderr.strip() else "(no stderr)"
+    print("  ✗ Fresh-process numpy/scipy import FAILED — this is the ABI mismatch "
+          "that would crash the dubbing run:")
+    print("   ", _last)
+    print("    Fix: ensure scipy==1.13.1 (the numpy-1.x ABI pair) installed above, "
+          "then Restart Kernel and Run All.")
 
 print("\n✅ AI/TTS packages installed!")
 """
@@ -237,6 +306,7 @@ def _make_write_cell():
         (os.path.join(base, "pipeline", "semantic_similarity.py"), "/kaggle/working/pipeline/semantic_similarity.py"),
         (os.path.join(base, "pipeline", "source_separation.py"),"/kaggle/working/pipeline/source_separation.py"),
         (os.path.join(base, "pipeline", "voice_manager.py"),    "/kaggle/working/pipeline/voice_manager.py"),
+        (os.path.join(base, "pipeline", "translation_cache.py"), "/kaggle/working/pipeline/translation_cache.py"),
         (os.path.join(base, "pipeline", "isochrony_translation.py"), "/kaggle/working/pipeline/isochrony_translation.py"),
         (os.path.join(base, "utils", "audio_extraction.py"),    "/kaggle/working/utils/audio_extraction.py"),
         (os.path.join(base, "utils", "transcription.py"),       "/kaggle/working/utils/transcription.py"),
@@ -671,7 +741,27 @@ if not HF_TOKEN:
     print("⚠ WARNING: HF_TOKEN is not set. Model download will fail.")
 
 env = os.environ.copy()
-env.update({"GEMINI_API_KEY": GEMINI_KEY, "HF_TOKEN": HF_TOKEN, "PYTHONIOENCODING": "utf-8"})
+# UTF-8 everywhere in the app subprocess. Kaggle spawns this notebook kernel
+# under a C/ASCII locale, so WITHOUT this any implicit str->bytes encode inside
+# the pipeline (a library doing s.encode() that falls back to
+# locale.getpreferredencoding(), a text-mode open(), httpx) defaults to ASCII and
+# dies on the first non-ASCII char. The Indic pipeline is saturated with
+# non-ASCII (Devanagari/Tamil output, plus — → Δ ✓ in prompts and logs), so this
+# surfaces as e.g. "'ascii' codec can't encode character '✓'" and every
+# translation call fails in 0.00s.
+#   • PYTHONIOENCODING only fixes stdout/stderr/stdin.
+#   • PYTHONUTF8=1 forces CPython UTF-8 Mode: it ALSO flips the default open()
+#     encoding AND locale.getpreferredencoding() to UTF-8 — this is the switch
+#     that actually stops the crash.
+#   • LANG/LC_ALL back it up for any C-extension that reads the locale directly.
+env.update({
+    "GEMINI_API_KEY": GEMINI_KEY,
+    "HF_TOKEN": HF_TOKEN,
+    "PYTHONIOENCODING": "utf-8",
+    "PYTHONUTF8": "1",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+})
 
 # ── Launch Streamlit ──────────────────────────────────────────────────────────
 print("🚀 Starting Streamlit app...")
@@ -828,6 +918,7 @@ def _generate_large_files_module():
         (os.path.join(base, "pipeline", "semantic_similarity.py"),   f"{WORK_DIR}/pipeline/semantic_similarity.py"),
         (os.path.join(base, "pipeline", "source_separation.py"),     f"{WORK_DIR}/pipeline/source_separation.py"),
         (os.path.join(base, "pipeline", "voice_manager.py"),         f"{WORK_DIR}/pipeline/voice_manager.py"),
+        (os.path.join(base, "pipeline", "translation_cache.py"),     f"{WORK_DIR}/pipeline/translation_cache.py"),
         (os.path.join(base, "pipeline", "isochrony_translation.py"), f"{WORK_DIR}/pipeline/isochrony_translation.py"),
         (os.path.join(base, "utils", "transcription.py"),            f"{WORK_DIR}/utils/transcription.py"),
         (os.path.join(base, "utils", "audio_sync.py"),               f"{WORK_DIR}/utils/audio_sync.py"),
