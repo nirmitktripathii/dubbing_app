@@ -117,24 +117,24 @@ def _resolve_language(language: str) -> str:
 # themselves are always real espeak phonemes regardless.
 # ---------------------------------------------------------------------------------------
 
-# English reference phoneme rate (phonemes/sec). Mid-range of the Indic table; used only as
-# the denominator that turns per-second rates into a phoneme-count ratio.
-ENGLISH_PHONEMES_PER_SEC = 13.0
+# English reference phoneme rate (phonemes/sec). Calibrated to natural narration pace.
+ENGLISH_PHONEMES_PER_SEC = 10.2
 
-# Natural phoneme rate per language (phonemes/sec), from pipeline_v3/common/languages.py.
+# Natural conversational/narration phoneme rate per language (phonemes/sec).
+# Calibrated for natural cadence in IndicF5 synthesis (prevents rushed syllables / word drops).
 PHONEMES_PER_SEC = {
     "english":   ENGLISH_PHONEMES_PER_SEC,
-    "hindi":     13.5,
-    "bengali":   13.0,
-    "marathi":   13.2,
-    "gujarati":  13.0,
-    "punjabi":   12.8,
-    "tamil":     12.5,
-    "telugu":    12.6,
-    "kannada":   12.7,
-    "malayalam": 12.3,
-    "odia":      13.0,
-    "assamese":  12.9,
+    "hindi":     10.5,
+    "bengali":   10.1,
+    "marathi":   10.3,
+    "gujarati":  10.1,
+    "punjabi":   10.0,
+    "tamil":      9.7,
+    "telugu":     9.8,
+    "kannada":    9.9,
+    "malayalam":  9.6,
+    "odia":      10.1,
+    "assamese":  10.0,
 }
 
 # Derived phoneme-domain expansion ratios = pps_target / pps_english (see rationale above).
