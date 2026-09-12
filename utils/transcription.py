@@ -104,8 +104,88 @@ def transcribe_audio(audio_path: str, model_size: str = "large-v3", log_fn=None)
         ) from e
 
 
+import re
+
+ABBREVIATIONS = {
+    "mr.", "mrs.", "ms.", "dr.", "prof.", "sr.", "jr.", "vs.", "etc.",
+    "i.e.", "e.g.", "u.s.", "u.k.", "a.m.", "p.m.", "no."
+}
+
+def _is_sentence_terminal(word: str) -> bool:
+    w = word.strip().lower()
+    if w in ABBREVIATIONS:
+        return False
+    clean = re.sub(r'["\'\)\]\}]+$', '', w)
+    return clean.endswith(('.', '!', '?'))
+
+def _is_clause_boundary(word: str) -> bool:
+    w = word.strip().lower()
+    clean = re.sub(r'["\'\)\]\}]+$', '', w)
+    return clean.endswith((',', ';', ':', '—', '-'))
+
+def resegment_into_sentences(
+    words: list,
+    min_duration: float = 2.0,
+    max_duration: float = 12.0,
+    max_pause_sec: float = 0.6,
+) -> list:
+    """
+    Group word-level tokens into syntactically complete sentences/clauses.
+
+    Prevents VAD silence splits from severing verbs, postpositions, and clauses in the middle.
+    """
+    if not words:
+        return []
+
+    segments = []
+    current_words = []
+
+    def commit_segment():
+        nonlocal current_words
+        if not current_words:
+            return
+        text = "".join(w["word"] for w in current_words).strip()
+        text = re.sub(r'\s+', ' ', text)
+        if text:
+            start_t = round(current_words[0]["start"], 3)
+            end_t = round(current_words[-1]["end"], 3)
+            segments.append({
+                "start": start_t,
+                "end": end_t,
+                "text": text,
+                "duration": round(end_t - start_t, 3),
+            })
+        current_words = []
+
+    for i, w in enumerate(words):
+        current_words.append(w)
+        dur = w["end"] - current_words[0]["start"]
+        word_text = w["word"].strip()
+
+        next_w = words[i + 1] if i + 1 < len(words) else None
+        pause = (next_w["start"] - w["end"]) if next_w else 0.0
+
+        is_term = _is_sentence_terminal(word_text)
+        is_clause = _is_clause_boundary(word_text)
+
+        # 1: Terminal punctuation (. ? !) and duration >= min_duration
+        if is_term and dur >= min_duration:
+            commit_segment()
+        # 2: Exceeding max_duration -> split at clause boundary or substantial pause
+        elif dur >= max_duration:
+            commit_segment()
+        elif dur >= (max_duration * 0.75) and (is_clause or pause >= max_pause_sec):
+            commit_segment()
+        # 3: Very large silence gap between words (>= 1.2s)
+        elif pause >= 1.2 and dur >= min_duration:
+            commit_segment()
+
+    commit_segment()
+    return segments
+
+
 def _transcribe_faster_whisper(audio_path: str, model_size: str, device: str, log=print) -> list:
-    """Transcribe using Faster-Whisper with INT8 quantization."""
+    """Transcribe using Faster-Whisper with INT8 quantization and sentence-level resegmentation."""
     from faster_whisper import WhisperModel
 
     compute_type = "int8_float16" if device == "cuda" else "int8"
@@ -122,19 +202,34 @@ def _transcribe_faster_whisper(audio_path: str, model_size: str, device: str, lo
         vad_parameters=dict(
             min_silence_duration_ms=300,
         ),
+        word_timestamps=True,
     )
 
     log(f"[Transcription] Detected language: {info.language} (confidence: {info.language_probability:.2f})")
 
-    formatted = []
+    all_words = []
+    raw_formatted = []
     for seg in segments:
         if seg.text.strip():
-            formatted.append({
+            raw_formatted.append({
                 "start": seg.start,
                 "end": seg.end,
                 "text": seg.text.strip(),
                 "duration": round(seg.end - seg.start, 3),
             })
+            for w in getattr(seg, "words", []) or []:
+                all_words.append({
+                    "start": w.start,
+                    "end": w.end,
+                    "word": w.word,
+                })
+
+    # Resegment into complete sentences if word timestamps are available
+    if all_words:
+        formatted = resegment_into_sentences(all_words)
+        log(f"[Transcription] Resegmented {len(raw_formatted)} raw pause chunks into {len(formatted)} complete sentences.")
+    else:
+        formatted = raw_formatted
 
     # Explicit cleanup
     del model
@@ -146,7 +241,7 @@ def _transcribe_faster_whisper(audio_path: str, model_size: str, device: str, lo
 
 
 def _transcribe_openai_whisper(audio_path: str, model_size: str, device: str, log=print) -> list:
-    """Fallback: Transcribe using original openai-whisper."""
+    """Fallback: Transcribe using original openai-whisper with sentence-level resegmentation."""
     import whisper
 
     # Map only if the requested size is not one this install actually ships.
@@ -155,16 +250,30 @@ def _transcribe_openai_whisper(audio_path: str, model_size: str, device: str, lo
     log(f"[Transcription] Loading Whisper ({safe_size}) on {device}...")
 
     model = whisper.load_model(safe_size, device=device)
-    result = model.transcribe(audio_path, word_timestamps=False)
+    result = model.transcribe(audio_path, word_timestamps=True)
 
-    formatted = []
+    all_words = []
+    raw_formatted = []
     for seg in result.get("segments", []):
-        formatted.append({
-            "start": seg["start"],
-            "end": seg["end"],
-            "text": seg["text"].strip(),
-            "duration": round(seg["end"] - seg["start"], 3),
-        })
+        if seg.get("text", "").strip():
+            raw_formatted.append({
+                "start": seg["start"],
+                "end": seg["end"],
+                "text": seg["text"].strip(),
+                "duration": round(seg["end"] - seg["start"], 3),
+            })
+            for w in seg.get("words", []):
+                all_words.append({
+                    "start": w["start"],
+                    "end": w["end"],
+                    "word": w["word"],
+                })
+
+    if all_words:
+        formatted = resegment_into_sentences(all_words)
+        log(f"[Transcription] Resegmented {len(raw_formatted)} raw pause chunks into {len(formatted)} complete sentences.")
+    else:
+        formatted = raw_formatted
 
     del model
     if _TORCH_AVAILABLE and torch.cuda.is_available():
@@ -172,3 +281,4 @@ def _transcribe_openai_whisper(audio_path: str, model_size: str, device: str, lo
 
     log(f"[Transcription] Done. {len(formatted)} segments extracted.")
     return formatted
+
