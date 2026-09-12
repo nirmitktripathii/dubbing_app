@@ -293,68 +293,168 @@ def _read(path):
     with open(path, encoding="utf-8") as f:
         return f.read()
 
-def _make_write_cell():
-    """Build Python code that writes all pipeline files to /kaggle/working/"""
+# The single monolithic file-write cell was split into one labeled cell per role
+# (Step 6a–6h). Every file cell shares this small logging helper so each write is
+# reported with its path + size — a short/failed write is then obvious in the log
+# instead of surfacing as a mysterious ImportError mid-dub.
 
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    base = os.path.dirname(script_dir)  # E:/Dubbing app
+def _make_write_helper():
+    """Return the shared `_write_file(path, content)` helper injected at the top of
+    every file-writing cell. It logs each write (path + KB) so nothing fails silently."""
+    return (
+        "import os\n"
+        "\n"
+        "def _write_file(path, content):\n"
+        "    os.makedirs(os.path.dirname(path), exist_ok=True)\n"
+        "    with open(path, 'w', encoding='utf-8') as _f:\n"
+        "        _f.write(content)\n"
+        "    _kb = len(content.encode('utf-8')) / 1024\n"
+        "    print(f'  ✓ {path}  ({_kb:.1f} KB)')\n"
+    )
 
-    # Files to embed: (source_path, dest_path_on_kaggle)
-    file_map = [
-        (os.path.join(base, "app.py"),                          "/kaggle/working/app.py"),
-        (os.path.join(base, "pipeline", "phoneme_counter.py"), "/kaggle/working/pipeline/phoneme_counter.py"),
-        (os.path.join(base, "pipeline", "semantic_similarity.py"), "/kaggle/working/pipeline/semantic_similarity.py"),
-        (os.path.join(base, "pipeline", "source_separation.py"),"/kaggle/working/pipeline/source_separation.py"),
-        (os.path.join(base, "pipeline", "voice_manager.py"),    "/kaggle/working/pipeline/voice_manager.py"),
-        (os.path.join(base, "pipeline", "translation_cache.py"), "/kaggle/working/pipeline/translation_cache.py"),
-        (os.path.join(base, "pipeline", "isochrony_translation.py"), "/kaggle/working/pipeline/isochrony_translation.py"),
-        (os.path.join(base, "utils", "audio_extraction.py"),    "/kaggle/working/utils/audio_extraction.py"),
-        (os.path.join(base, "utils", "transcription.py"),       "/kaggle/working/utils/transcription.py"),
-        (os.path.join(base, "utils", "audio_sync.py"),          "/kaggle/working/utils/audio_sync.py"),
-    ]
 
-    lines = [
-        "import os",
-        "",
-        "# Create directory structure",
-        "for d in ['/kaggle/working/pipeline', '/kaggle/working/utils', '/kaggle/working/temp_processing']:",
-        "    os.makedirs(d, exist_ok=True)",
-        "",
-        "# Write empty __init__.py files",
-        "for init in ['/kaggle/working/pipeline/__init__.py', '/kaggle/working/utils/__init__.py']:",
-        "    open(init, 'w').close()",
-        "",
-    ]
+# Files copied verbatim from the local tree (no Kaggle adaptation needed).
+_PIPELINE_FILES = [
+    "phoneme_counter.py",
+    "semantic_similarity.py",
+    "source_separation.py",
+    "voice_manager.py",
+    "translation_cache.py",
+    "isochrony_translation.py",
+    # Step-6 process-isolation freeze fix. Cross-platform (they branch on os.name
+    # internally), so no Kaggle glob-path adaptation is needed like duration_tts.py.
+    "tts_worker.py",
+    "tts_supervisor.py",
+]
+_UTILS_FILES = [
+    "audio_extraction.py",
+    "transcription.py",
+    "audio_sync.py",
+]
 
-    for src_path, dst_path in file_map:
+
+def _make_mkdirs_cell():
+    """Step 6a — create the /kaggle/working package structure + __init__.py files."""
+    return (
+        "import os\n"
+        "\n"
+        "print('Step 6a — Creating /kaggle/working package structure...')\n"
+        "for d in ['/kaggle/working/pipeline', '/kaggle/working/utils', '/kaggle/working/temp_processing']:\n"
+        "    os.makedirs(d, exist_ok=True)\n"
+        "    print(f'  ✓ {d}/')\n"
+        "\n"
+        "for _init in ['/kaggle/working/pipeline/__init__.py', '/kaggle/working/utils/__init__.py']:\n"
+        "    open(_init, 'w').close()\n"
+        "    print(f'  ✓ {_init}')\n"
+        "\n"
+        "print('Step 6a complete — package dirs ready.')\n"
+    )
+
+
+def _make_app_cell(base):
+    """Step 6b — write the Streamlit UI (app.py)."""
+    content = _read(os.path.join(base, "app.py"))
+    return (
+        _make_write_helper()
+        + "\nprint('Step 6b — Writing the Streamlit app (app.py)...')\n"
+        + f"_write_file('/kaggle/working/app.py', {repr(content)})\n"
+        + "print('Step 6b complete — app.py written.')\n"
+    )
+
+
+def _make_headless_runner_cell(base):
+    """Batch mode — write run_headless.py (the no-UI batch driver) to /kaggle/working."""
+    content = _read(os.path.join(base, "run_headless.py"))
+    return (
+        _make_write_helper()
+        + "\nprint('Writing headless batch driver (run_headless.py)...')\n"
+        + f"_write_file('/kaggle/working/run_headless.py', {repr(content)})\n"
+        + "print('run_headless.py written.')\n"
+    )
+
+
+def _make_pipeline_cell(base):
+    """Step 6c — write the unmodified pipeline modules."""
+    lines = [_make_write_helper(),
+             "print('Step 6c — Writing pipeline modules...')"]
+    written = 0
+    for name in _PIPELINE_FILES:
+        src_path = os.path.join(base, "pipeline", name)
         if not os.path.exists(src_path):
             print(f"WARNING: {src_path} not found — skipping")
             continue
         content = _read(src_path)
-        # Use repr() to get a valid Python string literal with all escaping done
-        repr_content = repr(content)
-        lines.append(f"# ── {os.path.basename(dst_path)} ──")
-        lines.append(f"with open({repr(dst_path)}, 'w', encoding='utf-8') as _f:")
-        lines.append(f"    _f.write({repr_content})")
-        lines.append("")
-
-    # Kaggle-adapted files (written inline, not from Windows source)
-    lines.append(_make_kaggle_video_merge())
-    lines.append(_make_kaggle_duration_tts())
-    lines.append(_make_kaggle_model_patch())
-
-    lines.append("")
-    lines.append("print('✅ All pipeline files written to /kaggle/working/')")
-    lines.append("import subprocess")
-    lines.append("r = subprocess.run(['python', '-c', 'import pipeline.phoneme_counter; print(\"Import OK\")'],")
-    lines.append("                    capture_output=True, text=True, cwd='/kaggle/working')")
-    lines.append("print('Import test:', r.stdout.strip() or r.stderr.strip())")
-
+        lines.append(f"_write_file('/kaggle/working/pipeline/{name}', {repr(content)})")
+        written += 1
+    lines.append(f"print('Step 6c complete — {written} pipeline modules written.')")
     return "\n".join(lines)
 
 
-def _make_kaggle_video_merge():
-    """Return Python code string that writes the Linux-adapted video_merge.py"""
+def _make_utils_cell(base):
+    """Step 6d — write the unmodified utils modules."""
+    lines = [_make_write_helper(),
+             "print('Step 6d — Writing utils modules...')"]
+    written = 0
+    for name in _UTILS_FILES:
+        src_path = os.path.join(base, "utils", name)
+        if not os.path.exists(src_path):
+            print(f"WARNING: {src_path} not found — skipping")
+            continue
+        content = _read(src_path)
+        lines.append(f"_write_file('/kaggle/working/utils/{name}', {repr(content)})")
+        written += 1
+    lines.append(f"print('Step 6d complete — {written} utils modules written.')")
+    return "\n".join(lines)
+
+
+def _make_video_merge_cell():
+    """Step 6e — write the Linux-adapted utils/video_merge.py, then sanity-check it."""
+    content = _kaggle_video_merge_content()
+    return (
+        _make_write_helper()
+        + "\nprint('Step 6e — Writing utils/video_merge.py (Linux-adapted)...')\n"
+        + f"_write_file('/kaggle/working/utils/video_merge.py', {repr(content)})\n"
+        + "_src = open('/kaggle/working/utils/video_merge.py', encoding='utf-8').read()\n"
+        + "assert 'def merge_video_audio_subs' in _src and 'log_fn' in _src, \\\n"
+        + "    'video_merge.py is missing merge_video_audio_subs(log_fn=...)'\n"
+        + "print('  sanity ✓ merge_video_audio_subs(log_fn=...) present')\n"
+        + "print('Step 6e complete.')\n"
+    )
+
+
+def _make_duration_tts_cell(base):
+    """Step 6f — write the Kaggle-adapted pipeline/duration_tts.py, then sanity-check it."""
+    content = _kaggle_duration_tts_content(base)
+    return (
+        _make_write_helper()
+        + "\nprint('Step 6f — Writing pipeline/duration_tts.py (Kaggle-adapted)...')\n"
+        + f"_write_file('/kaggle/working/pipeline/duration_tts.py', {repr(content)})\n"
+        + "_src = open('/kaggle/working/pipeline/duration_tts.py', encoding='utf-8').read()\n"
+        + "assert 'transformers_modules/ai4bharat/IndicF5' in _src \\\n"
+        + "    and '_cache_dir = os.path.expandvars(' not in _src, \\\n"
+        + "    'duration_tts.py HF cache path was not adapted to the Linux glob'\n"
+        + "print('  sanity ✓ HF cache path uses the Linux glob (no Windows expandvars)')\n"
+        + "print('Step 6f complete.')\n"
+    )
+
+
+def _make_model_patch_cell():
+    """Step 6g — write pipeline/indicf5_model_patched.py, then sanity-check it."""
+    content = _kaggle_model_patch_content()
+    return (
+        _make_write_helper()
+        + "\nprint('Step 6g — Writing pipeline/indicf5_model_patched.py (Kaggle model.py)...')\n"
+        + f"_write_file('/kaggle/working/pipeline/indicf5_model_patched.py', {repr(content)})\n"
+        + "_src = open('/kaggle/working/pipeline/indicf5_model_patched.py', encoding='utf-8').read()\n"
+        + "assert 'class INF5Model' in _src and 'load_vocoder' in _src, \\\n"
+        + "    'model patch is missing INF5Model / load_vocoder'\n"
+        + "print('  sanity ✓ INF5Model + CPU-first vocoder load present')\n"
+        + "print('Step 6g complete — applied to the HF cache in Step 7.')\n"
+    )
+
+
+def _kaggle_video_merge_content():
+    """Return the raw source of the Linux-adapted utils/video_merge.py."""
     content = r'''import os
 import subprocess
 
@@ -392,18 +492,17 @@ def merge_video_audio_subs(video_path: str, audio_path: str, srt_path: str, outp
         raise RuntimeError(f"FFmpeg failed:\n{e.stderr}")
     return output_path
 '''
-    return (
-        "# ── utils/video_merge.py (Linux-adapted) ──\n"
-        f"with open('/kaggle/working/utils/video_merge.py', 'w', encoding='utf-8') as _f:\n"
-        f"    _f.write({repr(content)})\n"
-    )
+    return content
 
 
-def _make_kaggle_duration_tts():
-    """Return Python code that writes the Kaggle-adapted duration_tts.py"""
+def _kaggle_duration_tts_content(base):
+    """Return the raw source of the Kaggle-adapted pipeline/duration_tts.py.
+
+    The local source may already be Linux-adapted (the on-disk file uses the glob
+    cache path), so this validates the RESULT positively rather than assuming a
+    Windows source to rewrite — it works whether or not the marker block is present."""
     # Read the original
-    orig_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                              "pipeline", "duration_tts.py")
+    orig_path = os.path.join(base, "pipeline", "duration_tts.py")
     with open(orig_path, encoding="utf-8") as f:
         orig = f.read()
 
@@ -462,22 +561,23 @@ def _make_kaggle_duration_tts():
         # Find the 8-space indent block start
         line_start = adapted.rfind('\n', 0, idx_start) + 1
         adapted = adapted[:line_start] + LINUX_BLOCK + adapted[idx_end:]
-    else:
-        # Fallback: append a note
-        adapted += "\n# NOTE: Run on Kaggle — uses glob-based cache path\n"
+    # If the marker block was absent, the source is already Linux-adapted — leave it.
 
-    # Remove Windows SSL bypass (not needed on Kaggle, causes import issues)
-    # Keep it in (it's harmless on Linux and prevents SSL errors)
-
-    return (
-        "# ── pipeline/duration_tts.py (Kaggle-adapted) ──\n"
-        f"with open('/kaggle/working/pipeline/duration_tts.py', 'w', encoding='utf-8') as _f:\n"
-        f"    _f.write({repr(adapted)})\n"
+    # Validate the RESULT is Linux-correct regardless of which branch ran above.
+    # (Discriminate on the Windows-only expandvars call, NOT on the string
+    # "%USERPROFILE%" — that also appears in an explanatory comment on Linux.)
+    assert "transformers_modules/ai4bharat/IndicF5" in adapted, (
+        "duration_tts.py adaptation failed: Linux glob cache path missing"
+    )
+    assert "_cache_dir = os.path.expandvars(" not in adapted, (
+        "duration_tts.py adaptation failed: Windows expandvars cache block still present"
     )
 
+    return adapted
 
-def _make_kaggle_model_patch():
-    """Return Python code that writes the patched model.py (no Windows paths)"""
+
+def _kaggle_model_patch_content():
+    """Return the raw source of the Kaggle model.py (pipeline/indicf5_model_patched.py)."""
     content = r'''import sys
 import os
 from datetime import datetime
@@ -658,11 +758,56 @@ class INF5Model(PreTrainedModel):
         audio_seg = audio_seg.apply_gain(target_dBFS - audio_seg.dBFS)
         return np.array(audio_seg.get_array_of_samples())
 '''
-    return (
-        "# ── pipeline/indicf5_model_patched.py (Kaggle-compatible model.py) ──\n"
-        f"with open('/kaggle/working/pipeline/indicf5_model_patched.py', 'w', encoding='utf-8') as _f:\n"
-        f"    _f.write({repr(content)})\n"
-    )
+    return content
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+CELL_VERIFY_IMPORTS = r"""import subprocess, sys
+
+print('Step 6h — Verifying every written module imports cleanly...')
+print('(runs in a throwaway subprocess so a bad file cannot corrupt this kernel)')
+
+# Import in a child process with cwd=/kaggle/working so the package layout resolves.
+# EXCLUDES app.py (Streamlit entry point) and indicf5_model_patched.py (applied to
+# the HF cache in Step 7, not imported here). The listed modules all load lazily —
+# importing them triggers NO model downloads.
+_probe = r'''
+import importlib, sys
+mods = [
+    "pipeline.phoneme_counter",
+    "pipeline.semantic_similarity",
+    "pipeline.source_separation",
+    "pipeline.voice_manager",
+    "pipeline.translation_cache",
+    "pipeline.isochrony_translation",
+    "pipeline.duration_tts",
+    "pipeline.tts_worker",
+    "pipeline.tts_supervisor",
+    "utils.audio_extraction",
+    "utils.transcription",
+    "utils.audio_sync",
+    "utils.video_merge",
+]
+ok = 0
+for m in mods:
+    try:
+        importlib.import_module(m)
+        print("  ✓ " + m)
+        ok += 1
+    except Exception as e:
+        print("  ✗ " + m + ": " + type(e).__name__ + ": " + str(e))
+sys.exit(0 if ok == len(mods) else 1)
+'''
+
+r = subprocess.run([sys.executable, "-c", _probe], cwd="/kaggle/working",
+                   capture_output=True, text=True)
+print(r.stdout, end="")
+if r.stderr.strip():
+    print(r.stderr[-2000:])
+if r.returncode != 0:
+    raise RuntimeError("Step 6h FAILED — a module did not import. Fix it before launching (Step 9) so you don't burn GPU quota on a broken build.")
+print("Step 6h complete — all 11 modules import cleanly.")
+"""
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -683,13 +828,28 @@ try:
 except Exception as e:
     print(f"  ⚠ snapshot_download issue: {e}")
 
-# Trigger transformers_modules caching (creates the model.py in HF cache)
+# Trigger transformers_modules caching (creates the model.py in HF cache).
+# Run in a FRESH SUBPROCESS: importing IndicF5's remote code pulls in numpy-backed
+# libs, and THIS kernel still holds Kaggle's preloaded numpy 2.x (kaggle-environments
+# needs >=2) while Step 4 pinned numpy 1.26.4 ON DISK — so an in-kernel AutoConfig hits
+# "numpy.dtype size changed (Expected 96 ... got 88)". A subprocess imports the on-disk
+# numpy 1.26.4 cleanly and caches model.py reliably (Step 3 below then overwrites it with
+# the patched version anyway, so we only need the file to exist).
 print("\nStep 2: Caching transformers_modules (model.py + config.py)...")
-try:
-    AutoConfig.from_pretrained("ai4bharat/IndicF5", trust_remote_code=True, token=hf_token)
-    print("  ✓ transformers_modules cached")
-except Exception as e:
-    print(f"  ⚠ Config cache: {e}")
+_cache_code = (
+    "import os\n"
+    "from transformers import AutoConfig\n"
+    "AutoConfig.from_pretrained('ai4bharat/IndicF5', trust_remote_code=True,\n"
+    "                           token=os.environ.get('HF_TOKEN'))\n"
+    "print('cached-ok')\n"
+)
+_r = subprocess.run([sys.executable, "-c", _cache_code],
+                    capture_output=True, text=True, env=os.environ)
+if _r.returncode == 0:
+    print("  ✓ transformers_modules cached (fresh subprocess, coherent numpy)")
+else:
+    _tail = _r.stderr.strip().splitlines()[-1] if _r.stderr.strip() else "(no stderr)"
+    print(f"  ⚠ Config cache subprocess failed: {_tail}")
 
 # Find cached model.py
 patterns = glob.glob(os.path.expanduser(
@@ -740,6 +900,26 @@ else:
 # ──────────────────────────────────────────────────────────────────────────────
 CELL_LAUNCH = r"""import subprocess, time, re, os, threading
 
+# ═════════════════════════════════════════════════════════════════════════════
+# ⚙️  SPEED vs QUALITY — Step 6 (TTS) diffusion steps
+# ─────────────────────────────────────────────────────────────────────────────
+#   32  →  quality baseline (default, slower)
+#   16  →  ~2x faster synthesis, slight quality cost
+#
+# Set the value you want, then run this cell to launch the app.
+# Only 32 or 16 are supported; any other value falls back to 32.
+NFE_STEP = 32          # ← change to 16 for the fast run
+# ═════════════════════════════════════════════════════════════════════════════
+
+if NFE_STEP not in (16, 32):
+    print(f"⚠ NFE_STEP={NFE_STEP!r} is not a supported option (32 or 16). Falling back to 32.")
+    NFE_STEP = 32
+print(
+    f"⚙  Step 6 diffusion steps: NFE_STEP={NFE_STEP}"
+    + (" — FAST mode (~2x quicker, slight quality cost)" if NFE_STEP == 16
+       else " — quality baseline")
+)
+
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 HF_TOKEN   = os.environ.get("HF_TOKEN", "")
 
@@ -769,6 +949,8 @@ env.update({
     "PYTHONUTF8": "1",
     "LANG": "C.UTF-8",
     "LC_ALL": "C.UTF-8",
+    # Step 6 diffusion-step count, read by pipeline/duration_tts.py. Chosen above.
+    "DUBBING_NFE_STEP": str(NFE_STEP),
 })
 
 # ── Launch Streamlit ──────────────────────────────────────────────────────────
@@ -849,23 +1031,258 @@ except KeyboardInterrupt:
 # Assemble and write notebook
 # ══════════════════════════════════════════════════════════════════════════════
 
-def main():
-    print("Building Kaggle notebook...")
+# ── Batch (headless) mode cells — replace the Streamlit+tunnel launch (Steps 8-9) ──
+CELL_HEADLESS_CONFIG = r"""import os
 
-    file_write_source = _make_write_cell()
+# ── Batch-run configuration ────────────────────────────────────────────────────
+# Edit to control the run. Leave DUBBING_INPUT_VIDEO empty to auto-detect the first
+# video under /kaggle/input (attach your source video as a Kaggle Dataset).
+os.environ.setdefault("DUBBING_TARGET_LANG", "Hindi")
+os.environ.setdefault("DUBBING_WHISPER_MODEL", "medium")
+os.environ.setdefault("DUBBING_USE_DEMUCS", "1")
+os.environ.setdefault("DUBBING_BG_VOLUME", "0.3")
+os.environ.setdefault("DUBBING_OUTPUT_DIR", "/kaggle/working/dubbing_output")
+# os.environ["DUBBING_INPUT_VIDEO"] = "/kaggle/input/<your-dataset>/<video>.mp4"
+
+# ── RUN SELECTOR — pick ONE. This is the ONLY line you change between runs. ──────
+# The residual "~1-2s garbled audio at the start of every segment" is IndicF5 onset
+# instability from CROSS-LINGUAL cloning (English reference -> Hindi target). Modes:
+#   "premium" — clone the English speaker (original behaviour; THIS is what babbles).
+#   "basic"   — RUN 1 control: native HINDI reference, English voice NOT cloned. If the
+#               babble vanishes, the cross-lingual cause is proven. (Generic Hindi voice.)
+#   "primer"  — RUN 2 fix: clone the English speaker BUT prepend a throwaway Hindi primer
+#               that absorbs the onset babble, then slice it off. Keeps the speaker's voice.
+RUN = "basic"     # <── change to "basic" / "primer" / "premium"
+
+# Explicit assignment (NOT setdefault) so the value ALWAYS takes, even if the config cell
+# was already run once this kernel session. setdefault silently no-ops on a re-run and is
+# how a "basic" edit can still execute as premium.
+_MODES = {"premium": ("1", "0"), "basic": ("0", "0"), "primer": ("1", "1")}
+if RUN not in _MODES:
+    raise SystemExit(f"RUN={RUN!r} invalid — pick one of {list(_MODES)}")
+os.environ["DUBBING_VOICE_CLONE"], os.environ["DUBBING_TTS_PRIMER"] = _MODES[RUN]
+print("=" * 64)
+print(f"  RUN MODE = {RUN.upper()}   "
+      f"(DUBBING_VOICE_CLONE={os.environ['DUBBING_VOICE_CLONE']}, "
+      f"DUBBING_TTS_PRIMER={os.environ['DUBBING_TTS_PRIMER']})")
+if RUN == "basic":
+    print("  -> native HINDI reference; English voice NOT cloned.")
+    print("  -> CONFIRM in the log within ~1 min: 'voice cloning DISABLED' then")
+    print("     'Mode: Basic' then 'Default reference voice resolved to: ...HIN_M_HAPPY...'")
+    print("  -> If you instead see 'Extracting reference voice clip' / 'Mode: Premium',")
+    print("     STOP — it is cloning English again.")
+elif RUN == "primer":
+    print("  -> clone English speaker + Hindi primer absorbs the onset babble.")
+    print("  -> CONFIRM in the log: 'Mode: Premium' AND '[primer] ... sliced primer'.")
+else:
+    print("  -> clones the English speaker; this is the babbling baseline.")
+    print("  -> CONFIRM in the log: 'Mode: Premium'.")
+print("=" * 64)
+# Optional primer tuning (defaults are fine for the first run):
+# os.environ["DUBBING_TTS_PRIMER_TEXT"]   = "नमस्ते।"   # throwaway Hindi utterance (ends in danda)
+# os.environ["DUBBING_TTS_PRIMER_BUDGET"] = "1.0"      # seconds of fix_duration given to the primer
+
+# ── Faster CPU run (optional) ───────────────────────────────────────────────────
+# For the Basic-mode CPU run these cut wall-time a lot; leave them off for the GPU run.
+# os.environ["DUBBING_NFE_STEP"]      = "16"     # ~2x faster TTS, slight quality cost (default 32)
+# os.environ["DUBBING_USE_DEMUCS"]    = "0"      # skip source separation (not needed to judge the voice)
+# os.environ["DUBBING_WHISPER_MODEL"] = "small"  # faster ASR; segmentation quality barely matters here
+
+# ── GPU-aware Step-6 timeouts ───────────────────────────────────────────────────
+# IndicF5 on CPU is ~10-50x slower per segment than on a T4, so the GPU-tuned Step-6
+# watchdogs would fire on healthy-but-slow CPU segments — turning a good segment into
+# silence (inner DUBBING_SEGMENT_TIMEOUT, default 180s) or SIGKILL-thrash (supervisor
+# DUBBING_TTS_SEG_STALL, default 240s). Raise them ONLY when no usable GPU is present;
+# on GPU the fast defaults stay intact so a genuinely-wedged CUDA op is still caught fast.
+import shutil as _shutil, subprocess as _subprocess
+_cvd = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+_gpu_hidden = _cvd is not None and _cvd.strip() == ""   # torch sees no GPU when this is ""
+_has_gpu = False
+if not _gpu_hidden and _shutil.which("nvidia-smi"):
+    try:
+        _has_gpu = _subprocess.run(
+            ["nvidia-smi"], stdout=_subprocess.DEVNULL, stderr=_subprocess.DEVNULL, timeout=10
+        ).returncode == 0
+    except Exception:
+        _has_gpu = False
+if _has_gpu:
+    print("GPU detected -> keeping fast Step-6 timeouts (segment 180s / seg_stall 240s / load 900s).")
+else:
+    # Keep inner < supervisor so the graceful per-segment timeout wins before the
+    # supervisor SIGKILLs the worker.
+    os.environ.setdefault("DUBBING_SEGMENT_TIMEOUT", "900")    # inner per-segment ceiling (default 180)
+    os.environ.setdefault("DUBBING_TTS_SEG_STALL",  "1200")    # supervisor no-progress kill (default 240)
+    os.environ.setdefault("DUBBING_TTS_LOAD_STALL", "1800")    # CPU model load is slower  (default 900)
+    print("No GPU detected -> CPU-safe Step-6 timeouts (segment 900s / seg_stall 1200s / load 1800s).")
+
+# Locate the input video now so a missing dataset fails HERE (fast), not mid-run.
+_iv = os.environ.get("DUBBING_INPUT_VIDEO", "").strip()
+if not _iv:
+    _cands = []
+    for _dp, _dd, _ff in os.walk("/kaggle/input"):
+        for _f in _ff:
+            if _f.lower().endswith((".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v")):
+                _cands.append(os.path.join(_dp, _f))
+    _cands.sort()
+    if _cands:
+        print(f"Auto-detected input video: {_cands[0]}")
+        if len(_cands) > 1:
+            print(f"  ({len(_cands)} videos found; using the first. Set DUBBING_INPUT_VIDEO to choose.)")
+    else:
+        print("No video under /kaggle/input. Attach a dataset with your source video,")
+        print("   or set os.environ['DUBBING_INPUT_VIDEO'] above before running the next cell.")
+else:
+    print(f"Input video (from DUBBING_INPUT_VIDEO): {_iv}")
+
+for _k in ("DUBBING_TARGET_LANG", "DUBBING_WHISPER_MODEL", "DUBBING_USE_DEMUCS",
+           "DUBBING_BG_VOLUME", "DUBBING_OUTPUT_DIR", "DUBBING_VOICE_CLONE", "DUBBING_TTS_PRIMER"):
+    print(f"  {_k} = {os.environ.get(_k)}")
+"""
+
+CELL_HEADLESS_RUN = r"""import os, sys, subprocess
+
+# Run the batch driver in a FRESH SUBPROCESS — NOT in this kernel. Kaggle's kernel loads
+# the base image's numpy 2.x at startup (kaggle-environments requires numpy>=2), while
+# Step 4 pins numpy 1.26.4 ON DISK. In-kernel, a lazily-imported numpy-1.x-built extension
+# (e.g. numba, dragged in by the openai-whisper fallback) then crashes with
+# "numpy.dtype size changed (Expected 96 ... got 88)" — a 1.x-built .so meeting the 2.x
+# core still live in memory. A subprocess imports the on-disk numpy 1.26.4 fresh, so the
+# whole environment is coherent — the SAME reason the Streamlit app runs the pipeline in a
+# subprocess. Step 6 (IndicF5) still runs in ITS own supervised subprocess (the freeze fix)
+# nested under this one.
+os.chdir("/kaggle/working")
+
+# Carry Step 5's API keys + Step 9's DUBBING_* config to the child, and force UTF-8 so the
+# non-ASCII Indic pipeline (Devanagari/Tamil output, ✓/→/Δ in logs) doesn't die on the C/
+# ASCII locale Kaggle spawns kernels under — the app subprocess sets exactly these.
+_env = dict(os.environ)
+_env.update({
+    "PYTHONUNBUFFERED": "1",   # stream the child's stdout/stderr live into this cell
+    "PYTHONIOENCODING": "utf-8",
+    "PYTHONUTF8": "1",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+})
+
+_proc = subprocess.run([sys.executable, "-u", "run_headless.py"],
+                       cwd="/kaggle/working", env=_env)
+rc = _proc.returncode
+
+print(f"\n=== HEADLESS RUN EXIT CODE: {rc} ===")
+_out = os.environ.get("DUBBING_OUTPUT_DIR", "/kaggle/working/dubbing_output")
+if os.path.isdir(_out):
+    print("Outputs (persisted by the commit) under:", _out)
+    for _f in sorted(os.listdir(_out)):
+        _p = os.path.join(_out, _f)
+        if os.path.isfile(_p):
+            print(f"  {_f}  ({os.path.getsize(_p)/1024:.1f} KB)")
+# A non-zero exit raises so a "Save & Run All" commit is marked FAILED (not silently green).
+if rc != 0:
+    raise SystemExit(f"Headless run failed with exit code {rc} — see the log above.")
+"""
+
+
+def main(mode="app"):
+    print(f"Building Kaggle notebook (mode={mode})...")
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    base = os.path.dirname(script_dir)  # repo root (E:/Dubbing app/pipeline_v3)
+
+    def step_md(title, body=""):
+        """A markdown header cell placed before a code cell, so the notebook reads
+        as clean numbered steps in the Kaggle UI."""
+        text = "## " + title
+        if body:
+            text += "\n\n" + body
+        return md_cell(text)
 
     cells = [
+        # Title / overview
         md_cell(CELL_MD_HEADER),
+
+        # Step 1 — GPU check
+        step_md("Step 1 — Confirm the GPU is attached",
+                "Verifies a T4 is visible. If this prints *no GPU*, set "
+                "**Settings → Accelerator → GPU T4 x2** and re-run."),
         code_cell(CELL_GPU_CHECK),
+
+        # Step 2 — system packages
+        step_md("Step 2 — Install system packages (ffmpeg, etc.)"),
         code_cell(CELL_SYSTEM_DEPS),
+
+        # Step 3 — python deps (part 1)
+        step_md("Step 3 — Install Python dependencies (core)"),
         code_cell(CELL_PYTHON_DEPS_1),
+
+        # Step 4 — python deps (part 2)
+        step_md("Step 4 — Install Python dependencies (TTS stack) + pin ABIs",
+                "Installs f5-tts / IndicF5 / vocos, then re-pins numpy/scipy and "
+                "`transformers<5` so the ABI stays consistent."),
         code_cell(CELL_PYTHON_DEPS_2),
+
+        # Step 5 — API keys
+        step_md("Step 5 — Load API keys from Kaggle Secrets",
+                "Reads `GEMINI_API_KEY` and `HF_TOKEN`. Secrets are **per-notebook** — "
+                "a freshly-imported copy carries none, so add them under "
+                "**Add-ons → Secrets** if this step reports them missing."),
         code_cell(CELL_API_KEYS),
-        code_cell(file_write_source),
+
+        # Step 6 — write the application into /kaggle/working (split into labeled sub-steps)
+        step_md("Step 6 — Write the dubbing application to `/kaggle/working`",
+                "Each sub-step writes one role of files and logs every write with its "
+                "size, so a short or failed write is obvious here — long before Step 9 "
+                "burns GPU time. Step 6h then import-checks the whole build."),
+        step_md("Step 6a — Create the package directory structure"),
+        code_cell(_make_mkdirs_cell()),
+        step_md("Step 6b — Write the Streamlit app (`app.py`)"),
+        code_cell(_make_app_cell(base)),
+        step_md("Step 6c — Write the pipeline modules"),
+        code_cell(_make_pipeline_cell(base)),
+        step_md("Step 6d — Write the utils modules"),
+        code_cell(_make_utils_cell(base)),
+        step_md("Step 6e — Write `utils/video_merge.py` (Linux-adapted)"),
+        code_cell(_make_video_merge_cell()),
+        step_md("Step 6f — Write `pipeline/duration_tts.py` (Kaggle-adapted)"),
+        code_cell(_make_duration_tts_cell(base)),
+        step_md("Step 6g — Write `pipeline/indicf5_model_patched.py` (Kaggle model.py)"),
+        code_cell(_make_model_patch_cell()),
+        step_md("Step 6h — Verify every module imports cleanly",
+                "A throwaway subprocess imports all 13 modules. If any fails, this cell "
+                "**stops the run** so you fix it before spending GPU quota."),
+        code_cell(CELL_VERIFY_IMPORTS),
+
+        # Step 7 — patch IndicF5 in the HF cache
+        step_md("Step 7 — Cache IndicF5 and apply the patched model.py"),
         code_cell(CELL_PATCH_INDICF5),
-        code_cell(CELL_CLOUDFLARED),
-        code_cell(CELL_LAUNCH),
     ]
+
+    if mode == "batch":
+        # Headless batch: write the no-UI driver, configure the run, execute it. No
+        # Streamlit, no Cloudflare tunnel — outputs land in /kaggle/working and a
+        # "Save & Run All" commit persists them. This is the validation vehicle.
+        cells += [
+            step_md("Step 8 — Write the headless batch driver (`run_headless.py`)"),
+            code_cell(_make_headless_runner_cell(base)),
+            step_md("Step 9 — Configure the batch run",
+                    "Sets target language / Whisper model / Demucs and locates the input "
+                    "video under `/kaggle/input`. Edit the `os.environ` lines to taste."),
+            code_cell(CELL_HEADLESS_CONFIG),
+            step_md("Step 10 — Run the pipeline end-to-end (headless)",
+                    "Runs Steps 1-7 in this kernel; Step 6 (IndicF5) runs in a supervised "
+                    "subprocess that is killed + relaunched if it wedges. A non-zero exit "
+                    "fails the commit, so a broken run is never a silent green."),
+            code_cell(CELL_HEADLESS_RUN),
+        ]
+    else:
+        # Interactive app: Streamlit + Cloudflare tunnel (the original live-UI flow).
+        cells += [
+            step_md("Step 8 — Install the Cloudflare tunnel binary"),
+            code_cell(CELL_CLOUDFLARED),
+            step_md("Step 9 — Launch the app and open the public URL",
+                    "Starts Streamlit + the Cloudflare tunnel and prints a "
+                    "`*.trycloudflare.com` link. Keep this cell running to keep the app alive."),
+            code_cell(CELL_LAUNCH),
+        ]
 
     notebook = {
         "nbformat": 4,
@@ -887,7 +1304,8 @@ def main():
         "cells": cells
     }
 
-    out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "indicai_dubbing_kaggle.ipynb")
+    nb_name = "indicai_dubbing_kaggle_batch.ipynb" if mode == "batch" else "indicai_dubbing_kaggle.ipynb"
+    out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), nb_name)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(notebook, f, indent=1, ensure_ascii=False)
 
@@ -922,12 +1340,16 @@ def _generate_large_files_module():
 
     large_files = [
         (os.path.join(base, "app.py"),                               f"{WORK_DIR}/app.py"),
+        (os.path.join(base, "run_headless.py"),                       f"{WORK_DIR}/run_headless.py"),
         (os.path.join(base, "pipeline", "phoneme_counter.py"),       f"{WORK_DIR}/pipeline/phoneme_counter.py"),
         (os.path.join(base, "pipeline", "semantic_similarity.py"),   f"{WORK_DIR}/pipeline/semantic_similarity.py"),
         (os.path.join(base, "pipeline", "source_separation.py"),     f"{WORK_DIR}/pipeline/source_separation.py"),
         (os.path.join(base, "pipeline", "voice_manager.py"),         f"{WORK_DIR}/pipeline/voice_manager.py"),
         (os.path.join(base, "pipeline", "translation_cache.py"),     f"{WORK_DIR}/pipeline/translation_cache.py"),
         (os.path.join(base, "pipeline", "isochrony_translation.py"), f"{WORK_DIR}/pipeline/isochrony_translation.py"),
+        # Step-6 process-isolation freeze fix (cross-platform, no adaptation needed).
+        (os.path.join(base, "pipeline", "tts_worker.py"),            f"{WORK_DIR}/pipeline/tts_worker.py"),
+        (os.path.join(base, "pipeline", "tts_supervisor.py"),        f"{WORK_DIR}/pipeline/tts_supervisor.py"),
         (os.path.join(base, "utils", "transcription.py"),            f"{WORK_DIR}/utils/transcription.py"),
         (os.path.join(base, "utils", "audio_sync.py"),               f"{WORK_DIR}/utils/audio_sync.py"),
     ]
@@ -1007,4 +1429,8 @@ def _generate_large_files_module():
 
 
 if __name__ == "__main__":
-    main()
+    import sys as _sys
+    _mode = "app"
+    if "--batch" in _sys.argv[1:] or os.environ.get("DUBBING_BUILD_MODE", "").lower() == "batch":
+        _mode = "batch"
+    main(_mode)
