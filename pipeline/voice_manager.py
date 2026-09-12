@@ -27,10 +27,15 @@ except ImportError:
     SOUNDFILE_AVAILABLE = False
 
 
-# Target reference clip duration (seconds). IndicF5 works best with 10-15s.
-REFERENCE_CLIP_SECONDS = 12
-# Window size for SNR analysis
-WIN_SECONDS = 12
+# Target reference clip duration (seconds). F5-TTS / IndicF5 are most stable with SHORTER
+# references (~5-10s); a ~12s clip sat at the edge of that range and coincided with gross
+# duration overshoot on dense target segments here (the drift safety-net then has to make
+# a large, audible correction — or, past MAX_DRIFT_STRETCH, cannot). ~8s keeps the clip
+# well inside the stable range while still giving the voice cloner enough signal.
+REFERENCE_CLIP_SECONDS = 8
+# Window size for SNR analysis — kept equal to the exported clip length so the RMS score
+# is measured over exactly the audio that ships as the reference.
+WIN_SECONDS = 8
 # Hop between windows (overlap)
 HOP_SECONDS = 4
 # Silence threshold: RMS below this fraction of max RMS is considered silence
