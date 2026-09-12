@@ -1,5 +1,7 @@
 import streamlit as st
 import os
+import json
+import hashlib
 import torch
 
 from utils.audio_extraction import extract_audio
@@ -16,8 +18,87 @@ from pipeline.isochrony_translation import (
 from pipeline.duration_tts import (
     generate_tts_for_segments,
     unload_indicf5,
+    MANIFEST_NAME,
 )
+from pipeline.tts_supervisor import generate_tts_supervised
 from pipeline.voice_manager import extract_reference_clip
+
+# ── Steps 1-5 resume cache ────────────────────────────────────────────────────
+# Steps 1-5 (extract → separate → transcribe → translate → voice-ref) are both
+# expensive AND not bit-reproducible: Whisper's temperature fallback and Gemini's
+# decoding can yield a DIFFERENT segment set on a re-run. The Step-6 manifest keys
+# each WAV to its (text, duration) signature, so it never glues stale audio onto
+# changed text — but if 1-5 re-ran and drifted, "resume" would re-synthesize
+# almost everything. So we persist the 1-5 result and, when the inputs are
+# unchanged, let the user JUMP straight to Step 6 with the exact same segments —
+# which makes reconciliation a non-issue (1-5 can't drift if they don't re-run).
+TEMP_DIR = "temp_processing"
+RUN_CACHE_NAME = "run_cache.json"
+
+
+def _run_key(video_hash: str, target_lang: str, model_size: str, use_demucs: bool) -> str:
+    """Identity of a Steps 1-5 result. Everything that changes 1-5 output belongs here:
+    the video bytes (Steps 1,2,3,5), the target language (Step 4), the Whisper model
+    (Step 3), and Demucs on/off (Steps 2,3,5). bg_volume/tier/nfe_step are deliberately
+    NOT here — they only affect Steps 6-7, which never reuse cached 1-5 output."""
+    payload = f"{video_hash}|{target_lang}|{model_size}|{int(bool(use_demucs))}"
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def _json_default(o):
+    """Coerce numpy scalars (e.g. an isochrony score) to plain JSON types on save."""
+    import numpy as _np
+    if isinstance(o, _np.generic):
+        return o.item()
+    raise TypeError(f"not JSON-serializable: {type(o)}")
+
+
+def _load_run_cache(temp_dir):
+    try:
+        with open(os.path.join(temp_dir, RUN_CACHE_NAME), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _save_run_cache(temp_dir, data) -> bool:
+    """Persist the Steps 1-5 result atomically. Best-effort: a failure just means resume
+    won't be offered next time — it must never abort the run about to enter Step 6."""
+    try:
+        os.makedirs(temp_dir, exist_ok=True)
+        path = os.path.join(temp_dir, RUN_CACHE_NAME)
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, default=_json_default)
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        return False
+
+
+def _manifest_done_count(tts_dir) -> int:
+    """How many Step-6 segments a prior run already finished as real audio ('ok')."""
+    try:
+        with open(os.path.join(tts_dir, MANIFEST_NAME), "r", encoding="utf-8") as f:
+            m = json.load(f)
+        return sum(1 for v in m.values() if isinstance(v, dict) and v.get("status") == "ok")
+    except Exception:
+        return 0
+
+
+def _resume_available(temp_dir, run_key):
+    """Return the cached Steps 1-5 payload IFF it matches the current inputs AND the saved
+    video is still on disk; else None (so resume isn't offered). Optional artifacts
+    (voice-ref, background) are validated later and degraded gracefully, not required here."""
+    cache = _load_run_cache(temp_dir)
+    if not cache or cache.get("run_key") != run_key:
+        return None
+    if not cache.get("translated_segments"):
+        return None
+    if not os.path.exists(os.path.join(temp_dir, "input_video.mp4")):
+        return None
+    return cache
 
 # ── Page config ─────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -111,20 +192,57 @@ uploaded_file = st.file_uploader(
     type=["mp4", "mkv", "mov"],
 )
 
+run_key = None
+resume_info = None
 if uploaded_file:
     _size_mb = getattr(uploaded_file, "size", 0) / (1024 * 1024)
     st.caption(f"✓ Received **{uploaded_file.name}** — {_size_mb:.1f} MB")
     st.video(uploaded_file)
 
-col_start, _ = st.columns([1, 4])
-with col_start:
-    start_btn = st.button("🚀 Start Dubbing", type="primary", use_container_width=True)
+    # Hash the video ONCE per upload (cached in session_state) so detecting a resumable
+    # prior run doesn't re-hash the whole file on every Streamlit rerun (e.g. slider moves).
+    _fid = getattr(uploaded_file, "file_id", None) or f"{uploaded_file.name}:{getattr(uploaded_file, 'size', 0)}"
+    if st.session_state.get("_video_fid") != _fid:
+        _h = hashlib.sha1()
+        _h.update(uploaded_file.getbuffer())
+        st.session_state["_video_hash"] = _h.hexdigest()
+        st.session_state["_video_fid"] = _fid
+    run_key = _run_key(st.session_state["_video_hash"], target_lang, model_size, use_demucs)
+    resume_info = _resume_available(TEMP_DIR, run_key)
 
-if start_btn:
+start_btn = False
+resume_btn = False
+if resume_info:
+    _done = _manifest_done_count(os.path.join(TEMP_DIR, "tts_chunks"))
+    _total = len(resume_info["translated_segments"])
+    st.info(
+        f"↩️ A previous run of **this exact video + language + settings** was found. "
+        f"Steps 1-5 (transcription, translation, voice profile) are cached, and Step 6 "
+        f"had finished **{_done}/{_total}** segments. You can continue from Step 6, or start over."
+    )
+    col_a, col_b, _ = st.columns([1.4, 1.4, 2.2])
+    with col_a:
+        resume_btn = st.button(
+            f"▶️ Resume from Step 6 — {_done}/{_total} done",
+            type="primary", use_container_width=True,
+        )
+    with col_b:
+        start_btn = st.button(
+            "🔄 Start over", use_container_width=True,
+            help="Re-run every step: transcribe, translate, and re-synthesize all segments from scratch.",
+        )
+else:
+    col_start, _ = st.columns([1, 4])
+    with col_start:
+        start_btn = st.button("🚀 Start Dubbing", type="primary", use_container_width=True)
+
+if start_btn or resume_btn:
+    resume_mode = bool(resume_btn)
     if not uploaded_file:
         st.error("Please upload a video file first.")
         st.stop()
-    if not api_key:
+    # Translation (Step 4) is skipped on resume, so the Gemini key isn't needed then.
+    if not resume_mode and not api_key:
         st.error("Please enter your Gemini API key in the sidebar.")
         st.stop()
     if not hf_token:
@@ -133,34 +251,39 @@ if start_btn:
 
     os.environ["HF_TOKEN"] = hf_token
 
-    temp_dir = "temp_processing"
+    temp_dir = TEMP_DIR
     os.makedirs(temp_dir, exist_ok=True)
 
     video_path = os.path.join(temp_dir, "input_video.mp4")
 
-    # Save the uploaded file to disk in chunks so we can show a real progress
-    # bar. NOTE: Streamlit's st.file_uploader already streams the browser→server
-    # network upload with its own built-in progress indicator; by the time this
-    # code runs the bytes are fully in memory. This bar therefore reports the
-    # disk-write (buffer → temp file) phase, which is the part we control.
-    buffer = uploaded_file.getbuffer()
-    total_bytes = buffer.nbytes
-    save_progress = st.progress(0.0)
-    save_status = st.empty()
-    chunk_size = 4 * 1024 * 1024  # 4 MB
-    written = 0
-    with open(video_path, "wb") as f:
-        while written < total_bytes:
-            chunk = buffer[written:written + chunk_size]
-            f.write(chunk)
-            written += len(chunk)
-            frac = written / total_bytes if total_bytes else 1.0
-            save_progress.progress(frac)
-            save_status.caption(
-                f"Saving upload… {written / (1024*1024):.1f} / "
-                f"{total_bytes / (1024*1024):.1f} MB ({frac*100:.0f}%)"
-            )
-    save_status.caption(f"✓ Upload saved ({total_bytes / (1024*1024):.1f} MB)")
+    if resume_mode and os.path.exists(video_path):
+        # The cache is keyed on the video hash, so the saved copy is byte-identical
+        # to the current upload — no need to re-write it.
+        st.caption("↩️ Resuming — reusing the already-saved upload.")
+    else:
+        # Save the uploaded file to disk in chunks so we can show a real progress
+        # bar. NOTE: Streamlit's st.file_uploader already streams the browser→server
+        # network upload with its own built-in progress indicator; by the time this
+        # code runs the bytes are fully in memory. This bar therefore reports the
+        # disk-write (buffer → temp file) phase, which is the part we control.
+        buffer = uploaded_file.getbuffer()
+        total_bytes = buffer.nbytes
+        save_progress = st.progress(0.0)
+        save_status = st.empty()
+        chunk_size = 4 * 1024 * 1024  # 4 MB
+        written = 0
+        with open(video_path, "wb") as f:
+            while written < total_bytes:
+                chunk = buffer[written:written + chunk_size]
+                f.write(chunk)
+                written += len(chunk)
+                frac = written / total_bytes if total_bytes else 1.0
+                save_progress.progress(frac)
+                save_status.caption(
+                    f"Saving upload… {written / (1024*1024):.1f} / "
+                    f"{total_bytes / (1024*1024):.1f} MB ({frac*100:.0f}%)"
+                )
+        save_status.caption(f"✓ Upload saved ({total_bytes / (1024*1024):.1f} MB)")
 
     progress = st.progress(0)
     status = st.empty()
@@ -187,84 +310,149 @@ if start_btn:
         )
 
     try:
-        # ── Step 1: Audio extraction ──────────────────────────────────────
-        status.markdown("**Step 1/7** — Extracting audio from video...")
-        log("Step 1: Extracting audio...")
-        audio_path = os.path.join(temp_dir, "original_audio.wav")
-        extract_audio(video_path, audio_path, log_fn=log)
-        log(f"  ✓ Audio extracted: {audio_path}")
-        progress.progress(5)
+        if resume_mode:
+            # ── Resume: load the cached Steps 1-5 result and jump to Step 6 ────
+            status.markdown("**Resuming** — loading cached Steps 1-5, jumping to Step 6...")
+            log("▶️ Resume mode: loading cached transcription / translation / voice-ref (Steps 1-5).")
+            cache = resume_info or _load_run_cache(temp_dir)
+            if not cache or not cache.get("translated_segments"):
+                raise RuntimeError("Resume cache is missing or empty — please Start over.")
+            segments = cache.get("segments") or []
+            translated_segments = cache["translated_segments"]
+            ref_audio_path = cache.get("ref_audio_path")
+            ref_text = cache.get("ref_text")
+            background_path = cache.get("background_path")
+            vocals_path = cache.get("vocals_path")
 
-        # ── Step 2: Source separation (optional Demucs) ───────────────────
-        vocals_path = audio_path
-        background_path = None
-
-        if use_demucs:
-            status.markdown("**Step 2/7** — Separating vocals and background (Demucs)...")
-            log("Step 2: Running Demucs source separation...")
-            sep_dir = os.path.join(temp_dir, "separated")
-            try:
-                stems = separate_audio(audio_path, sep_dir, log_fn=log)
-                vocals_path = stems["vocals"]
-                background_path = stems["background"]
-                log(f"  ✓ Vocals: {vocals_path}")
-                log(f"  ✓ Background: {background_path}")
-            except Exception as e:
-                log(f"  ⚠️ Demucs failed: {e}. Using full audio for transcription.")
-                st.warning(f"Source separation failed ({e}). Proceeding without background preservation.")
-        else:
-            log("Step 2: Source separation skipped by user.")
-        progress.progress(15)
-
-        # ── Step 3: Transcription ─────────────────────────────────────────
-        status.markdown(f"**Step 3/7** — Transcribing with Whisper {model_size}...")
-        log(f"Step 3: Transcribing audio with Whisper ({model_size})...")
-        segments = transcribe_audio(vocals_path, model_size=model_size, log_fn=log)
-        english_srt_path = os.path.join(temp_dir, "english_subtitles.srt")
-        generate_srt(segments, english_srt_path)
-        log(f"  ✓ {len(segments)} segments transcribed.")
-        progress.progress(30)
-
-        # ── Step 4: Isochrony-aware translation ───────────────────────────
-        status.markdown(f"**Step 4/7** — Isochrony-aware translation → {target_lang}...")
-        log(f"Step 4: Translating to {target_lang} with phoneme-budget constraints...")
-        translated_segments = translate_segments_isochrony(
-            segments, target_lang, api_key, log_fn=log
-        )
-        avg_iso = sum(s.get("isochrony_score", 0) for s in translated_segments) / max(1, len(translated_segments))
-        log(f"  ✓ Translation complete. Avg isochrony score: {avg_iso:.3f}")
-        translated_srt_path = os.path.join(temp_dir, f"{target_lang}_subtitles.srt")
-        generate_srt(translated_segments, translated_srt_path)
-
-        st.metric("Avg Isochrony Score", f"{avg_iso:.3f}", help="≥0.85 = excellent timing compliance")
-        progress.progress(50)
-
-        # ── Step 5: Voice reference extraction (cloning reference) ─────────
-        ref_audio_path = None
-        ref_text = None
-
-        # IndicF5 requires a valid reference audio clip to synthesize audio.
-        # We always extract the speaker's reference voice from the vocals track.
-        if vocals_path and os.path.exists(vocals_path):
-            status.markdown("**Step 5/7** — Extracting voice profile for cloning...")
-            log("Step 5: Extracting reference voice clip...")
-            ref_audio_path = os.path.join(temp_dir, "voice_reference.wav")
-            try:
-                ref_audio_path, ref_text = extract_reference_clip(vocals_path, ref_audio_path, segments=segments, log_fn=log)
-                log(f"  ✓ Voice reference saved: {ref_audio_path}")
-            except Exception as e:
-                log(f"  ⚠️ Voice extraction failed: {e}. Synthesis may fail.")
+            # Optional artifacts may have been cleaned up between runs — degrade
+            # gracefully rather than crashing, so the expensive Step-6 work still resumes.
+            if ref_audio_path and not os.path.exists(ref_audio_path):
+                log("  ⚠️ Cached voice reference file is gone; falling back to the basic voice.")
                 ref_audio_path = None
-                ref_text = None
+            if background_path and not os.path.exists(background_path):
+                log("  ⚠️ Cached background track is gone; the final mix will omit it.")
+                background_path = None
+
+            # The translated SRT is a deterministic function of the cached segments —
+            # regenerate it (needed for the final merge + the subtitles download).
+            translated_srt_path = os.path.join(temp_dir, f"{target_lang}_subtitles.srt")
+            generate_srt(translated_segments, translated_srt_path)
+            avg_iso = sum(s.get("isochrony_score", 0) for s in translated_segments) / max(1, len(translated_segments))
+            st.metric("Avg Isochrony Score", f"{avg_iso:.3f}", help="from the cached translation")
+            log(f"  ✓ Loaded {len(translated_segments)} cached segments. Resuming at Step 6.")
+            progress.progress(58)
         else:
-            log("Step 5: Voice reference skipped (no vocals track available).")
-        progress.progress(58)
+            # ── Step 1: Audio extraction ──────────────────────────────────────
+            status.markdown("**Step 1/7** — Extracting audio from video...")
+            log("Step 1: Extracting audio...")
+            audio_path = os.path.join(temp_dir, "original_audio.wav")
+            extract_audio(video_path, audio_path, log_fn=log)
+            log(f"  ✓ Audio extracted: {audio_path}")
+            progress.progress(5)
+
+            # ── Step 2: Source separation (optional Demucs) ───────────────────
+            vocals_path = audio_path
+            background_path = None
+
+            if use_demucs:
+                status.markdown("**Step 2/7** — Separating vocals and background (Demucs)...")
+                log("Step 2: Running Demucs source separation...")
+                sep_dir = os.path.join(temp_dir, "separated")
+                try:
+                    stems = separate_audio(audio_path, sep_dir, log_fn=log)
+                    vocals_path = stems["vocals"]
+                    background_path = stems["background"]
+                    log(f"  ✓ Vocals: {vocals_path}")
+                    log(f"  ✓ Background: {background_path}")
+                except Exception as e:
+                    log(f"  ⚠️ Demucs failed: {e}. Using full audio for transcription.")
+                    st.warning(f"Source separation failed ({e}). Proceeding without background preservation.")
+            else:
+                log("Step 2: Source separation skipped by user.")
+            progress.progress(15)
+
+            # ── Step 3: Transcription ─────────────────────────────────────────
+            status.markdown(f"**Step 3/7** — Transcribing with Whisper {model_size}...")
+            log(f"Step 3: Transcribing audio with Whisper ({model_size})...")
+            segments = transcribe_audio(vocals_path, model_size=model_size, log_fn=log)
+            english_srt_path = os.path.join(temp_dir, "english_subtitles.srt")
+            generate_srt(segments, english_srt_path)
+            log(f"  ✓ {len(segments)} segments transcribed.")
+            progress.progress(30)
+
+            # ── Step 4: Isochrony-aware translation ───────────────────────────
+            status.markdown(f"**Step 4/7** — Isochrony-aware translation → {target_lang}...")
+            log(f"Step 4: Translating to {target_lang} with phoneme-budget constraints...")
+            translated_segments = translate_segments_isochrony(
+                segments, target_lang, api_key, log_fn=log
+            )
+            avg_iso = sum(s.get("isochrony_score", 0) for s in translated_segments) / max(1, len(translated_segments))
+            log(f"  ✓ Translation complete. Avg isochrony score: {avg_iso:.3f}")
+            translated_srt_path = os.path.join(temp_dir, f"{target_lang}_subtitles.srt")
+            generate_srt(translated_segments, translated_srt_path)
+
+            st.metric("Avg Isochrony Score", f"{avg_iso:.3f}", help="≥0.85 = excellent timing compliance")
+            progress.progress(50)
+
+            # ── Step 5: Voice reference extraction (cloning reference) ─────────
+            ref_audio_path = None
+            ref_text = None
+
+            # IndicF5 requires a valid reference audio clip to synthesize audio.
+            # We always extract the speaker's reference voice from the vocals track.
+            if vocals_path and os.path.exists(vocals_path):
+                status.markdown("**Step 5/7** — Extracting voice profile for cloning...")
+                log("Step 5: Extracting reference voice clip...")
+                ref_audio_path = os.path.join(temp_dir, "voice_reference.wav")
+                try:
+                    ref_audio_path, ref_text = extract_reference_clip(vocals_path, ref_audio_path, segments=segments, log_fn=log)
+                    log(f"  ✓ Voice reference saved: {ref_audio_path}")
+                except Exception as e:
+                    log(f"  ⚠️ Voice extraction failed: {e}. Synthesis may fail.")
+                    ref_audio_path = None
+                    ref_text = None
+            else:
+                log("Step 5: Voice reference skipped (no vocals track available).")
+
+            # Persist the Steps 1-5 result so a Step-6 interruption can resume from HERE
+            # with the exact same segments (no re-transcribe / re-translate drift).
+            # Best-effort — a write failure must not abort the run entering Step 6.
+            if _save_run_cache(temp_dir, {
+                "run_key": run_key,
+                "target_lang": target_lang,
+                "model_size": model_size,
+                "use_demucs": bool(use_demucs),
+                "segments": segments,
+                "translated_segments": translated_segments,
+                "ref_audio_path": ref_audio_path,
+                "ref_text": ref_text,
+                "background_path": background_path,
+                "vocals_path": vocals_path,
+            }):
+                log("  ✓ Cached Steps 1-5 — a Step-6 interruption can resume from here.")
+            else:
+                log("  ⚠️ Could not write the resume cache; a re-run would restart from Step 1.")
+            progress.progress(58)
 
         # ── Step 6: Duration-controlled TTS ──────────────────────────────
         status.markdown(f"**Step 6/7** — Generating {target_lang} audio with IndicF5...")
         log(f"Step 6: Running IndicF5 TTS for {len(translated_segments)} segments...")
         tts_dir = os.path.join(temp_dir, "tts_chunks")
-        translated_segments = generate_tts_for_segments(
+        if not resume_mode:
+            # "Start over" must re-synthesize every segment — drop any manifest from a
+            # previous run so nothing is skipped. Resume deliberately KEEPS it: that's how
+            # it continues from the exact segment the last run stopped at.
+            os.makedirs(tts_dir, exist_ok=True)
+            try:
+                os.remove(os.path.join(tts_dir, MANIFEST_NAME))
+            except OSError:
+                pass
+        # Supervised subprocess synthesis: Step 6 runs in a separate OS process that this
+        # parent SIGKILLs + relaunches if its heartbeat stalls (a wedged CUDA op can freeze
+        # its own process but never this one). Poison segments degrade to silence; progress
+        # is checkpointed to disk, so a killed worker resumes seamlessly. This is the
+        # process-isolation cure for the Step-6 GPU freeze — see pipeline/tts_supervisor.py.
+        translated_segments = generate_tts_supervised(
             translated_segments,
             target_language=target_lang,
             output_dir=tts_dir,
@@ -274,7 +462,9 @@ if start_btn:
         )
         log(f"  ✓ TTS complete: {len(translated_segments)} audio chunks generated.")
 
-        # Unload IndicF5 to free VRAM before audio assembly
+        # IndicF5 lived in the (now-exited) worker process, so its VRAM is already freed by
+        # process teardown. This call is a harmless no-op in the parent (which never loaded
+        # the model) — kept as defensive cleanup in case that ever changes.
         unload_indicf5()
         progress.progress(80)
 
