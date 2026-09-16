@@ -259,16 +259,39 @@ def main():
                 mode = "basic"
 
         # ── Step 6: Duration-controlled TTS (SUPERVISED subprocess) ───────
-        log(f"Step 6/7: Supervised IndicF5 TTS for {len(translated_segments)} segments...")
+        # DUBBING_TTS_BACKEND selects HOW Step 6 executes; it never changes WHAT is
+        # synthesized. Both backends end with the same segment WAVs + tts_manifest.json in
+        # tts_dir and the same returned segments, so Steps 6.5 and 7 are identical either
+        # way — and a run started under one backend resumes under the other.
+        #   "" / "supervised" (default) — the proven single-process supervisor path with the
+        #       SIGKILL-and-relaunch freeze fix. This is what Kaggle uses; unchanged.
+        #   "modal-fanout" — shard the segments across parallel Modal GPU workers
+        #       (deploy/tts_fanout.py). Only meaningful inside the Modal deployment, where
+        #       there are containers to fan out to.
         tts_dir = os.path.join(out_dir, "tts_chunks")
-        translated_segments = generate_tts_supervised(
-            translated_segments,
-            target_language=target_lang,
-            output_dir=tts_dir,
-            reference_audio_path=ref_audio_path,
-            reference_text=ref_text,
-            log_fn=log,
-        )
+        tts_backend = os.environ.get("DUBBING_TTS_BACKEND", "").strip().lower()
+        if tts_backend in ("modal-fanout", "fanout"):
+            log(f"Step 6/7: Fan-out IndicF5 TTS for {len(translated_segments)} segments "
+                f"(backend={tts_backend})...")
+            from deploy.tts_fanout import generate_tts_fanout
+            translated_segments = generate_tts_fanout(
+                translated_segments,
+                target_language=target_lang,
+                output_dir=tts_dir,
+                reference_audio_path=ref_audio_path,
+                reference_text=ref_text,
+                log_fn=log,
+            )
+        else:
+            log(f"Step 6/7: Supervised IndicF5 TTS for {len(translated_segments)} segments...")
+            translated_segments = generate_tts_supervised(
+                translated_segments,
+                target_language=target_lang,
+                output_dir=tts_dir,
+                reference_audio_path=ref_audio_path,
+                reference_text=ref_text,
+                log_fn=log,
+            )
 
         # ── Step 6.5: Voice conversion (PREMIUM cloning path) ──────────────
         # Clone the source speaker's timbre onto the clean native-TTS Hindi. VC is

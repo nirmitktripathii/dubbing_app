@@ -18,14 +18,56 @@ repo root (also `E:\Dubbing app\PRODUCTION_INFRA_PLAN.md`).
 | `streamlit_app.py` | Human UI + sales demo; talks to the API |
 
 ## One-time setup
+
+**1. Account.** Sign up at [modal.com](https://modal.com) (GitHub/Google SSO). The free
+tier includes monthly credit — enough to validate this pipeline — and GPUs are billed per
+second while a container runs, so an idle deployment costs nothing.
+
+**2. CLI + auth.** From the repo root:
 ```bash
-pip install modal && modal setup
-# secrets the pipeline needs (Gemini for translation, HF for gated weights, RapidAPI verify):
-modal secret create dubbing-secrets \
-  GEMINI_API_KEY=xxx HF_TOKEN=xxx RAPIDAPI_PROXY_SECRET=$(openssl rand -hex 16)
+pip install modal
+modal setup
 ```
-Volumes (`indic-dubbing-hf-cache`, `indic-dubbing-jobs`) and the `indic-dubbing-status` Dict
-are auto-created on first deploy.
+`modal setup` opens a browser and writes a token to `~/.modal.toml`. On a headless box use
+`modal token new` and paste the token instead. Verify with `modal profile current`.
+
+**3. Secrets.** One Modal secret holds everything the pipeline reads from the environment.
+Unlike Kaggle, a Modal secret is created once and referenced by every function — there is
+no per-notebook attach step:
+```bash
+modal secret create dubbing-secrets \
+  GEMINI_API_KEY=... \
+  HF_TOKEN=... \
+  RAPIDAPI_PROXY_SECRET=$(openssl rand -hex 16)
+```
+| key | used by | required? |
+|---|---|---|
+| `GEMINI_API_KEY` | Step 4 isochrony translation | **yes** — the run aborts without it |
+| `HF_TOKEN` | IndicF5 + the default reference voice from HF | yes for gated repos |
+| `RAPIDAPI_PROXY_SECRET` | `api.py::_auth`, so the endpoint can't be called around RapidAPI | before listing; unset = open (dev only) |
+
+> The `GEMINI_API_KEY` here should **not** stay a free-tier key once you charge for this —
+> it rate-limits under concurrent load and reselling its output is almost certainly against
+> its ToS. See `PRODUCTION_INFRA_PLAN.md` §4.4.
+
+**4. Storage.** Nothing to create by hand — the two Volumes (`indic-dubbing-hf-cache` for
+model weights, `indic-dubbing-jobs` for job artifacts) and the `indic-dubbing-status` Dict
+are auto-created on first deploy. Model weights download to the cache Volume on the **first
+job only** and persist after that, so the first run is slow and later ones are not.
+
+**5. First run.** `modal serve` gives a live-reloading dev deployment with a public URL:
+```bash
+modal serve deploy/modal_app.py            # dev; prints the FastAPI URL, Ctrl-C to stop
+curl $URL/healthz                          # sanity check, no GPU used
+modal deploy deploy/modal_app.py           # production
+```
+Useful while iterating: `modal app list`, `modal app logs indic-dubbing`,
+`modal app stop indic-dubbing`, `modal volume ls indic-dubbing-jobs`.
+
+**Cost control.** GPU billing is per second of container runtime. `MODAL_TTS_WARM` and
+`MODAL_WARM` keep containers alive between jobs — they remove cold-start latency but bill
+idle GPU time, so leave them at `0` until latency actually matters. Set a spend limit in
+the Modal dashboard before pointing paid traffic at it.
 
 ## Deploy
 ```bash
@@ -99,9 +141,56 @@ job isn't an opaque `running`.
 L4 ≈ $0.80/hr ⇒ ~$0.013/GPU-min. All-in COGS ≈ **$0.03–0.05 / video-minute**. Basic at
 $0.20 and Pro at $0.75–1.50 leave 80–90%+ gross margin (RapidAPI takes ~20%).
 
+## Step-6 TTS fan-out
+TTS dominates the run: a measured ~235 s of a ~7.8 min job for an 80 s video, because 13
+segments are synthesized serially at ~18 s each. Segments are independent (each target
+comes from its own SRT slot; drift correction compares a segment against its *own* target,
+with no accumulated state), so this parallelizes.
+
+`deploy/tts_fanout.py` shards the segments across `TTSEngine` containers (`modal_app.py`).
+A worker calls the **same** `duration_tts.generate_tts_for_segments` as the serial and
+Kaggle paths, passing the full segment list plus `only_indices` for its shard — so language
+/nfe/reference resolution, the segment signature, drift correction and silence degradation
+are all literally the same code, `i` stays the **global** index, and a run started on one
+backend resumes on the other. Workers never share a manifest: each writes to a private dir
+and returns WAV bytes + entries, which the orchestrator merges as the single writer.
+
+Work maps over **shards, not segments** — a worker's cost is dominated by loading IndicF5,
+so a per-segment map would pay that load per segment.
+
+### What the speedup actually is
+```
+wall ≈ model_load + ceil(n_segments / n_shards) × per_segment
+```
+The floor is `model_load + per_segment`, not zero. For the measured 13-segment clip at
+~18 s/segment with a ~40 s cold model load:
+
+| shards | cold (`MODAL_TTS_WARM=0`) | warm (`MODAL_TTS_WARM≥1`) |
+|---|---|---|
+| 1 (serial today) | ~275 s | ~235 s |
+| 4 | ~112 s | ~72 s |
+| 8 | ~76 s | ~36 s |
+| 13 (one each) | ~58 s | ~18 s |
+
+So the plan's "~30 s" is reachable only with a **warm pool** — cold, the model load sets a
+~58 s floor no matter how wide you fan out. Past ~8 shards the curve flattens while the
+number of model loads keeps rising. These are projections from the measured 18 s/segment,
+**not** measured fan-out numbers; the first real deploy should replace this table.
+
+Fan-out is on by default in the Modal worker. Dials:
+| env | default | effect |
+|---|---|---|
+| `DUBBING_TTS_FANOUT` | `1` | `0` reverts to the in-container supervised path |
+| `MODAL_TTS_MAX_CONTAINERS` | `8` | ceiling on parallel TTS containers |
+| `MODAL_TTS_WARM` | `0` | warm engines; removes the model-load term (costs idle GPU) |
+| `DUBBING_TTS_MAX_SHARDS` | `8` | shards a run is split into |
+| `DUBBING_NFE_STEP` | `32` | diffusion steps; latency ~linear (a per-tier cost dial) |
+
+```bash
+python deploy/test_tts_fanout.py   # CPU tests: sharding, merge, resume/staleness
+```
+
 ## Known next steps
-- **TTS fan-out**: swap in-container serial TTS for a Modal `Cls` + `.map()` across GPU
-  replicas to take the ~235 s TTS stage to ~30 s (see FAN-OUT NOTE in `modal_app.py`).
 - **Get off the free Gemini key** before charging: it rate-limits under concurrent load and
   reselling its output is almost certainly against its ToS. See `PRODUCTION_INFRA_PLAN.md` §4.4
   (self-hosted IndicTrans2, gated on a real per-language quality comparison).

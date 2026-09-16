@@ -122,6 +122,10 @@ def dub_video(job_id: str, input_name: str, target_lang: str = "Hindi", mode: st
         "DUBBING_OUTPUT_DIR": out_dir,
         "DUBBING_TARGET_LANG": target_lang,
         "DUBBING_VOICE_CLONE": mode_to_clone.get(mode, "0"),
+        # Fan Step 6 out across TTSEngine containers instead of synthesizing serially.
+        # Set DUBBING_TTS_FANOUT=0 to fall back to the in-container supervised path.
+        "DUBBING_TTS_BACKEND": ("modal-fanout"
+                                if os.environ.get("DUBBING_TTS_FANOUT", "1") != "0" else ""),
         # GEMINI_API_KEY / HF_TOKEN come from the Modal secret.
         "PYTHONUNBUFFERED": "1",
     })
@@ -201,6 +205,97 @@ def _parse_stage(line: str):
     if m:
         return f"step 6/7 — TTS segment {m.group(1)}/{m.group(2)}"
     return None
+
+
+# ── Step-6 TTS fan-out worker ─────────────────────────────────────────────────────────────
+# TTS is the pipeline's dominant cost (~235 s of a ~7.8 min run for an 80 s video: 13
+# segments serialized at ~18 s each). Segments are independent, so they parallelize. One
+# instance of this class = one container = ONE IndicF5 load serving a whole shard, which is
+# why work is mapped over shards rather than over individual segments (a per-segment map
+# would pay the model load per segment). See deploy/tts_fanout.py for the sharding model.
+TTS_MAX_CONTAINERS = int(os.environ.get("MODAL_TTS_MAX_CONTAINERS", "8"))
+
+
+@app.cls(
+    gpu=GPU_TYPE,
+    volumes=VOLUMES,
+    secrets=secrets,
+    timeout=60 * 20,
+    max_containers=TTS_MAX_CONTAINERS,
+    # SETUP: min_containers=1+ keeps engines warm, which removes the model-load term from
+    # the wall-clock floor (the difference between ~60 s and ~25 s for a short video) at the
+    # cost of paying for idle GPU. Leave 0 for bursty traffic; raise it for a latency SLA.
+    min_containers=int(os.environ.get("MODAL_TTS_WARM", "0")),
+)
+class TTSEngine:
+    @modal.enter()
+    def load(self):
+        """Load IndicF5 ONCE per container, before any shard runs.
+
+        duration_tts caches the model in module globals, so the generate_tts_for_segments
+        call inside synth_shard reuses what we load here instead of loading per shard.
+        """
+        import sys
+        sys.path.insert(0, REPO_MOUNT)
+        os.chdir(REPO_MOUNT)
+        os.environ.update(_env_for_hf())
+        from pipeline.duration_tts import _load_indicf5
+        _load_indicf5("cuda")
+
+    @modal.method()
+    def synth_shard(self, spec: dict) -> dict:
+        """Synthesize this shard's segments and return their WAV bytes + manifest entries.
+
+        Calls the SAME generate_tts_for_segments the serial and Kaggle paths call, with the
+        full segment list and only_indices for this shard, so `i` stays the global index and
+        every resolution rule (language, nfe, reference voice, signature, drift, degradation)
+        is literally the same code. Writes into a PRIVATE directory — workers never share a
+        manifest — and the caller merges as the single writer.
+        """
+        import sys, json, tempfile, traceback
+        sys.path.insert(0, REPO_MOUNT)
+        from pipeline.duration_tts import generate_tts_for_segments, MANIFEST_NAME
+
+        lines: list[str] = []
+        work = tempfile.mkdtemp(prefix="ttsshard_")
+        only = set(spec.get("only_indices") or [])
+
+        ref_path = None
+        if spec.get("reference_bytes"):
+            ref_path = os.path.join(work, spec.get("reference_name") or "reference.wav")
+            with open(ref_path, "wb") as fh:
+                fh.write(spec["reference_bytes"])
+
+        try:
+            generate_tts_for_segments(
+                spec["segments"],
+                target_language=spec["target_language"],
+                output_dir=work,
+                reference_audio_path=ref_path,
+                reference_text=spec.get("reference_text"),
+                device="cuda",
+                log_fn=lines.append,
+                watchdog_mode="thread",   # no supervisor here; Modal's timeout+retry is the outer bound
+                only_indices=only,
+            )
+        except Exception as e:
+            lines.append(f"shard {sorted(only)[:3]}... FAILED: {e}")
+            lines.append(traceback.format_exc()[-1500:])
+
+        # Collect only what this shard actually produced.
+        entries, wavs = {}, {}
+        try:
+            with open(os.path.join(work, MANIFEST_NAME), encoding="utf-8") as fh:
+                entries = {k: v for k, v in json.load(fh).items() if int(k) in only}
+        except Exception:
+            pass
+        for i in sorted(only):
+            p = os.path.join(work, f"segment_{i:04d}.wav")
+            if os.path.exists(p) and os.path.getsize(p) > 44:
+                with open(p, "rb") as fh:
+                    wavs[str(i)] = fh.read()
+
+        return {"entries": entries, "wavs": wavs, "log": lines[-80:]}
 
 
 # ── FastAPI gateway, served by Modal ──────────────────────────────────────────────────────
