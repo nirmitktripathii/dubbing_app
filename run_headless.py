@@ -44,6 +44,7 @@ from pipeline.source_separation import separate_audio
 from pipeline.isochrony_translation import translate_segments_isochrony
 from pipeline.voice_manager import extract_reference_clip
 from pipeline.tts_supervisor import generate_tts_supervised
+from pipeline.voice_conversion import convert_segments_timbre
 
 VIDEO_EXTS = (".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v")
 
@@ -68,6 +69,47 @@ def _find_input_video():
         "No input video found. Set DUBBING_INPUT_VIDEO, or attach a dataset with a video "
         "under /kaggle/input."
     )
+
+
+def _voice_mode(raw):
+    """Map DUBBING_VOICE_CLONE to a voice path: 'basic' | 'vc' | 'xlingual'.
+
+    0/basic/off      -> native TTS voice, no cloning (clean, ships today; safe default).
+    2/vc             -> PREMIUM: native TTS + Step-6.5 voice conversion (clone timbre).
+    1/xlingual/clone -> DEPRECATED cross-lingual TTS conditioning (the onset-babble path).
+    """
+    v = (raw or "").strip().lower()
+    if v in ("0", "basic", "off", "false", "no", ""):
+        return "basic"
+    if v in ("2", "vc"):
+        return "vc"
+    if v in ("1", "xlingual", "clone", "premium", "true", "yes"):
+        return "xlingual"
+    return "basic"
+
+
+def _ordered_segment_paths(tts_dir, n):
+    """Resolve the ordered per-segment WAV paths for VC, preferring the TTS manifest.
+
+    Manifest paths may be absolute for the environment that wrote them (e.g. /kaggle/...);
+    fall back to the tts_dir basename, then to the segment_NNNN.wav naming convention.
+    """
+    paths = []
+    try:
+        with open(os.path.join(tts_dir, "tts_manifest.json"), encoding="utf-8") as fh:
+            m = json.load(fh)
+        for i in range(n):
+            e = m.get(str(i))
+            p = e.get("path") if isinstance(e, dict) else None
+            if p and not os.path.exists(p):
+                p = os.path.join(tts_dir, os.path.basename(p))
+            if p and os.path.exists(p):
+                paths.append(p)
+    except Exception:
+        pass
+    if len(paths) != n:
+        paths = [os.path.join(tts_dir, f"segment_{i:04d}.wav") for i in range(n)]
+    return paths
 
 
 def main():
@@ -183,30 +225,38 @@ def main():
         generate_srt(translated_segments, translated_srt_path)
 
         # ── Step 5: Voice reference extraction ────────────────────────────
-        ref_audio_path = None
+        # Voice path is selected by DUBBING_VOICE_CLONE (see _voice_mode):
+        #   basic    -> native TTS voice (reference=None). Clean, generic, ships today.
+        #   vc       -> PREMIUM: native TTS (clean Hindi) + Step-6.5 voice conversion that
+        #               transfers the SOURCE speaker's timbre onto the clean Hindi. No
+        #               cross-lingual TTS conditioning, so no onset babble.
+        #   xlingual -> DEPRECATED: English reference fed straight into IndicF5. This is the
+        #               cross-lingual path proven to produce onset babble; kept only for A/B.
+        # Default is Basic — the pipeline never silently emits the garbled cross-lingual voice.
+        ref_audio_path = None      # passed to TTS (only in the deprecated xlingual path)
         ref_text = None
-        # DUBBING_VOICE_CLONE=0 forces Basic mode: duration_tts uses a native Hindi reference
-        # instead of cloning the source (English) speaker. This is the in-language control that
-        # isolates the cross-lingual onset-babble cause — IndicF5 is Indic-trained, so an English
-        # ref (audio+text) destabilizes its onset when generating Hindi. Basic mode both proves
-        # that cause (if the babble vanishes) and ships a clean, generic-voice dub. Default "1"
-        # keeps voice cloning on (premium mode), unchanged.
-        voice_clone = os.environ.get("DUBBING_VOICE_CLONE", "1").strip().lower() not in ("0", "false", "no", "")
-        if not voice_clone:
-            log("Step 5/7: voice cloning DISABLED (DUBBING_VOICE_CLONE=0) — Basic mode (native Hindi reference).")
-        elif vocals_path and os.path.exists(vocals_path):
-            log("Step 5/7: Extracting reference voice clip...")
-            ref_audio_path = os.path.join(temp_dir, "voice_reference.wav")
-            try:
-                ref_audio_path, ref_text = extract_reference_clip(
-                    vocals_path, ref_audio_path, segments=segments, log_fn=log
-                )
-            except Exception as e:
-                log(f"  WARNING: voice extraction failed: {e}. Falling back to basic voice.")
-                ref_audio_path = None
-                ref_text = None
+        vc_target_path = None      # speaker reference consumed by the Step-6.5 VC pass
+        mode = _voice_mode(os.environ.get("DUBBING_VOICE_CLONE", "0"))
+        if mode == "basic":
+            log("Step 5/7: Basic mode (DUBBING_VOICE_CLONE=0) — native TTS voice, no cloning.")
+        elif not (vocals_path and os.path.exists(vocals_path)):
+            log(f"Step 5/7: {mode} mode requested but no vocals track — falling back to Basic voice.")
+            mode = "basic"
         else:
-            log("Step 5/7: skipped (no vocals track).")
+            log(f"Step 5/7: Extracting reference voice clip ({mode} mode)...")
+            _ref_path = os.path.join(temp_dir, "voice_reference.wav")
+            try:
+                _ref_path, _ref_text = extract_reference_clip(
+                    vocals_path, _ref_path, segments=segments, log_fn=log
+                )
+                if mode == "xlingual":
+                    ref_audio_path, ref_text = _ref_path, _ref_text   # -> straight into TTS
+                    log("  WARNING: xlingual mode is DEPRECATED (cross-lingual onset babble).")
+                else:  # vc: keep the clip as the VC target; TTS stays native (ref=None)
+                    vc_target_path = _ref_path
+            except Exception as e:
+                log(f"  WARNING: voice extraction failed: {e}. Falling back to Basic voice.")
+                mode = "basic"
 
         # ── Step 6: Duration-controlled TTS (SUPERVISED subprocess) ───────
         log(f"Step 6/7: Supervised IndicF5 TTS for {len(translated_segments)} segments...")
@@ -219,6 +269,25 @@ def main():
             reference_text=ref_text,
             log_fn=log,
         )
+
+        # ── Step 6.5: Voice conversion (PREMIUM cloning path) ──────────────
+        # Clone the source speaker's timbre onto the clean native-TTS Hindi. VC is
+        # duration-preserving, so the isochrony achieved in Step 6 survives to the sample.
+        # Degrades to a visible pass-through (native voice) if the VC backend is unavailable —
+        # it never crashes a render.
+        if mode == "vc" and vc_target_path:
+            log("Step 6.5/7: Voice conversion — cloning source speaker onto clean Hindi...")
+            seg_paths = _ordered_segment_paths(tts_dir, len(translated_segments))
+            vc_stats = convert_segments_timbre(seg_paths, vc_target_path, log_fn=log)
+            n_ok = len(vc_stats.get("converted", []))
+            n_pt = len(vc_stats.get("passthrough", []))
+            n_fail = len(vc_stats.get("failed", []))
+            if n_ok == 0:
+                log(f"  WARNING: voice conversion converted 0 segment(s) "
+                    f"(pass-through={n_pt}, failed={n_fail}); output is the native TTS voice.")
+            else:
+                log(f"  Voice conversion: {n_ok} converted, {n_pt} pass-through, {n_fail} failed "
+                    f"(backend={vc_stats.get('backend')}).")
 
         # ── Step 7: Assembly + video merge ────────────────────────────────
         log("Step 7/7: Assembling audio and merging video...")

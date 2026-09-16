@@ -325,6 +325,9 @@ _PIPELINE_FILES = [
     # internally), so no Kaggle glob-path adaptation is needed like duration_tts.py.
     "tts_worker.py",
     "tts_supervisor.py",
+    # Step-6.5 voice-conversion cloning path (mode "vc" / DUBBING_VOICE_CLONE=2). Pure
+    # torch/torchaudio, backend-agnostic; no Kaggle path adaptation needed.
+    "voice_conversion.py",
 ]
 _UTILS_FILES = [
     "audio_extraction.py",
@@ -363,13 +366,23 @@ def _make_app_cell(base):
 
 
 def _make_headless_runner_cell(base):
-    """Batch mode — write run_headless.py (the no-UI batch driver) to /kaggle/working."""
-    content = _read(os.path.join(base, "run_headless.py"))
+    """Batch mode — write the two no-UI batch files to /kaggle/working:
+      * run_headless.py — the Steps 1-7 driver Step 10 executes.
+      * zip_output.py   — the post-run packager Step 11 calls to bundle the whole
+                          output folder into one downloadable .zip.
+    zip_output.py is embedded from kaggle/zip_output.py (single source of truth), so
+    the baked-in version and the standalone paste-into-a-cell version are identical."""
+    runner = _read(os.path.join(base, "run_headless.py"))
+    zipper = _read(os.path.join(base, "kaggle", "zip_output.py"))
     return (
         _make_write_helper()
-        + "\nprint('Writing headless batch driver (run_headless.py)...')\n"
-        + f"_write_file('/kaggle/working/run_headless.py', {repr(content)})\n"
-        + "print('run_headless.py written.')\n"
+        + "\nprint('Writing batch driver + output packager...')\n"
+        + f"_write_file('/kaggle/working/run_headless.py', {repr(runner)})\n"
+        + f"_write_file('/kaggle/working/zip_output.py', {repr(zipper)})\n"
+        + "_zsrc = open('/kaggle/working/zip_output.py', encoding='utf-8').read()\n"
+        + "assert 'def zip_dubbing_output' in _zsrc, 'zip_output.py write looks truncated'\n"
+        + "print('  sanity ✓ zip_dubbing_output present')\n"
+        + "print('run_headless.py + zip_output.py written.')\n"
     )
 
 
@@ -1045,40 +1058,81 @@ os.environ.setdefault("DUBBING_OUTPUT_DIR", "/kaggle/working/dubbing_output")
 # os.environ["DUBBING_INPUT_VIDEO"] = "/kaggle/input/<your-dataset>/<video>.mp4"
 
 # ── RUN SELECTOR — pick ONE. This is the ONLY line you change between runs. ──────
-# The residual "~1-2s garbled audio at the start of every segment" is IndicF5 onset
-# instability from CROSS-LINGUAL cloning (English reference -> Hindi target). Modes:
-#   "premium" — clone the English speaker (original behaviour; THIS is what babbles).
-#   "basic"   — RUN 1 control: native HINDI reference, English voice NOT cloned. If the
-#               babble vanishes, the cross-lingual cause is proven. (Generic Hindi voice.)
-#   "primer"  — RUN 2 fix: clone the English speaker BUT prepend a throwaway Hindi primer
-#               that absorbs the onset babble, then slice it off. Keeps the speaker's voice.
-RUN = "basic"     # <── change to "basic" / "primer" / "premium"
+# The "garbled/babbling dubbed audio" was IndicF5 onset instability from CROSS-LINGUAL
+# cloning (English reference -> Hindi target): an English ref audio+text destabilizes the
+# flow-matching alignment across the WHOLE utterance, not just at t=0. Proven by A/B:
+# "basic" (no external ref) is clean; "premium"/"primer" (English ref) babble. The primer
+# (prepend+slice a Hindi word) does NOT fix distributed babble and can't be sliced cleanly
+# -> RETIRED. The real cloning path is "vc": synth clean native Hindi, THEN convert timbre
+# to the source speaker in a separate, duration-preserving pass (no cross-lingual TTS).
+# Modes:
+#   "basic"   — native HINDI reference, English voice NOT cloned. Clean. The shippable default.
+#   "vc"      — CLONING (the fix): native Hindi TTS + Step-6.5 voice-conversion to the English
+#               speaker's timbre (knn-vc). Keeps the speaker's voice AND stays clean. Needs
+#               INTERNET on (torch.hub pulls knn-vc + WavLM) — the deps cell pre-warms it.
+#   "premium" — clone the English speaker via cross-lingual TTS (the babbling baseline; kept
+#               only to reproduce the failure). DO NOT use for a real dub.
+#   "primer"  — RETIRED failed experiment (cross-lingual + Hindi primer). Kept for the record.
+RUN = "vc"     # <── "basic" (clean, generic voice) / "vc" (clean, cloned voice) / "premium"/"primer" (broken)
 
 # Explicit assignment (NOT setdefault) so the value ALWAYS takes, even if the config cell
 # was already run once this kernel session. setdefault silently no-ops on a re-run and is
 # how a "basic" edit can still execute as premium.
-_MODES = {"premium": ("1", "0"), "basic": ("0", "0"), "primer": ("1", "1")}
+# (DUBBING_VOICE_CLONE, DUBBING_TTS_PRIMER):  0=basic native, 1=cross-lingual, 2=native+VC.
+_MODES = {"basic": ("0", "0"), "vc": ("2", "0"), "premium": ("1", "0"), "primer": ("1", "1")}
 if RUN not in _MODES:
     raise SystemExit(f"RUN={RUN!r} invalid — pick one of {list(_MODES)}")
 os.environ["DUBBING_VOICE_CLONE"], os.environ["DUBBING_TTS_PRIMER"] = _MODES[RUN]
+os.environ.setdefault("DUBBING_VC_BACKEND", "knn-vc")   # Step-6.5 backend for mode "vc"
 print("=" * 64)
 print(f"  RUN MODE = {RUN.upper()}   "
       f"(DUBBING_VOICE_CLONE={os.environ['DUBBING_VOICE_CLONE']}, "
       f"DUBBING_TTS_PRIMER={os.environ['DUBBING_TTS_PRIMER']})")
 if RUN == "basic":
-    print("  -> native HINDI reference; English voice NOT cloned.")
+    print("  -> native HINDI reference; English voice NOT cloned. Clean, generic voice.")
     print("  -> CONFIRM in the log within ~1 min: 'voice cloning DISABLED' then")
     print("     'Mode: Basic' then 'Default reference voice resolved to: ...HIN_M_HAPPY...'")
-    print("  -> If you instead see 'Extracting reference voice clip' / 'Mode: Premium',")
-    print("     STOP — it is cloning English again.")
-elif RUN == "primer":
-    print("  -> clone English speaker + Hindi primer absorbs the onset babble.")
-    print("  -> CONFIRM in the log: 'Mode: Premium' AND '[primer] ... sliced primer'.")
+elif RUN == "vc":
+    print("  -> native Hindi TTS (clean) + Step-6.5 voice-conversion to the English speaker.")
+    print(f"  -> VC backend: {os.environ['DUBBING_VC_BACKEND']} (knn-vc via torch.hub).")
+    print("  -> CONFIRM in the log: TTS runs native ('Mode: Basic', NOT 'Premium'), then after")
+    print("     Step 6 you see 'Step 6.5/7: Voice conversion', '[VC] Converting N segment(s)',")
+    print("     '[VC] [i/N] ... converted.', and '[VC] Done ... N converted, 0 pass-through'.")
+    print("  -> If instead you see '[VC] WARNING: could not load backend' and the Done line")
+    print("     shows 'N pass-through', VC did NOT run (internet off / hub fetch failed) —")
+    print("     the audio will be clean-but-Basic (generic voice), not cloned.")
 else:
-    print("  -> clones the English speaker; this is the babbling baseline.")
-    print("  -> CONFIRM in the log: 'Mode: Premium'.")
+    print("  -> CROSS-LINGUAL cloning: this is the BROKEN/babbling baseline. Use 'vc' instead.")
+    print("  -> CONFIRM in the log: 'Mode: Premium'"
+          + (" AND '[primer] ... sliced primer'." if RUN == "primer" else "."))
 print("=" * 64)
-# Optional primer tuning (defaults are fine for the first run):
+
+# ── Pre-warm the VC backend (mode "vc" only) ────────────────────────────────────
+# knn-vc loads via torch.hub (pulls the bshall/knn-vc repo + WavLM + HiFiGAN). The
+# Step-6.5 VC pass degrades to a SILENT pass-through (clean but generic voice) if that
+# fetch fails — which for a *validation* run is a wasted ~8-min GPU session that looks
+# like "cloning did nothing". So warm it HERE (CPU is fine; it only populates the cache)
+# and fail FAST if it can't load, before any GPU work. Uses the identical torch.hub call
+# as pipeline/voice_conversion.py so the cache it warms is the one Step 6.5 reuses.
+if RUN == "vc" and os.environ.get("DUBBING_VC_BACKEND", "knn-vc").lower() == "knn-vc":
+    print("Pre-warming knn-vc (torch.hub: bshall/knn-vc + WavLM + HiFiGAN)...")
+    try:
+        import torch as _torch
+        _m = _torch.hub.load("bshall/knn-vc", "knn_vc",
+                             prematched=True, trust_repo=True, pretrained=True, device="cpu")
+        del _m
+        print("  ✓ knn-vc loaded and cached — Step 6.5 will convert timbre (not pass-through).")
+    except Exception as _e:
+        print(f"  ✗ knn-vc failed to load: {type(_e).__name__}: {str(_e)[-300:]}")
+        print("    In mode 'vc' this means Step 6.5 would SILENTLY pass through (generic voice),")
+        print("    wasting the GPU run. Most likely cause: this notebook has INTERNET OFF")
+        print("    (Settings → Internet → on) so torch.hub can't fetch the repo/weights.")
+        raise SystemExit("Aborting before GPU work: VC backend unavailable in mode 'vc'. "
+                         "Enable Internet and re-run, or set RUN='basic' for a generic voice.")
+
+# Optional VC tuning (mode "vc"):
+# os.environ["DUBBING_VC_TOPK"] = "4"       # knn-vc neighbours (higher = smoother, less identity)
+# Optional primer tuning (RETIRED mode "primer" only):
 # os.environ["DUBBING_TTS_PRIMER_TEXT"]   = "नमस्ते।"   # throwaway Hindi utterance (ends in danda)
 # os.environ["DUBBING_TTS_PRIMER_BUDGET"] = "1.0"      # seconds of fix_duration given to the primer
 
@@ -1176,9 +1230,42 @@ if os.path.isdir(_out):
         _p = os.path.join(_out, _f)
         if os.path.isfile(_p):
             print(f"  {_f}  ({os.path.getsize(_p)/1024:.1f} KB)")
-# A non-zero exit raises so a "Save & Run All" commit is marked FAILED (not silently green).
+
+# Stash the exit code for the next cell. We deliberately do NOT raise here: Step 11 zips the
+# output FIRST (a failed run's pipeline_log.txt is exactly what you want to download and read),
+# then re-raises this code LAST so a "Save & Run All" commit is still marked FAILED rather than
+# silently green.
+HEADLESS_RC = rc
 if rc != 0:
-    raise SystemExit(f"Headless run failed with exit code {rc} — see the log above.")
+    print(f"\n⚠ Non-zero exit ({rc}). Step 11 will still zip the partial output + log, "
+          "then mark the commit FAILED.")
+"""
+
+CELL_HEADLESS_ZIP = r"""import os, sys
+
+# Make sure /kaggle/working (where Step 8 wrote zip_output.py) is importable in-kernel.
+os.chdir("/kaggle/working")
+if "/kaggle/working" not in sys.path:
+    sys.path.insert(0, "/kaggle/working")
+
+# ── Package the whole run into ONE .zip under /kaggle/working for download ───────────────
+# Runs whether the pipeline SUCCEEDED or FAILED — a failed run's pipeline_log.txt is exactly
+# what you want to pull down and read, so it must make it into the archive. The deferred
+# failure from Step 10 is re-raised at the very END, so the zip is always produced first.
+#
+# LEAN toggle: False = zip EVERYTHING (final video/audio/subs/log + per-segment TTS WAVs +
+# Demucs stems). True = only the deliverables (video, audio, subtitles, log, manifest) — much
+# smaller; flip it when a long video makes the full archive too big for /kaggle/working.
+ZIP_LEAN = False   # ← set True for a deliverables-only archive
+
+from zip_output import zip_dubbing_output
+zip_dubbing_output(lean=ZIP_LEAN)
+
+# Re-raise the deferred pipeline failure LAST, so the archive above is always produced.
+_rc = globals().get("HEADLESS_RC", 0)
+if _rc != 0:
+    raise SystemExit(f"Headless run failed with exit code {_rc} — download the .zip above "
+                     "and read pipeline_log.txt to diagnose.")
 """
 
 
@@ -1257,11 +1344,13 @@ def main(mode="app"):
     ]
 
     if mode == "batch":
-        # Headless batch: write the no-UI driver, configure the run, execute it. No
-        # Streamlit, no Cloudflare tunnel — outputs land in /kaggle/working and a
+        # Headless batch: write the no-UI driver, configure the run, execute it, then zip the
+        # output. No Streamlit, no Cloudflare tunnel — outputs land in /kaggle/working and a
         # "Save & Run All" commit persists them. This is the validation vehicle.
         cells += [
-            step_md("Step 8 — Write the headless batch driver (`run_headless.py`)"),
+            step_md("Step 8 — Write the batch driver + output packager",
+                    "`run_headless.py` (the Steps 1-7 driver) and `zip_output.py` "
+                    "(Step 11's one-click output packager)."),
             code_cell(_make_headless_runner_cell(base)),
             step_md("Step 9 — Configure the batch run",
                     "Sets target language / Whisper model / Demucs and locates the input "
@@ -1269,9 +1358,16 @@ def main(mode="app"):
             code_cell(CELL_HEADLESS_CONFIG),
             step_md("Step 10 — Run the pipeline end-to-end (headless)",
                     "Runs Steps 1-7 in this kernel; Step 6 (IndicF5) runs in a supervised "
-                    "subprocess that is killed + relaunched if it wedges. A non-zero exit "
-                    "fails the commit, so a broken run is never a silent green."),
+                    "subprocess that is killed + relaunched if it wedges. A non-zero exit is "
+                    "remembered and re-raised in Step 11, so a broken run still fails the "
+                    "commit — after its log has been zipped for download."),
             code_cell(CELL_HEADLESS_RUN),
+            step_md("Step 11 — Zip the output for download",
+                    "Bundles the whole run into one `.zip` under `/kaggle/working` and prints "
+                    "the download paths. Runs even if Step 10 failed, so the log is always "
+                    "downloadable. Set `ZIP_LEAN = True` in the cell for a deliverables-only "
+                    "archive when a long video makes the full zip too big."),
+            code_cell(CELL_HEADLESS_ZIP),
         ]
     else:
         # Interactive app: Streamlit + Cloudflare tunnel (the original live-UI flow).
@@ -1350,6 +1446,8 @@ def _generate_large_files_module():
         # Step-6 process-isolation freeze fix (cross-platform, no adaptation needed).
         (os.path.join(base, "pipeline", "tts_worker.py"),            f"{WORK_DIR}/pipeline/tts_worker.py"),
         (os.path.join(base, "pipeline", "tts_supervisor.py"),        f"{WORK_DIR}/pipeline/tts_supervisor.py"),
+        # Step-6.5 voice-conversion cloning path (mode "vc").
+        (os.path.join(base, "pipeline", "voice_conversion.py"),      f"{WORK_DIR}/pipeline/voice_conversion.py"),
         (os.path.join(base, "utils", "transcription.py"),            f"{WORK_DIR}/utils/transcription.py"),
         (os.path.join(base, "utils", "audio_sync.py"),               f"{WORK_DIR}/utils/audio_sync.py"),
     ]
