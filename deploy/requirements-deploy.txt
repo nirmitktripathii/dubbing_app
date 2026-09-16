@@ -1,0 +1,13 @@
+# Deploy-layer deps (API + UI), on TOP of the pipeline's ../requirements.txt.
+# These are the packages the Modal gateway / Streamlit UI need beyond the pipeline itself.
+#
+# VERSION PIN (important): fastapi <0.129 + pydantic 2.12 trips a
+# "TypeAdapter[...UploadFile...] is not fully defined" error at request time (pydantic 2.12
+# changed TypeAdapter forward-ref building; this fastapi predates support). Pin a known-good
+# combo so multipart file upload works on the deployed image.
+fastapi>=0.115,<0.129
+pydantic>=2.9,<2.12
+python-multipart>=0.0.9
+requests>=2.31
+# streamlit is already pinned in ../requirements.txt (1.57.0).
+# modal is installed on the deploy host, not in the image.
