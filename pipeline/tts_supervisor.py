@@ -95,6 +95,20 @@ LOADING_FATAL_STRIKES = 3
 # small helpers
 # ---------------------------------------------------------------------------
 
+def _json_default(o):
+    """Coerce a numpy scalar (bool_ / int64 / float64 / …) to its native Python type so
+    json.dump can serialize a segment dict that carries one. The upstream gates write
+    fields like ``gates_passed`` from numpy comparisons (``sim >= threshold`` -> numpy.bool_),
+    and numpy.bool_/numpy.int64 are NOT JSON-serializable (unlike numpy.float64, which
+    subclasses float) — so without this the job-spec write crashes before the worker even
+    launches. Applied as the ``default=`` hook, it fires ONLY for values the stdlib encoder
+    rejects. Mirrors app.py's identical helper so the headless and Streamlit paths agree."""
+    import numpy as _np
+    if isinstance(o, _np.generic):
+        return o.item()
+    raise TypeError(f"not JSON-serializable: {type(o)}")
+
+
 def _resolve_nfe_step(nfe_step: Optional[int], emit) -> int:
     """Resolve nfe_step EXACTLY as generate_tts_for_segments does (arg > env > 32, clamp
     >=1). Must match, because we feed this same value both to the worker (in the job spec)
@@ -279,12 +293,19 @@ def generate_tts_supervised(
 
     def emit(msg: str):
         t = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-        print(f"[{t}] {msg}", flush=True)
         if log_fn is not None:
+            # log_fn owns BOTH the durable file and the (hardened, non-blocking) console
+            # mirror. Do NOT also raw-print here: under a headless run the parent's stdout is
+            # a rate-limited Kaggle pipe, and a second blocking print per line would double
+            # that volume AND re-introduce the wedge log_fn was hardened to avoid (a full
+            # stdout pipe freezing the whole run after synthesis already finished). Standalone
+            # (no log_fn — e.g. the no-GPU tests) still prints so output is visible.
             try:
                 log_fn(f"  {msg}")
             except Exception:
                 pass
+        else:
+            print(f"[{t}] {msg}", flush=True)
 
     lang_code = LANGUAGE_TO_CODE.get(target_language)
     if not lang_code:
@@ -328,7 +349,7 @@ def generate_tts_supervised(
         "heartbeat_path": heartbeat_path,
     }
     with open(spec_path, "w", encoding="utf-8") as fh:
-        json.dump(spec, fh, ensure_ascii=False)
+        json.dump(spec, fh, ensure_ascii=False, default=_json_default)
 
     emit(
         f"[supervisor] Supervising {n_total} segment(s): lang={target_language} nfe={nfe_step} "

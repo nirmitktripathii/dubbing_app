@@ -891,7 +891,8 @@ def _evaluate_candidates(
         rate_penalty = 0.0
         if pps > MAX_PHONEME_DENSITY:
             rate_penalty = (pps - MAX_PHONEME_DENSITY) * 0.5
-        rate_ok = (pps <= MAX_PHONEME_DENSITY) if pps > 0 else True
+        # bool(...) so a numpy.bool_ (pps is a numpy float) never reaches a JSON dump downstream.
+        rate_ok = bool(pps <= MAX_PHONEME_DENSITY) if pps > 0 else True
 
         records.append({
             "text": cand,
@@ -947,7 +948,11 @@ def _select_best(records: list, semantic_threshold: float, phoneme_tolerance: fl
     sem_ok = best["sem"] is None or best["sem"] >= semantic_threshold
     phon_ok = best["rel_diff"] <= phoneme_tolerance
     rate_ok = best.get("rate_ok", True)
-    return best, (sem_ok and phon_ok and rate_ok)
+    # bool(...) so the returned `satisfied` (stored as each segment's gates_passed) is a
+    # native Python bool, not a numpy.bool_ — the latter is not JSON-serializable and was
+    # crashing the Step-6 job-spec write. Cleaning it here keeps every downstream JSON
+    # boundary (TTS spec, resume manifest, translation cache) safe at the source.
+    return best, bool(sem_ok and phon_ok and rate_ok)
 
 
 # ---------------------------------------------------------------------------

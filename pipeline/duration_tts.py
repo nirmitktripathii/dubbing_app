@@ -832,6 +832,19 @@ def _load_manifest(path: str) -> dict:
         return {}
 
 
+def _json_default(o):
+    """Coerce a numpy scalar (bool_ / int64 / float64 / …) to its native Python type so
+    json.dump can serialize a manifest entry that carries one — segment metadata can pick up
+    a numpy.bool_/numpy.int64 from an upstream gate comparison, and those are NOT
+    JSON-serializable (unlike numpy.float64, which subclasses float). Applied as the
+    ``default=`` hook, it fires ONLY for values the stdlib encoder rejects. Mirrors the
+    identical helpers in app.py and tts_supervisor.py."""
+    import numpy as _np
+    if isinstance(o, _np.generic):
+        return o.item()
+    raise TypeError(f"not JSON-serializable: {type(o)}")
+
+
 def _save_manifest_atomic(path: str, manifest: dict) -> None:
     """Write the manifest to a temp file then os.replace() it, so a kill mid-write can
     never leave a half-written (unparseable) manifest that would defeat resume."""
@@ -842,7 +855,7 @@ def _save_manifest_atomic(path: str, manifest: dict) -> None:
     try:
         tmp = f"{path}.{uuid.uuid4().hex[:8]}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(manifest, f, ensure_ascii=False, indent=0)
+            json.dump(manifest, f, ensure_ascii=False, indent=0, default=_json_default)
         os.replace(tmp, path)
     except Exception as e:
         print(f"  [Manifest] WARNING: could not persist resume manifest: {e}", flush=True)
@@ -949,7 +962,8 @@ def generate_tts_for_segments(
         try:
             tmp = f"{heartbeat_path}.{os.getpid()}.tmp"
             with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump({"phase": phase, "seg": seg, "done": done, "ts": time.time()}, fh)
+                json.dump({"phase": phase, "seg": seg, "done": done, "ts": time.time()}, fh,
+                          default=_json_default)
             os.replace(tmp, heartbeat_path)
         except Exception:
             pass

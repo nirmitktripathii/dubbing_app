@@ -31,6 +31,8 @@ import os
 import sys
 import json
 import time
+import queue
+import threading
 import traceback
 from datetime import datetime
 
@@ -76,13 +78,47 @@ def main():
 
     logf = open(os.path.join(out_dir, "pipeline_log.txt"), "a", encoding="utf-8")
 
+    # ── Console sink: a NON-BLOCKING mirror of the durable log ──────────────────────────
+    # The source of truth is pipeline_log.txt (written+flushed synchronously in log() below).
+    # The live console is only a best-effort mirror. On Kaggle this process is launched by the
+    # notebook cell via subprocess.run WITHOUT a stdout pipe of its own, so it inherits the
+    # KERNEL's stdout — a ~64 KB OS pipe drained by Kaggle's output relay (IOPub, rate-limited).
+    # If that relay stops draining (rate-limit trip, disconnected tab), the pipe fills and a
+    # blocking print() wedges every thread that logs. That is exactly how a run whose TTS had
+    # ALREADY finished all segments hung after "Segment 12/13" with no Step 7 and a log that
+    # stopped mid-line: print() blocked BEFORE the file write, freezing the cell and the file
+    # at the same point. So console writes go through a bounded queue drained by a daemon
+    # thread; if the console stalls we DROP console lines (never block) while the file keeps
+    # every line. Project rule 3: Kaggle only publishes the log at session end anyway — the
+    # live channel is W&B / the on-disk file, not this mirror.
+    _console_q: "queue.Queue" = queue.Queue(maxsize=2000)
+
+    def _console_writer():
+        while True:
+            item = _console_q.get()
+            if item is None:
+                break
+            try:
+                sys.stdout.write(item)
+                sys.stdout.flush()
+            except Exception:
+                pass
+
+    threading.Thread(target=_console_writer, name="console-sink", daemon=True).start()
+
     def log(msg=""):
         line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
-        print(line, flush=True)
+        # 1) Durable file FIRST — must never be lost to a stalled console; flush so a killed
+        #    session still has the tail on disk.
         try:
             logf.write(line + "\n")
             logf.flush()
         except Exception:
+            pass
+        # 2) Best-effort live mirror — non-blocking; drop under backpressure, never wedge.
+        try:
+            _console_q.put_nowait(line + "\n")
+        except queue.Full:
             pass
 
     target_lang = os.environ.get("DUBBING_TARGET_LANG", "Hindi").strip() or "Hindi"

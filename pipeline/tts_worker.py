@@ -106,4 +106,20 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    _rc = main()
+    # Flush, then HARD-exit on the clean path. A normal sys.exit() runs interpreter shutdown,
+    # which joins non-daemon threads — and torch/CUDA/IndicF5 can leave a lingering non-daemon
+    # thread that never returns, hanging the worker at exit AFTER every segment is already on
+    # disk. That would strand the supervisor waiting on a done-but-not-exiting child until its
+    # 240 s stall watchdog kills it (a needless 4-min stall) — or, if the parent is itself
+    # wedged, forever. All progress is durably on disk (per-segment WAVs + manifest), so
+    # skipping interpreter shutdown loses nothing. Error paths keep sys.exit so tracebacks and
+    # atexit hooks still run for diagnosis.
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+    if _rc == 0:
+        os._exit(0)
+    sys.exit(_rc)
