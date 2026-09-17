@@ -40,10 +40,17 @@ GPU_TYPE = os.environ.get("MODAL_GPU", "L4")   # SETUP: L4 fits Whisper+Demucs+I
 # notebook does (sys.path.insert(0, ...)), so `from run_headless import main` resolves.
 REPO_MOUNT = "/root/app"
 
-# ── Image: system ffmpeg + espeak-ng, pinned python deps, model weights on a Volume ───────
+# ── Image: mirrors the PROVEN Kaggle environment ──────────────────────────────────────────
+# The Kaggle notebook (kaggle/build_notebook.py) is the reference for what a working IndicF5
+# environment needs; this reproduces its install sequence so the image doesn't build clean
+# and then die at Step 6. The fragile parts (why each step is here) are called out inline.
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .apt_install("ffmpeg", "espeak-ng", "git")
+    # Same system packages the Kaggle deps cell installs. rubberband-cli is NOT optional:
+    # pyrubberband (drift correction) shells out to the `rubberband` binary. fonts-noto gives
+    # libass real glyphs for Indic subtitle burn-in; libsndfile1 backs soundfile.
+    .apt_install("ffmpeg", "rubberband-cli", "espeak-ng", "fonts-noto", "libsndfile1", "git")
+    # Pinned core: numpy 1.26.4 / scipy 1.13.1 / transformers 4.57.6 — the fragile ABI set.
     .pip_install_from_requirements("requirements.txt")
     # API/UI deps + a PINNED fastapi/pydantic combo (see deploy/requirements-deploy.txt):
     # fastapi<0.129 + pydantic 2.12 breaks multipart UploadFile parsing.
@@ -51,9 +58,19 @@ image = (
     # torch/torchaudio are platform-specific and not pinned in requirements; install the CUDA
     # build explicitly for Modal's GPUs. knn-vc (Step 6.5) pulls WavLM+HiFiGAN from torch.hub.
     .pip_install("torch==2.5.1", "torchaudio==2.5.1", index_url="https://download.pytorch.org/whl/cu121")
+    # IndicF5 is NOT on PyPI — it installs from source, and f5-tts MUST precede it (IndicF5
+    # depends on it). vocos is F5-TTS's vocoder. Mirrors the Kaggle deps cell.
+    .pip_install("f5-tts", "vocos", "safetensors")
+    .pip_install("git+https://github.com/ai4bharat/IndicF5.git")
+    # Re-assert the two pins LAST. f5-tts / IndicF5 can drag transformers to 5.x (the IndicF5
+    # meta-tensor crash) and pull a numpy-2.x wheel (dtype-size ABI error at model load).
+    # Order matters: a transformers (re)install can itself pull numpy 2.x, so numpy is forced
+    # back last, exactly as the Kaggle notebook does it.
+    .pip_install("transformers<5.0.0")
+    .run_commands("python -m pip install --force-reinstall --no-deps numpy==1.26.4")
     .add_local_dir(".", REPO_MOUNT, copy=True,
-                   ignore=["dubbing_output*", "*.zip", "*.mp4", "*.wav", ".git", "graphify-out",
-                           "**/__pycache__", ".claude"])
+                   ignore=["dubbing_output*", "*.zip", "*.mp4", "*.mkv", "*.mov", "*.wav",
+                           ".git", "graphify-out", "**/__pycache__", ".claude"])
 )
 
 app = modal.App(APP_NAME, image=image)
@@ -74,13 +91,87 @@ VOLUMES = {CACHE_DIR: hf_cache, JOBS_DIR: jobs_vol}
 
 
 def _env_for_hf():
-    # Point every HF/torch cache at the Volume so weights persist across cold starts.
-    return {
-        "HF_HOME": CACHE_DIR,
-        "HUGGINGFACE_HUB_CACHE": f"{CACHE_DIR}/hub",
-        "TORCH_HOME": f"{CACHE_DIR}/torch",
-        "TRANSFORMERS_CACHE": f"{CACHE_DIR}/transformers",
-    }
+    # duration_tts hard-globs ~/.cache/huggingface/modules/... for the IndicF5 remote-code
+    # model.py, and knn-vc (Step 6.5) pulls WavLM/HiFiGAN via torch.hub's ~/.cache/torch —
+    # BOTH keyed off $HOME. So point HOME at the persistent Volume: every weight, remote-code
+    # module and hub download then lands under /cache/hf, survives cold starts, AND resolves
+    # at the exact path the glob expects. This is the layout Kaggle relies on (HOME=/root by
+    # default). Setting HF_HOME instead would put transformers_modules under $HF_HOME/modules,
+    # which duration_tts's hardcoded ~/.cache glob would never find.
+    return {"HOME": CACHE_DIR}
+
+
+def _prep_indicf5():
+    """Make the cached IndicF5 remote-code model.py OUR patched version — at runtime.
+
+    duration_tts._load_indicf5 loads INF5Model *directly* from the transformers_modules
+    model.py that HF caches on disk, and the proven Kaggle path OVERWRITES that cached file
+    with a patched copy (CPU-first vocoder load, no Windows paths, real DiT weights). We reuse
+    the exact same patch text (kaggle/build_notebook.py::_kaggle_model_patch_content, loaded
+    by FILE PATH so no pip-installed `kaggle` client can shadow the local module) so there is
+    ONE source of truth for the patch.
+
+    Runs at RUNTIME, not image build, because the HF cache lives on a Volume not mounted at
+    build time. Idempotent and safe under concurrent TTSEngine containers: a sentinel first
+    line skips re-patching and the write is atomic (temp + os.replace).
+    """
+    import glob, importlib.util, tempfile
+    os.environ.update(_env_for_hf())         # HOME -> the Volume, so ~/.cache resolves there
+    token = os.environ.get("HF_TOKEN")
+    marker = "# [modal-indicf5-patch-applied]\n"
+
+    try:
+        hf_cache.reload()                    # pick up a cache another container already wrote
+    except Exception:
+        pass
+
+    # 1) Cache config/vocab + the remote model.py (NOT the 1.3 GB safetensors — duration_tts
+    #    pulls those on first load). Mirrors Steps 1-2 of the Kaggle patch cell.
+    try:
+        from huggingface_hub import snapshot_download
+        snapshot_download("ai4bharat/IndicF5",
+                          ignore_patterns=["*.safetensors", "*.bin"], token=token)
+    except Exception as e:
+        print(f"[indicf5-prep] snapshot_download skipped: {e}", flush=True)
+    try:
+        from transformers import AutoConfig
+        AutoConfig.from_pretrained("ai4bharat/IndicF5", trust_remote_code=True, token=token)
+    except Exception as e:
+        print(f"[indicf5-prep] AutoConfig cache-trigger: {e}", flush=True)
+
+    # 2) Overwrite each cached model.py with the patched text, unless already patched. Same
+    #    glob duration_tts uses, so we patch exactly the file it will load.
+    pattern = os.path.expanduser(
+        "~/.cache/huggingface/modules/transformers_modules/ai4bharat/IndicF5/*/model.py")
+    hits = glob.glob(pattern)
+    if not hits:
+        print(f"[indicf5-prep] no cached model.py at {pattern}; duration_tts will trigger and "
+              "load it UNPATCHED on first use — check HF_TOKEN/gate acceptance", flush=True)
+        return
+
+    patched = None
+    for mp in hits:
+        try:
+            if open(mp, encoding="utf-8").read().startswith(marker):
+                continue
+            if patched is None:
+                bn = os.path.join(REPO_MOUNT, "kaggle", "build_notebook.py")
+                spec = importlib.util.spec_from_file_location("_kaggle_bn", bn)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                patched = marker + mod._kaggle_model_patch_content()
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(mp), suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(patched)
+            os.replace(tmp, mp)              # atomic; concurrent containers write identical bytes
+            print(f"[indicf5-prep] patched {mp}", flush=True)
+        except Exception as e:
+            print(f"[indicf5-prep] could not patch {mp}: {e}", flush=True)
+
+    try:
+        hf_cache.commit()                    # persist the patched model.py for later cold starts
+    except Exception:
+        pass
 
 
 @app.function(
@@ -103,6 +194,12 @@ def dub_video(job_id: str, input_name: str, target_lang: str = "Hindi", mode: st
     os.chdir(REPO_MOUNT)
     # One duration implementation for both the gate and the meter (see deploy/api.py).
     from deploy.api import probe_duration
+
+    # Patch the cached IndicF5 model.py before anything loads it. Needed for the serial TTS
+    # path (DUBBING_TTS_FANOUT=0) which loads IndicF5 inside this container's subprocess; in
+    # fan-out mode it also warms + commits the shared cache so TTSEngine containers reload a
+    # patched model.py instead of each racing to write it.
+    _prep_indicf5()
 
     job_dir = os.path.join(JOBS_DIR, job_id)
     out_dir = os.path.join(job_dir, "dubbing_output")
@@ -238,9 +335,14 @@ class TTSEngine:
         import sys
         sys.path.insert(0, REPO_MOUNT)
         os.chdir(REPO_MOUNT)
-        os.environ.update(_env_for_hf())
+        # Patch the cached model.py, THEN load — _load_indicf5 reads the file we just wrote.
+        _prep_indicf5()
         from pipeline.duration_tts import _load_indicf5
         _load_indicf5("cuda")
+        try:
+            hf_cache.commit()   # persist the 1.3 GB weights this load downloaded on a cold cache
+        except Exception:
+            pass
 
     @modal.method()
     def synth_shard(self, spec: dict) -> dict:
