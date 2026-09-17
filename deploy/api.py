@@ -32,6 +32,14 @@ import subprocess
 import time
 import uuid
 
+# Imported at MODULE level on purpose: this file uses `from __future__ import annotations`
+# (PEP 563), so endpoint annotations like `request: Request` are stored as strings and FastAPI
+# resolves them against this module's globals at OpenAPI-generation time. If these names were
+# imported inside build_api() instead, they would not be in module globals and generation would
+# fail with "... is not fully defined" (PydanticUserError) on GET /openapi.json.
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
+
 MAX_UPLOAD_MB = int(os.environ.get("DUB_MAX_UPLOAD_MB", "500"))
 VALID_MODES = {"basic", "vc", "xlingual"}
 # Per-plan input ceilings (seconds of video). RapidAPI enforces call quotas; this guards GPU.
@@ -138,9 +146,6 @@ def prepare_job(*, job_status, jobs_vol, jobs_dir, dub_video, data: bytes, filen
 
 
 def build_api(dub_video, job_status, jobs_vol, jobs_dir):
-    from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException
-    from fastapi.responses import FileResponse, JSONResponse
-
     api = FastAPI(title="Indic AI Dubbing API", version="1.0")
 
     expected_secret = os.environ.get("RAPIDAPI_PROXY_SECRET", "")
@@ -154,24 +159,54 @@ def build_api(dub_video, job_status, jobs_vol, jobs_dir):
     def healthz():
         return {"ok": True, "ts": time.time()}
 
-    @api.post("/v1/dub")
-    async def create_dub(
-        file: UploadFile = File(...),
-        target_lang: str = Form("Hindi"),
-        mode: str = Form("basic"),
-        x_rapidapi_proxy_secret: str | None = Header(None),
-        x_rapidapi_user: str | None = Header(None),
-        x_rapidapi_subscription: str | None = Header(None),  # plan name (BASIC/PRO/...)
-        idempotency_key: str | None = Header(None),
-    ):
-        _auth(x_rapidapi_proxy_secret)
-        data = await file.read()
+    @api.post(
+        "/v1/dub",
+        # We parse the multipart form off the raw Request below instead of declaring
+        # UploadFile/Form params, so FastAPI never synthesizes a Body_<op> model. On some
+        # fastapi/pydantic combos it fails to rebuild that model's TypeAdapter, and OpenAPI
+        # generation then 500s with "Body_create_dub_v1_dub_post is not fully defined" — a
+        # structural issue, not a version one (it reproduces on pydantic 2.10 too). The
+        # resolver floats fastapi anyway because f5-tts pulls gradio, so pinning couldn't fix
+        # it. openapi_extra restores the request schema that the params would have documented.
+        openapi_extra={
+            "requestBody": {
+                "required": True,
+                "content": {
+                    "multipart/form-data": {
+                        "schema": {
+                            "type": "object",
+                            "required": ["file"],
+                            "properties": {
+                                "file": {"type": "string", "format": "binary",
+                                         "description": "Source video/audio to dub."},
+                                "target_lang": {"type": "string", "default": "Hindi",
+                                                "description": "Target language name, e.g. Hindi, Tamil."},
+                                "mode": {"type": "string", "enum": ["basic", "vc"], "default": "basic",
+                                         "description": "basic = native voice; vc = premium voice clone."},
+                            },
+                        }
+                    }
+                },
+            }
+        },
+    )
+    async def create_dub(request: Request):
+        _auth(request.headers.get("x-rapidapi-proxy-secret"))
+        form = await request.form()
+        upload = form.get("file")
+        if upload is None or not hasattr(upload, "read"):
+            raise HTTPException(422, "multipart field 'file' (a file upload) is required")
+        data = await upload.read()
+        filename = getattr(upload, "filename", None) or "input.mp4"
+        target_lang = str(form.get("target_lang") or "Hindi")
+        mode = str(form.get("mode") or "basic")
         try:
             return prepare_job(
                 job_status=job_status, jobs_vol=jobs_vol, jobs_dir=jobs_dir, dub_video=dub_video,
-                data=data, filename=file.filename or "input.mp4", target_lang=target_lang,
-                mode=mode, plan=x_rapidapi_subscription or "", user=x_rapidapi_user,
-                idempotency_key=idempotency_key,
+                data=data, filename=filename, target_lang=target_lang,
+                mode=mode, plan=request.headers.get("x-rapidapi-subscription") or "",
+                user=request.headers.get("x-rapidapi-user"),
+                idempotency_key=request.headers.get("idempotency-key"),
             )
         except ApiError as e:
             raise HTTPException(e.status_code, e.detail)

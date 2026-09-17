@@ -1,12 +1,19 @@
 # Deploy-layer deps (API + UI), on TOP of the pipeline's ../requirements.txt.
 # These are the packages the Modal gateway / Streamlit UI need beyond the pipeline itself.
 #
-# VERSION PIN (important): fastapi <0.129 + pydantic 2.12 trips a
-# "TypeAdapter[...UploadFile...] is not fully defined" error at request time (pydantic 2.12
-# changed TypeAdapter forward-ref building; this fastapi predates support). Pin a known-good
-# combo so multipart file upload works on the deployed image.
-fastapi>=0.115,<0.129
-pydantic>=2.9,<2.12
+# GET /openapi.json once 500'd with a PydanticUserError,
+#   "Body_create_dub_v1_dub_post is not fully defined; ... call .rebuild()"
+# We first suspected pydantic >= 2.11, but it reproduces on 2.10 AND 2.12: the cause was never
+# a version. deploy/api.py uses `from __future__ import annotations` (PEP 563), so its endpoint
+# annotations are strings that FastAPI resolves against the module's globals during schema
+# generation — and the fastapi imports were done inside build_api(), so they weren't there.
+# The fix is in api.py (import those names at module scope; parse the /v1/dub multipart form off
+# the raw Request so no Body_* model is synthesized). The bounds below are therefore just
+# conservative guards, not a workaround. On the Modal image f5-tts -> gradio floats
+# fastapi/starlette/pydantic forward anyway; that's harmless (we never run gradio; the TTS path
+# imports only f5_tts.infer.utils_infer), which is why modal_app.py no longer pins them.
+fastapi>=0.115
+pydantic>=2.9,<3
 python-multipart>=0.0.9
 requests>=2.31
 # streamlit is already pinned in ../requirements.txt (1.57.0).

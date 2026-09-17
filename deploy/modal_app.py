@@ -52,8 +52,8 @@ image = (
     .apt_install("ffmpeg", "rubberband-cli", "espeak-ng", "fonts-noto", "libsndfile1", "git")
     # Pinned core: numpy 1.26.4 / scipy 1.13.1 / transformers 4.57.6 — the fragile ABI set.
     .pip_install_from_requirements("requirements.txt")
-    # API/UI deps + a PINNED fastapi/pydantic combo (see deploy/requirements-deploy.txt):
-    # fastapi<0.129 + pydantic 2.12 breaks multipart UploadFile parsing.
+    # API/UI deps (FastAPI + Streamlit). Version bounds live in deploy/requirements-deploy.txt
+    # and are conservative guards only — the /v1/dub OpenAPI fix is structural, in api.py.
     .pip_install_from_requirements("deploy/requirements-deploy.txt")
     # torch/torchaudio are platform-specific and not pinned in requirements; install the CUDA
     # build explicitly for Modal's GPUs. knn-vc (Step 6.5) pulls WavLM+HiFiGAN from torch.hub.
@@ -68,6 +68,11 @@ image = (
     # back last, exactly as the Kaggle notebook does it.
     .pip_install("transformers<5.0.0")
     .run_commands("python -m pip install --force-reinstall --no-deps numpy==1.26.4")
+    # f5-tts pulls gradio, which floats fastapi/starlette/pydantic forward on every rebuild.
+    # That is harmless and NOT pinned here: we never run gradio (the TTS path imports only
+    # f5_tts.infer.utils_infer), and api.py parses the /v1/dub multipart form off the raw
+    # Request, so FastAPI never synthesizes the Body_* model whose OpenAPI generation used to
+    # 500. The resolved web-stack version is therefore not load-bearing.
     .add_local_dir(".", REPO_MOUNT, copy=True,
                    ignore=["dubbing_output*", "*.zip", "*.mp4", "*.mkv", "*.mov", "*.wav",
                            ".git", "graphify-out", "**/__pycache__", ".claude"])
