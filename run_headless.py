@@ -19,6 +19,8 @@ Configuration — all via environment variables, with defaults:
     DUBBING_WHISPER_MODEL Whisper model size (default "medium").
     DUBBING_USE_DEMUCS    "1"/"0" — run Demucs source separation (default "1").
     DUBBING_BG_VOLUME     background-music volume in the final mix (default "0.3").
+    DUBBING_BURN_SUBS     "1"/"0" — hard-burn captions (full re-encode) vs soft-mux them
+                          and stream-copy the video (default "0" = soft-mux, no re-encode).
     DUBBING_OUTPUT_DIR    where outputs go (default "/kaggle/working/dubbing_output").
     GEMINI_API_KEY        REQUIRED — Gemini key for isochrony-aware translation.
     (Step-6 stall budgets DUBBING_TTS_LOAD_STALL / DUBBING_TTS_SEG_STALL etc. are read by
@@ -166,6 +168,9 @@ def main():
     target_lang = os.environ.get("DUBBING_TARGET_LANG", "Hindi").strip() or "Hindi"
     model_size = os.environ.get("DUBBING_WHISPER_MODEL", "medium").strip() or "medium"
     use_demucs = os.environ.get("DUBBING_USE_DEMUCS", "1").strip().lower() not in ("0", "false", "no", "")
+    # Default OFF: soft-mux subtitles + stream-copy the video (no re-encode). Set "1" to hard-
+    # burn captions into the pixels (forces a full libx264 re-encode). See video_merge.py / P2.
+    burn_subs = os.environ.get("DUBBING_BURN_SUBS", "0").strip().lower() in ("1", "true", "yes")
     try:
         bg_volume = float(os.environ.get("DUBBING_BG_VOLUME", "0.3"))
     except ValueError:
@@ -174,7 +179,8 @@ def main():
 
     log("=" * 72)
     log("Indic Dubbing — HEADLESS BATCH RUN")
-    log(f"  target_lang={target_lang}  whisper={model_size}  demucs={use_demucs}  bg_vol={bg_volume}")
+    log(f"  target_lang={target_lang}  whisper={model_size}  demucs={use_demucs}  "
+        f"bg_vol={bg_volume}  burn_subs={burn_subs}")
     log(f"  output_dir={out_dir}")
     if not api_key:
         log("FATAL: GEMINI_API_KEY is not set — isochrony translation cannot run.")
@@ -323,7 +329,8 @@ def main():
             log_fn=log,
         )
         final_video_path = os.path.join(out_dir, f"dubbed_{target_lang.lower()}.mp4")
-        merge_video_audio_subs(video_path, synced_audio_path, translated_srt_path, final_video_path, log_fn=log)
+        merge_video_audio_subs(video_path, synced_audio_path, translated_srt_path, final_video_path,
+                               log_fn=log, burn_subs=burn_subs)
 
     except Exception as e:
         log(f"FATAL: pipeline stage failed: {e}")

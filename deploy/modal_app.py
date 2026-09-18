@@ -224,6 +224,12 @@ def dub_video(job_id: str, input_name: str, target_lang: str = "Hindi", mode: st
         "DUBBING_OUTPUT_DIR": out_dir,
         "DUBBING_TARGET_LANG": target_lang,
         "DUBBING_VOICE_CLONE": mode_to_clone.get(mode, "0"),
+        # Persist the Stage-4 translation candidate pool on the HF cache Volume. Its default
+        # location is os.getcwd()/.dubbing_cache, which on Modal is the EPHEMERAL image layer —
+        # so the pool that is supposed to accumulate across runs (and let a re-run select its
+        # lines with ZERO Gemini calls) is silently thrown away on every container. Pointing it
+        # at the Volume is what actually makes it cross-run. See PRODUCTION_OPTIMIZATION_AUDIT.md P10.
+        "DUBBING_CACHE_DIR": os.path.join(CACHE_DIR, "dubbing_cache"),
         # Fan Step 6 out across TTSEngine containers instead of synthesizing serially.
         # Set DUBBING_TTS_FANOUT=0 to fall back to the in-container supervised path.
         "DUBBING_TTS_BACKEND": ("modal-fanout"
@@ -264,6 +270,14 @@ def dub_video(job_id: str, input_name: str, target_lang: str = "Hindi", mode: st
                            log="\n".join(tail)[-4000:], heartbeat=now)
         rc = proc.wait()
         log_tail = "\n".join(tail)[-4000:]
+
+        # Persist whatever Stage 4 added to the translation candidate pool (under
+        # DUBBING_CACHE_DIR on this Volume) so the next job/container sees it — regardless of
+        # whether a LATER stage then failed. Cheap: only the small cache JSON changed here.
+        try:
+            hf_cache.commit()
+        except Exception:
+            pass
 
         if rc != 0:
             set_status(status="failed", rc=rc, log=log_tail,
