@@ -8,17 +8,23 @@ Step-6.5 voice-conversion cloning path) in a Modal GPU function, fronted by an a
 gateway. Scale-to-zero between jobs; a warm pool keeps one GPU container hot so the model
 isn't cold-loaded on the hot path.
 
-Status: SCAFFOLD. It expresses the architecture with correct Modal idioms and reuses the
-pipeline as the single source of truth, but it has NOT been `modal deploy`-run from here
-(no Modal creds in the build env). Every place that needs your account/secret/decision is
-marked `# SETUP:`. Validate with `modal serve deploy/modal_app.py` then `modal deploy ...`.
+Status: DEPLOYED. A basic-mode run has completed end-to-end on Modal. Places that still need
+your account/secret/decision are marked `# SETUP:`. Iterate with `modal serve
+deploy/modal_app.py`, then `modal deploy deploy/modal_app.py` (fan-out needs a DEPLOYED app —
+`Cls.from_name` cannot see an ephemeral `modal serve` session).
 
-Latency note
-------------
-This is an ASYNC job API (submit -> poll/webhook), not real-time — the pipeline is a
-multi-stage GPU job (~8 min today for 80 s of video, TTS-bound). The first optimization
-lever after this scaffold is fanning TTS out across GPU replicas (see FAN-OUT NOTE below);
-that is what turns the ~235 s serial TTS into ~30 s.
+Cost/latency architecture
+-------------------------
+This is an ASYNC job API (submit -> poll/webhook), not real-time. Three levers, all live here:
+  1. TTS fan-out — Step 6 shards across TTSEngine GPU replicas (`TTSEngine.synth_shard.map`),
+     turning serial per-segment synthesis into parallel work. Below
+     DUBBING_TTS_FANOUT_MIN_SEGMENTS the run uses a single shard (one load) instead.
+  2. Memory snapshots — TTSEngine bakes its imports + CPU-materialised model into a snapshot,
+     so a cold worker RESTORES instead of re-importing/re-materialising (see the class).
+  3. Translation off-GPU split — `dub_video` is a CPU orchestrator: a GPU container runs Steps
+     1-3, then translation (~60% of wall clock, Gemini/CPU-bound) + assembly run on CPU with no
+     GPU billed, and TTS fans out to TTSEngine. Kill-switch: DUBBING_MODAL_SPLIT=0. vc mode
+     stays on the single-container GPU path until the vc pipeline is validated end-to-end.
 
 Run:
     pip install modal && modal setup
@@ -179,43 +185,27 @@ def _prep_indicf5():
         pass
 
 
-@app.function(
-    gpu=GPU_TYPE,
-    volumes=VOLUMES,
-    secrets=secrets,
-    timeout=60 * 30,          # a long video can take a while; async so the caller isn't blocked
-    min_containers=int(os.environ.get("MODAL_WARM", "0")),  # SETUP: set 1 to keep a GPU warm (kills cold-start; costs idle GPU)
-    retries=modal.Retries(max_retries=1, backoff_coefficient=1.0),
-)
-def dub_video(job_id: str, input_name: str, target_lang: str = "Hindi", mode: str = "basic"):
-    """Run the full dubbing pipeline for one job. Reads input + writes output on the jobs Volume.
-
-    `mode`: "basic" (native voice) | "vc" (premium: native TTS + voice-conversion clone) |
-            "xlingual" (deprecated cross-lingual — do not use in production).
-    """
-    import sys, collections, subprocess, traceback
-
-    sys.path.insert(0, REPO_MOUNT)      # mirror the Kaggle notebook's import root
-    os.chdir(REPO_MOUNT)
-    # One duration implementation for both the gate and the meter (see deploy/api.py).
-    from deploy.api import probe_duration
-
-    # Patch the cached IndicF5 model.py before anything loads it. Needed for the serial TTS
-    # path (DUBBING_TTS_FANOUT=0) which loads IndicF5 inside this container's subprocess; in
-    # fan-out mode it also warms + commits the shared cache so TTSEngine containers reload a
-    # patched model.py instead of each racing to write it.
-    _prep_indicf5()
-
+# ── Shared pipeline plumbing (used by the split orchestrator and the un-split GPU path) ─────
+def _job_paths(job_id: str, input_name: str):
     job_dir = os.path.join(JOBS_DIR, job_id)
     out_dir = os.path.join(job_dir, "dubbing_output")
     in_path = os.path.join(job_dir, input_name)
     os.makedirs(out_dir, exist_ok=True)
+    return job_dir, out_dir, in_path
 
+
+def _make_set_status(job_id: str):
     def set_status(**kw):
         cur = job_status.get(job_id, {})
         cur.update(kw)
         job_status[job_id] = cur
+    return set_status
 
+
+def _pipeline_env(in_path: str, out_dir: str, target_lang: str, mode: str,
+                  stages: str, fanout: bool):
+    """Build the run_headless environment for one phase. `stages` is DUBBING_STAGES
+    ("all" | "prep" | "resume"); `fanout` selects the Modal TTS backend."""
     mode_to_clone = {"basic": "0", "xlingual": "1", "vc": "2"}
     env = os.environ.copy()
     env.update(_env_for_hf())
@@ -228,82 +218,203 @@ def dub_video(job_id: str, input_name: str, target_lang: str = "Hindi", mode: st
         # location is os.getcwd()/.dubbing_cache, which on Modal is the EPHEMERAL image layer —
         # so the pool that is supposed to accumulate across runs (and let a re-run select its
         # lines with ZERO Gemini calls) is silently thrown away on every container. Pointing it
-        # at the Volume is what actually makes it cross-run. See PRODUCTION_OPTIMIZATION_AUDIT.md P10.
+        # at the Volume is what makes it cross-run. See PRODUCTION_OPTIMIZATION_AUDIT.md P10.
         "DUBBING_CACHE_DIR": os.path.join(CACHE_DIR, "dubbing_cache"),
         # Fan Step 6 out across TTSEngine containers instead of synthesizing serially.
-        # Set DUBBING_TTS_FANOUT=0 to fall back to the in-container supervised path.
-        "DUBBING_TTS_BACKEND": ("modal-fanout"
-                                if os.environ.get("DUBBING_TTS_FANOUT", "1") != "0" else ""),
+        "DUBBING_TTS_BACKEND": ("modal-fanout" if fanout else ""),
+        "DUBBING_STAGES": stages,
         # GEMINI_API_KEY / HF_TOKEN come from the Modal secret.
         "PYTHONUNBUFFERED": "1",
     })
+    return env
 
+
+def _run_headless_streamed(env, set_status):
+    """Run run_headless.py as a subprocess, STREAMING its stdout into job status. Returns
+    (rc, log_tail).
+
+    Reuses the proven headless driver verbatim (supervisor freeze-fix + VC included). Running
+    it as a subprocess keeps its own process-isolation model intact and makes a hung CUDA op
+    the SUBPROCESS's problem, not the container's. We stream rather than capture_output=True so
+    (1) a customer polling GET /v1/dub/{id} sees the live stage, not an opaque "running" for
+    minutes, and (2) the reader loop drains the pipe continuously — an undrained pipe is what
+    wedged the Kaggle run.
+    """
+    import sys, subprocess, collections
+    proc = subprocess.Popen(
+        [sys.executable, "-u", "run_headless.py"],
+        cwd=REPO_MOUNT, env=env, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1,
+    )
+    tail = collections.deque(maxlen=200)   # ring buffer: keep the tail, not the whole log
+    last_push = 0.0
+    for line in proc.stdout:
+        tail.append(line.rstrip("\n"))
+        stage = _parse_stage(line)
+        now = time.time()   # throttle Dict writes: on a stage change, else at most every 5 s
+        if stage or (now - last_push) > 5.0:
+            last_push = now
+            set_status(**({"stage": stage} if stage else {}),
+                       log="\n".join(tail)[-4000:], heartbeat=now)
+    rc = proc.wait()
+    return rc, "\n".join(tail)[-4000:]
+
+
+def _finalize_job(job_id, out_dir, target_lang, rc, log_tail, t0, set_status):
+    """Detect the output, meter on its MEASURED duration, and set the terminal status. Shared
+    by the split orchestrator and the un-split GPU path so metering is identical either way."""
+    import sys
+    sys.path.insert(0, REPO_MOUNT)
+    from deploy.api import probe_duration   # one duration impl for the gate and the meter
+    if rc != 0:
+        set_status(status="failed", rc=rc, log=log_tail,
+                   error=f"run_headless exited {rc}; see log tail.")
+        try:
+            jobs_vol.commit()
+        except Exception:
+            pass
+        return {"job_id": job_id, "status": "failed", "rc": rc}
+
+    final = os.path.join(out_dir, f"dubbed_{target_lang.lower()}.mp4")
+    if not os.path.exists(final):
+        mp4s = [f for f in os.listdir(out_dir) if f.endswith(".mp4")]   # any produced mp4
+        final = os.path.join(out_dir, mp4s[0]) if mp4s else ""
+    # Meter on the MEASURED output duration; fall back to the gated input duration only if the
+    # probe cannot read the result (never silently meter zero).
+    measured = probe_duration(final) if final else None
+    billed = measured if measured is not None else job_status.get(job_id, {}).get("input_seconds", 0.0)
+    set_status(status="done", stage="complete", output=final,
+               video_seconds=billed, metered_from=("output" if measured is not None else "input"),
+               elapsed_s=round(time.time() - t0, 1), log=log_tail)
+    try:
+        jobs_vol.commit()
+    except Exception:
+        pass
+    return {"job_id": job_id, "status": "done", "output": final, "video_seconds": billed}
+
+
+@app.function(
+    gpu=GPU_TYPE,
+    volumes=VOLUMES,
+    secrets=secrets,
+    timeout=60 * 30,
+    min_containers=int(os.environ.get("MODAL_WARM", "0")),  # SETUP: 1 keeps a GPU warm for the prep phase
+    retries=modal.Retries(max_retries=1, backoff_coefficient=1.0),
+)
+def gpu_transcribe(job_id: str, input_name: str, target_lang: str = "Hindi", mode: str = "basic"):
+    """SPLIT phase 1 (GPU): run Steps 1-3 (extract / Demucs / Whisper), persist the checkpoint
+    and RELEASE the GPU. This container's GPU is held only for Demucs+Whisper — not for the
+    ~60% of wall clock the CPU orchestrator then spends in Gemini translation. No IndicF5 here,
+    so no _prep_indicf5 and no model load."""
+    import sys
+    sys.path.insert(0, REPO_MOUNT)
+    os.chdir(REPO_MOUNT)
+    set_status = _make_set_status(job_id)
+    _, out_dir, in_path = _job_paths(job_id, input_name)
+    env = _pipeline_env(in_path, out_dir, target_lang, mode, stages="prep", fanout=False)
+    set_status(status="running", stage="transcribing", started_at=time.time())
+    rc, log_tail = _run_headless_streamed(env, set_status)
+    try:
+        jobs_vol.commit()   # publish pipeline_state.json + separated audio to the orchestrator
+        hf_cache.commit()
+    except Exception:
+        pass
+    if rc != 0:
+        set_status(status="failed", rc=rc, log=log_tail, error=f"transcribe (prep) exited {rc}")
+    return {"rc": rc, "log": log_tail}
+
+
+@app.function(
+    gpu=GPU_TYPE,
+    volumes=VOLUMES,
+    secrets=secrets,
+    timeout=60 * 30,
+    min_containers=int(os.environ.get("MODAL_WARM", "0")),
+    retries=modal.Retries(max_retries=1, backoff_coefficient=1.0),
+)
+def gpu_full_run(job_id: str, input_name: str, target_lang: str = "Hindi", mode: str = "basic"):
+    """The un-split path: run ALL seven stages in ONE GPU container (the proven behaviour).
+    Used for `mode="vc"` (Step 6.5 knn-vc needs a co-resident GPU), for the kill-switch
+    (DUBBING_MODAL_SPLIT=0), and as the orchestrator's auto-fallback. TTS still fans Step 6 out
+    to TTSEngine when DUBBING_TTS_FANOUT != 0."""
+    import sys
+    sys.path.insert(0, REPO_MOUNT)
+    os.chdir(REPO_MOUNT)
+    # Patch the cached IndicF5 model.py before anything loads it — needed for the serial TTS
+    # path (DUBBING_TTS_FANOUT=0), and it warms + commits the shared cache so TTSEngine
+    # containers reload a patched model.py instead of each racing to write it.
+    _prep_indicf5()
+    set_status = _make_set_status(job_id)
+    _, out_dir, in_path = _job_paths(job_id, input_name)
+    fanout = os.environ.get("DUBBING_TTS_FANOUT", "1") != "0"
+    env = _pipeline_env(in_path, out_dir, target_lang, mode, stages="all", fanout=fanout)
     set_status(status="running", stage="starting", started_at=time.time())
     t0 = time.time()
+    rc, log_tail = _run_headless_streamed(env, set_status)
     try:
-        # Reuse the proven headless driver verbatim (supervisor freeze-fix + VC included).
-        # Running it as a subprocess keeps its own process-isolation model intact and makes a
-        # hung CUDA op the SUBPROCESS's problem, not the container's.
-        #
-        # We STREAM its stdout line-by-line rather than capture_output=True. Two reasons:
-        # (1) a dub takes minutes, and a customer polling GET /v1/dub/{id} should see which
-        #     stage it is in, not an opaque "running" for eight minutes; buffered capture
-        #     only yields the log after the process has already exited.
-        # (2) the reader loop drains the pipe continuously. run_headless now survives a
-        #     stalled console by design, but the cheapest way to keep that true is to never
-        #     stop reading — an undrained pipe is what wedged the Kaggle run.
-        proc = subprocess.Popen(
-            [sys.executable, "-u", "run_headless.py"],
-            cwd=REPO_MOUNT, env=env, text=True,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1,
-        )
-        tail = collections.deque(maxlen=200)   # ring buffer: keep the tail, not the whole log
-        last_push = 0.0
-        for line in proc.stdout:
-            tail.append(line.rstrip("\n"))
-            stage = _parse_stage(line)
-            # Throttle Dict writes: update on a stage change, else at most every 5 s.
-            now = time.time()
-            if stage or (now - last_push) > 5.0:
-                last_push = now
-                set_status(**({"stage": stage} if stage else {}),
-                           log="\n".join(tail)[-4000:], heartbeat=now)
-        rc = proc.wait()
-        log_tail = "\n".join(tail)[-4000:]
+        hf_cache.commit()   # persist Stage-4 cache adds even if a later stage failed
+    except Exception:
+        pass
+    return _finalize_job(job_id, out_dir, target_lang, rc, log_tail, t0, set_status)
 
-        # Persist whatever Stage 4 added to the translation candidate pool (under
-        # DUBBING_CACHE_DIR on this Volume) so the next job/container sees it — regardless of
-        # whether a LATER stage then failed. Cheap: only the small cache JSON changed here.
+
+@app.function(
+    volumes=VOLUMES,
+    secrets=secrets,
+    timeout=60 * 40,
+    retries=modal.Retries(max_retries=1, backoff_coefficient=1.0),
+)
+def dub_video(job_id: str, input_name: str, target_lang: str = "Hindi", mode: str = "basic"):
+    """Orchestrator (CPU — no GPU billed while it runs).
+
+    For `mode="basic"` it SPLITS the run: a GPU container (`gpu_transcribe`) does Steps 1-3,
+    then translation + assembly run HERE on cheap CPU — releasing the GPU for the ~60% of wall
+    clock Step 4 spends in Gemini translation — with Step 6 TTS fanned out to TTSEngine GPUs.
+    `mode="vc"` and the kill-switch DUBBING_MODAL_SPLIT=0 route to the single-container GPU path
+    (`gpu_full_run`), because Step 6.5 knn-vc needs a co-resident GPU. Any orchestration error
+    (not a stage failure) falls back to that proven path, so a job degrades rather than fails.
+
+    `mode`: "basic" (native voice) | "vc" (premium: native TTS + voice-conversion clone) |
+            "xlingual" (deprecated cross-lingual — do not use in production).
+    """
+    import sys, traceback
+    sys.path.insert(0, REPO_MOUNT)
+    os.chdir(REPO_MOUNT)
+    set_status = _make_set_status(job_id)
+    _, out_dir, in_path = _job_paths(job_id, input_name)
+
+    split_on = os.environ.get("DUBBING_MODAL_SPLIT", "1") != "0"
+    if mode == "vc" or not split_on:
+        # vc needs a co-resident GPU for Step 6.5; the kill-switch forces the proven path.
+        return gpu_full_run.remote(job_id, input_name, target_lang, mode)
+
+    t0 = time.time()
+    try:
+        set_status(status="running", stage="starting", started_at=t0)
+        # Phase 1 on GPU (blocks until Steps 1-3 finish + the checkpoint is committed).
+        r = gpu_transcribe.remote(job_id, input_name, target_lang, mode)
+        if isinstance(r, dict) and r.get("rc", 1) != 0:
+            return {"job_id": job_id, "status": "failed", "rc": r.get("rc")}  # already marked failed
+        try:
+            jobs_vol.reload()   # pick up pipeline_state.json + separated audio from phase 1
+        except Exception:
+            pass
+        # Phase 2 on CPU: Step 4 (Gemini translation) + Step 5/7 (CPU) here; Step 6 TTS fans
+        # out to TTSEngine GPUs. No local GPU held for any of it in basic mode.
+        fanout = os.environ.get("DUBBING_TTS_FANOUT", "1") != "0"
+        env = _pipeline_env(in_path, out_dir, target_lang, mode, stages="resume", fanout=fanout)
+        rc, log_tail = _run_headless_streamed(env, set_status)
         try:
             hf_cache.commit()
         except Exception:
             pass
-
-        if rc != 0:
-            set_status(status="failed", rc=rc, log=log_tail,
-                       error=f"run_headless exited {rc}; see log tail.")
-            jobs_vol.commit()
-            return {"job_id": job_id, "status": "failed", "rc": rc}
-
-        final = os.path.join(out_dir, f"dubbed_{target_lang.lower()}.mp4")
-        if not os.path.exists(final):
-            # find any produced mp4 as a fallback
-            mp4s = [f for f in os.listdir(out_dir) if f.endswith(".mp4")]
-            final = os.path.join(out_dir, mp4s[0]) if mp4s else ""
-
-        # Meter on the MEASURED output duration; fall back to the gated input duration only
-        # if the probe cannot read the result (never silently meter zero).
-        measured = probe_duration(final) if final else None
-        billed = measured if measured is not None else job_status.get(job_id, {}).get("input_seconds", 0.0)
-        set_status(status="done", stage="complete", output=final,
-                   video_seconds=billed, metered_from=("output" if measured is not None else "input"),
-                   elapsed_s=round(time.time() - t0, 1), log=log_tail)
-        jobs_vol.commit()
-        return {"job_id": job_id, "status": "done", "output": final, "video_seconds": billed}
+        return _finalize_job(job_id, out_dir, target_lang, rc, log_tail, t0, set_status)
     except Exception as e:
-        set_status(status="failed", error=str(e), trace=traceback.format_exc()[-2000:])
-        jobs_vol.commit()
-        return {"job_id": job_id, "status": "failed", "error": str(e)}
+        # The orchestration itself broke (not a stage failure) — degrade to the proven single-
+        # container path rather than losing the job. Idempotent: it re-runs from Step 1.
+        set_status(status="running", stage="fallback: single-container GPU run",
+                   split_error=str(e), trace=traceback.format_exc()[-1500:])
+        return gpu_full_run.remote(job_id, input_name, target_lang, mode)
 
 
 # run_headless logs stage headings as "Step N/7: ..." (N may be 6.5) and the TTS supervisor
@@ -342,14 +453,27 @@ TTS_MAX_CONTAINERS = int(os.environ.get("MODAL_TTS_MAX_CONTAINERS", "8"))
     # the wall-clock floor (the difference between ~60 s and ~25 s for a short video) at the
     # cost of paying for idle GPU. Leave 0 for bursty traffic; raise it for a latency SLA.
     min_containers=int(os.environ.get("MODAL_TTS_WARM", "0")),
+    # Memory snapshot (GA, CPU): bake the heavy imports + the CPU-materialised 1.3 GB model
+    # into a snapshot so every future cold start RESTORES it instead of re-importing and
+    # re-materialising. The measured cold TTS load is ~28 s (f5_tts import alone ~16 s + weight
+    # materialisation); restoring a snapshot skips almost all of it. See the two @modal.enter
+    # phases below for why this is a plain CPU snapshot, not the Alpha GPU one.
+    enable_memory_snapshot=True,
 )
 class TTSEngine:
-    @modal.enter()
-    def load(self):
-        """Load IndicF5 ONCE per container, before any shard runs.
-
-        duration_tts caches the model in module globals, so the generate_tts_for_segments
-        call inside synth_shard reuses what we load here instead of loading per shard.
+    @modal.enter(snap=True)
+    def load_snapshot(self):
+        """Runs BEFORE the memory snapshot is captured, with NO GPU attached (the GA CPU-
+        snapshot path — we deliberately do not use the Alpha GPU snapshot). Everything that is
+        expensive AND device-independent happens here so it lands in the snapshot and is
+        skipped on every future cold start:
+          - the heavy imports (torch / transformers / f5_tts — f5_tts alone measured ~16 s);
+          - patching the cached IndicF5 remote-code model.py;
+          - materialising the ~1.3 GB checkpoint into CPU RAM.
+        The model is loaded to CPU because no GPU exists during the snap phase; the post-restore
+        hook below moves it onto CUDA. generate_tts_for_segments already re-places
+        ema_model+vocoder per call, so a CPU-loaded-then-moved model reaches the identical state
+        the old cuda-direct load produced.
         """
         import sys
         sys.path.insert(0, REPO_MOUNT)
@@ -357,11 +481,26 @@ class TTSEngine:
         # Patch the cached model.py, THEN load — _load_indicf5 reads the file we just wrote.
         _prep_indicf5()
         from pipeline.duration_tts import _load_indicf5
-        _load_indicf5("cuda")
+        _load_indicf5("cpu")
+        # Warm the synth-time imports into the snapshot too: generate_tts_for_segments imports
+        # these lazily on the hot path, so pull them in now while we are building the snapshot.
+        try:
+            from f5_tts.infer.utils_infer import (  # noqa: F401
+                preprocess_ref_audio_text, infer_batch_process)
+        except Exception as e:
+            print(f"[TTSEngine.snap] f5_tts warm-import skipped: {e}", flush=True)
         try:
             hf_cache.commit()   # persist the 1.3 GB weights this load downloaded on a cold cache
         except Exception:
             pass
+
+    @modal.enter()
+    def to_gpu(self):
+        """Runs AFTER restore (and after load_snapshot on the very first, pre-snapshot start),
+        with the GPU attached. Moves the CPU-resident cached model onto CUDA so synth_shard
+        sees a fully-on-device model — the same state the old single-phase cuda load left."""
+        from pipeline.duration_tts import _move_indicf5_to
+        _move_indicf5_to("cuda")
 
     @modal.method()
     def synth_shard(self, spec: dict) -> dict:
@@ -434,12 +573,12 @@ def fastapi_app():
 # SETUP: run the Streamlit UI either here (modal) or on Streamlit Community Cloud pointing at
 # the FastAPI URL. See deploy/streamlit_app.py and deploy/README.md.
 
-# ── FAN-OUT NOTE (next optimization, not in this scaffold) ─────────────────────────────────
-# To cut the serial ~235 s TTS: replace run_headless's in-container TTS with a Modal Cls that
-# loads IndicF5 in @modal.enter() (warm) and exposes synth_one(segment); the orchestrator then
-# calls `TTSEngine().synth_one.map(segments)` so Modal fans the segments across GPU replicas
-# (set max_containers, min_containers for the warm pool). knn-vc (Step 6.5) fans out the same
-# way. Everything else (translation, demucs, whisper, assembly) stays as-is.
+# ── REMAINING LEVERS (not yet implemented) ─────────────────────────────────────────────────
+# - Parallelize the per-segment Gemini calls inside Step 4 translation (isochrony_translation
+#   .py). It is now the single largest wall-clock term; concurrency there is the next win, but
+#   it touches the rate-limit/retry loop and deserves its own change + test.
+# - Split vc mode too: delegate Step 6.5 knn-vc to a GPU function so vc also runs off-GPU for
+#   translation. Deferred until the vc pipeline is validated end-to-end (owner's call).
 
 if __name__ == "__main__":
     # Local smoke: `python deploy/modal_app.py` just prints the plan; real runs use modal CLI.

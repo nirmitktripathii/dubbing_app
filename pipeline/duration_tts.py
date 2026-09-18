@@ -282,6 +282,47 @@ def _load_indicf5(device: str = "auto", log_fn=None):
         )
 
 
+def _move_indicf5_to(device: str, log_fn=None):
+    """Move the already-cached IndicF5 model onto ``device`` in place. For Modal snapshots.
+
+    A Modal CPU memory snapshot is captured with the model materialised in CPU RAM — loaded by
+    ``_load_indicf5("cpu")`` inside a ``@modal.enter(snap=True)`` phase, before any GPU is
+    attached, so the ~1.3 GB weight materialisation and the heavy imports are baked into the
+    snapshot. After restore the GPU is present, and this moves the SAME cached object onto it,
+    reaching the exact device state a direct ``_load_indicf5("cuda")`` would have produced — no
+    reload, no re-download. If nothing is loaded yet it falls back to a normal load so callers
+    stay correct off Modal.
+
+    Additive: the Kaggle/serial/supervised paths never call this, so their behaviour is
+    unchanged. The generate path re-places ema_model+vocoder per call anyway (see
+    generate_tts_for_segments); moving them here just makes the whole model coherently resident
+    on ``device`` immediately after restore.
+    """
+    global _indicf5_model, _indicf5_device
+    if _indicf5_model is None:
+        return _load_indicf5(device, log_fn=log_fn)
+    if _indicf5_device == device:
+        return _indicf5_model, _indicf5_device
+    model = _indicf5_model.to(device)
+    for attr in ("ema_model", "vocoder"):
+        sub = getattr(model, attr, None)
+        if sub is not None:
+            try:
+                sub.to(device)
+            except Exception:
+                pass
+    _indicf5_model = model
+    _indicf5_device = device
+    msg = f"[DurationTTS] moved cached IndicF5 to {device}"
+    print(msg, flush=True)
+    if log_fn is not None:
+        try:
+            log_fn(f"    {msg}")
+        except Exception:
+            pass
+    return model, device
+
+
 def unload_indicf5():
     """Explicitly unload the model and free VRAM."""
     global _indicf5_model, _indicf5_device

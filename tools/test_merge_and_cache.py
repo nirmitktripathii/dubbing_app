@@ -136,8 +136,19 @@ def main():
     modal_src = open(os.path.join(REPO, "deploy", "modal_app.py"), encoding="utf-8").read()
     if '"DUBBING_CACHE_DIR"' not in modal_src:
         fails.append("modal_app.py does not set DUBBING_CACHE_DIR in the worker env")
-    after_wait = modal_src.split("rc = proc.wait()", 1)[-1][:400]
-    if "hf_cache.commit()" not in after_wait:
+    # The cache Volume must be committed AFTER the pipeline runs (so Stage-4 cache adds
+    # survive). Structure-independent since the split refactor moved the run into a helper:
+    # find a run call and assert a commit follows it within a small window.
+    committed_after_run, start = False, 0
+    while True:
+        i = modal_src.find("_run_headless_streamed(", start)
+        if i < 0:
+            break
+        if "hf_cache.commit()" in modal_src[i:i + 600]:
+            committed_after_run = True
+            break
+        start = i + 1
+    if not committed_after_run:
         fails.append("modal_app.py does not commit the cache Volume after the run")
 
     print("\n" + ("FAIL:\n  - " + "\n  - ".join(fails) if fails else "ALL PROPERTIES HOLD ✓"))
