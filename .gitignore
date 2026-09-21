@@ -76,3 +76,7 @@ implementation_plan_v3.md
 audio_quality_report.md
 walkthrough.md
 task.md
+
+# README showcase demo clips — the ONLY committed videos; the *.mp4 rule above still
+# ignores every other video so stray renders never land in the repo.
+!docs/demo/*.mp4
