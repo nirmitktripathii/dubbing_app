@@ -46,6 +46,13 @@ GPU_TYPE = os.environ.get("MODAL_GPU", "L4")   # SETUP: L4 fits Whisper+Demucs+I
 # notebook does (sys.path.insert(0, ...)), so `from run_headless import main` resolves.
 REPO_MOUNT = "/root/app"
 
+# The semantic-gate model (IndicSBERT) ships ONLY pytorch_model.bin, which torch 2.5.1 refuses
+# to load (transformers' CVE-2025-32434 guard wants torch>=2.6). prewarm_models converts it to
+# safetensors ONCE and writes a clean sentence-transformers dir here on the hf_cache Volume; the
+# pipeline reads it via DUBBING_SBERT_MODEL (baked into the image env below). The path MUST sit
+# under the CACHE_DIR mount ("/cache/hf") so it lands on the Volume. See _prep_indicsbert().
+SBERT_LOCAL_DIR = "/cache/hf/models/indic-sbert-st"
+
 # ── Image: mirrors the PROVEN Kaggle environment ──────────────────────────────────────────
 # The Kaggle notebook (kaggle/build_notebook.py) is the reference for what a working IndicF5
 # environment needs; this reproduces its install sequence so the image doesn't build clean
@@ -83,6 +90,28 @@ image = (
                    ignore=["dubbing_output*", "*.zip", "*.mp4", "*.mkv", "*.mov", "*.wav",
                            ".git", "graphify-out", "**/__pycache__", ".claude"])
 )
+
+# Per-deploy runtime knobs: forward selected DUBBING_* vars from the DEPLOY shell into the
+# container env, so `_pipeline_env` (which does os.environ.copy()) hands them to run_headless
+# with no code change. Lets one deploy pick the bulk-translation model or Gemini concurrency,
+# e.g.  DUBBING_GEMINI_BULK_MODEL=gemini-3.5-flash-lite modal deploy deploy/modal_app.py
+# Only vars actually set at deploy time are baked in; nothing is forwarded otherwise, so a
+# plain deploy behaves exactly as before.
+_FORWARD_ENV = {
+    k: os.environ[k]
+    for k in ("DUBBING_GEMINI_BULK_MODEL", "DUBBING_GEMINI_CONCURRENCY", "DUBBING_MODAL_SPLIT",
+              "DUBBING_TTS_FANOUT", "DUBBING_TTS_FANOUT_MIN_SEGMENTS", "DUBBING_SBERT_MODEL")
+    if os.environ.get(k)
+}
+# The semantic gate (pipeline/semantic_similarity.py) reads DUBBING_SBERT_MODEL. Default it, for
+# EVERY function, to the converted-safetensors dir on the Volume that prewarm_models writes — so
+# the gate loads under the pinned torch 2.5.1 with no per-deploy flag. A deploy-shell
+# DUBBING_SBERT_MODEL still wins: it is applied AFTER via _FORWARD_ENV (later .env override), e.g.
+# to point the gate at a different model. Before prewarm has run, this path does not exist yet, so
+# the gate degrades exactly as it does today (phoneme-only) — no regression, just a latent default.
+image = image.env({"DUBBING_SBERT_MODEL": SBERT_LOCAL_DIR})
+if _FORWARD_ENV:
+    image = image.env(_FORWARD_ENV)
 
 app = modal.App(APP_NAME, image=image)
 
@@ -183,6 +212,73 @@ def _prep_indicf5():
         hf_cache.commit()                    # persist the patched model.py for later cold starts
     except Exception:
         pass
+
+
+def _prep_indicsbert():
+    """Materialise IndicSBERT as a safetensors sentence-transformers dir on the Volume so the
+    semantic gate loads under the pinned torch 2.5.1. Returns the local dir.
+
+    WHY: l3cube-pune/indic-sentence-similarity-sbert ships ONLY pytorch_model.bin, and
+    transformers 4.57.6 refuses torch.load of a .bin unless torch>=2.6 (CVE-2025-32434). We pin
+    torch 2.5.1 for the IndicF5/f5-tts ABI, so the gate never loads and Stage-4 silently drops to
+    phoneme-only (confirmed on a real run via semantic_similarity.unavailable_reason()). Bumping
+    torch is high ABI risk to IndicF5; instead convert ONCE: torch.load the .bin DIRECTLY (the
+    guard is transformers', not torch's) and re-save as safetensors, leaving a clean ST dir with
+    ONLY safetensors at SBERT_LOCAL_DIR. SentenceTransformer(dir) then loads via the safetensors
+    path and the guard never runs. Idempotent + committed to the Volume, so every later cold start
+    just loads it. Raises on a genuine access/convert failure — loud HERE, not silent per-dub.
+
+    ASSERT THE PROPERTY (CLAUDE rule 5): converting is not the same as loading. We do NOT return
+    on 'a safetensors file exists'; prewarm_models loads the dir and encodes through the SAME
+    semantic_similarity path the gate uses, so a broken conversion fails prewarm, not a dub.
+    """
+    import shutil
+    from pipeline import semantic_similarity
+    os.environ.update(_env_for_hf())
+    token = os.environ.get("HF_TOKEN")
+    src_repo = semantic_similarity.DEFAULT_MODEL      # the canonical source repo id, not the env override
+    target = SBERT_LOCAL_DIR
+    st_file = os.path.join(target, "model.safetensors")
+
+    try:
+        hf_cache.reload()                             # pick up a conversion another container wrote
+    except Exception:
+        pass
+    if os.path.exists(st_file):
+        return target                                 # already converted (verified by the caller)
+
+    from huggingface_hub import snapshot_download
+    src_dir = snapshot_download(src_repo, token=token)   # real files (symlinks resolved on copy)
+
+    # Copy the whole ST structure (modules.json, 1_Pooling, tokenizer, config) to the Volume, then
+    # swap the transformer-root weights .bin -> safetensors so the dir is self-contained & offline.
+    if os.path.isdir(target):
+        shutil.rmtree(target, ignore_errors=True)
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    shutil.copytree(src_dir, target)                  # symlinks=False -> resolves to real files
+
+    import torch
+    from safetensors.torch import save_file
+    bin_path = os.path.join(target, "pytorch_model.bin")
+    if not os.path.exists(bin_path):
+        if os.path.exists(st_file):
+            return target                             # some ST repos already ship safetensors
+        raise FileNotFoundError(
+            f"{src_repo}: neither pytorch_model.bin nor model.safetensors at the transformer root")
+    # weights_only=True: a pure BERT state_dict is all tensors; the guard we are dodging is
+    # transformers', so torch.load direct is allowed. clone().contiguous() breaks any shared
+    # storage (tied weights) so save_file won't raise on shared memory.
+    state = torch.load(bin_path, map_location="cpu", weights_only=True)
+    tensors = {k: v.clone().contiguous() for k, v in state.items() if isinstance(v, torch.Tensor)}
+    save_file(tensors, st_file, metadata={"format": "pt"})
+    os.remove(bin_path)                               # leave NO .bin for transformers to reject
+    print(f"[indicsbert-prep] converted {src_repo} .bin -> safetensors at {target} "
+          f"({len(tensors)} tensors)", flush=True)
+    try:
+        hf_cache.commit()
+    except Exception:
+        pass
+    return target
 
 
 # ── Shared pipeline plumbing (used by the split orchestrator and the un-split GPU path) ─────
@@ -293,12 +389,70 @@ def _finalize_job(job_id, out_dir, target_lang, rc, log_tail, t0, set_status):
     return {"job_id": job_id, "status": "done", "output": final, "video_seconds": billed}
 
 
+@app.function(volumes=VOLUMES, secrets=secrets, timeout=60 * 20)
+def prewarm_models():
+    """One-time cache warm: put every model a run pulls onto the hf_cache Volume so NOTHING
+    downloads on the request path. Run once after deploy (the models then persist on the Volume
+    across future deploys):
+
+        modal run deploy/modal_app.py::prewarm_models
+
+    Why a warm function and not a build step: a Modal Volume is not writable by `pip_install`
+    during image build — IndicF5 itself only reaches the Volume via a RUNTIME warm
+    (`_prep_indicf5`) + commit, and this mirrors that exactly. Baking the download into the
+    image build (`image.run_function(..., volumes=...)`) is possible but would hard-FAIL the
+    whole image on any HF hiccup; this keeps the pipeline's graceful degradation and surfaces a
+    genuine access problem HERE, loudly, instead of silently degrading every dub. Covers:
+      • IndicF5 remote-code model.py + config/vocab (1.3 GB weights still load lazily in TTS).
+      • IndicSBERT (l3cube-pune/indic-sentence-similarity-sbert) — the semantic gate. The repo
+        ships only pytorch_model.bin, which torch 2.5.1 refuses; _prep_indicsbert converts it to
+        safetensors on the Volume so it loads under the pinned torch. Once converted here,
+        semantic_similarity.available() is True on every later run (DUBBING_SBERT_MODEL points at
+        the converted dir, baked into the image env).
+    Idempotent — re-running just re-verifies. Raises if IndicSBERT cannot be fetched, converted,
+    or loaded (a broken conversion fails HERE, not silently on every dub)."""
+    import sys
+    sys.path.insert(0, REPO_MOUNT)
+    os.chdir(REPO_MOUNT)
+    os.environ.update(_env_for_hf())          # HOME -> the Volume, so the HF cache lands there
+
+    # 1) IndicF5 remote code + config/vocab (same warm the GPU path runs).
+    _prep_indicf5()
+
+    # 2) IndicSBERT — convert the .bin weights to safetensors on the Volume (the repo ships no
+    #    safetensors, and torch 2.5.1 refuses the .bin), then PROVE it loads + scores through the
+    #    SAME semantic_similarity path the gate uses. Converting is not loading (CLAUDE rule 5):
+    #    if the conversion is broken this fails HERE, not silently on every dub.
+    target = _prep_indicsbert()
+    os.environ["DUBBING_SBERT_MODEL"] = target        # so the gate below loads the converted dir
+    from pipeline import semantic_similarity
+    if not semantic_similarity.available():
+        raise RuntimeError(
+            f"IndicSBERT still unavailable after convert to {target}: "
+            f"{semantic_similarity.unavailable_reason()}")
+    sanity = semantic_similarity.score("hello world", "नमस्ते दुनिया")
+    if sanity is None:
+        raise RuntimeError(f"IndicSBERT loaded from {target} but scored None on the sanity pair")
+    print(f"[prewarm] IndicSBERT ready (safetensors) at {target}; sanity score={sanity}", flush=True)
+
+    try:
+        hf_cache.commit()                     # persist IndicF5 remote code + converted IndicSBERT
+    except Exception as e:
+        print(f"[prewarm] hf_cache.commit warning: {e}", flush=True)
+    return {"ok": True, "indicsbert": target, "sanity_score": sanity}
+
+
 @app.function(
     gpu=GPU_TYPE,
     volumes=VOLUMES,
     secrets=secrets,
     timeout=60 * 30,
     min_containers=int(os.environ.get("MODAL_WARM", "0")),  # SETUP: 1 keeps a GPU warm for the prep phase
+    # SETUP: the GPU is done the instant Steps 1-3 return; without this the container lingers
+    # the Modal default (~60 s) billing an idle L4 while the CPU orchestrator does translation.
+    # 5 s scales it to zero right after it returns. Raise only if you want warm reuse across
+    # back-to-back jobs (prefer min_containers for that — don't pay for idle to buy latency).
+    scaledown_window=int(os.environ.get("MODAL_GPU_SCALEDOWN", "5")),
     retries=modal.Retries(max_retries=1, backoff_coefficient=1.0),
 )
 def gpu_transcribe(job_id: str, input_name: str, target_lang: str = "Hindi", mode: str = "basic"):
@@ -448,11 +602,24 @@ TTS_MAX_CONTAINERS = int(os.environ.get("MODAL_TTS_MAX_CONTAINERS", "8"))
     volumes=VOLUMES,
     secrets=secrets,
     timeout=60 * 20,
+    # NOTE: these are the STATIC ceiling/floor for any direct call. The fan-out driver
+    # (deploy/tts_fanout.py::_modal_shard_runner) OVERRIDES max_containers and scaledown_window
+    # PER-RUN via Cls.with_options — pinning containers to exactly the planned shard count for
+    # that video — so these values only govern the non-fanned paths.
     max_containers=TTS_MAX_CONTAINERS,
     # SETUP: min_containers=1+ keeps engines warm, which removes the model-load term from
     # the wall-clock floor (the difference between ~60 s and ~25 s for a short video) at the
     # cost of paying for idle GPU. Leave 0 for bursty traffic; raise it for a latency SLA.
     min_containers=int(os.environ.get("MODAL_TTS_WARM", "0")),
+    # SETUP: THE dominant cost lever. The fan-out maps once over N shards; they all finish
+    # within a second of each other, the map drains, and every shard is then idle. Without this
+    # each L4 container lingers the Modal default (~60 s) billing pure idle — ~65% of a short
+    # dub's GPU bill. 5 s scales them to zero right after the drain. The result is already muxed
+    # by then, so this cannot slow any dub. Deliberately a small CONSTANT, not scaled with video
+    # length: the idle bill is workers x window and is length-independent, so inflating it for
+    # long videos only wastes money. Snapshot restore (~seconds) makes the next cold start cheap;
+    # for warm reuse under a latency SLA use MODAL_TTS_WARM, not a long window here.
+    scaledown_window=int(os.environ.get("MODAL_TTS_SCALEDOWN", "5")),
     # Memory snapshot (GA, CPU): bake the heavy imports + the CPU-materialised 1.3 GB model
     # into a snapshot so every future cold start RESTORES it instead of re-importing and
     # re-materialising. The measured cold TTS load is ~28 s (f5_tts import alone ~16 s + weight
@@ -573,10 +740,10 @@ def fastapi_app():
 # SETUP: run the Streamlit UI either here (modal) or on Streamlit Community Cloud pointing at
 # the FastAPI URL. See deploy/streamlit_app.py and deploy/README.md.
 
-# ── REMAINING LEVERS (not yet implemented) ─────────────────────────────────────────────────
-# - Parallelize the per-segment Gemini calls inside Step 4 translation (isochrony_translation
-#   .py). It is now the single largest wall-clock term; concurrency there is the next win, but
-#   it touches the rate-limit/retry loop and deserves its own change + test.
+# ── REMAINING LEVERS ───────────────────────────────────────────────────────────────────────
+# - DONE: the per-segment Gemini calls in Step 4 now run with bounded concurrency
+#   (isochrony_translation._run_batches_concurrent, DUBBING_GEMINI_CONCURRENCY, default 4), so a
+#   long clip's batches overlap their response waits; _throttle still holds each model's RPM.
 # - Split vc mode too: delegate Step 6.5 knn-vc to a GPU function so vc also runs off-GPU for
 #   translation. Deferred until the vc pipeline is validated end-to-end (owner's call).
 

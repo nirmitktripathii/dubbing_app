@@ -58,6 +58,12 @@ from pipeline.duration_tts import (  # noqa: E402
 
 DEFAULT_MAX_SHARDS = int(os.environ.get("DUBBING_TTS_MAX_SHARDS", "8"))
 MIN_SEGMENTS_PER_SHARD = int(os.environ.get("DUBBING_TTS_MIN_PER_SHARD", "2"))
+# The ADAPTIVE target: aim for ~this many segments per worker. A worker is a GPU container
+# that boots, restores the snapshot, does its segments, then sits idle until scaledown. So the
+# right number of workers is "enough to keep wall time bounded", not "one per two segments" —
+# a short clip should NOT spin up 7 replicas that each do 2 segments and then idle-bill. This
+# is what makes provisioning track the job size instead of over-fanning small videos.
+TARGET_SEGMENTS_PER_SHARD = int(os.environ.get("DUBBING_TTS_TARGET_PER_SHARD", "4"))
 
 
 def completed_indices(segments: list, output_dir: str, target_language: str,
@@ -90,22 +96,38 @@ def completed_indices(segments: list, output_dir: str, target_language: str,
 
 
 def plan_shards(pending: Iterable[int], max_shards: int = DEFAULT_MAX_SHARDS,
-                min_per_shard: int = MIN_SEGMENTS_PER_SHARD) -> list:
+                min_per_shard: int = MIN_SEGMENTS_PER_SHARD,
+                target_per_shard: Optional[int] = None) -> list:
     """Split pending global indices into contiguous shards, one per worker.
 
     Contiguous (not round-robin) so neighbouring segments — which share reference state and
-    cache locality — stay together. The shard count is capped so we never spin up more
-    containers than there is work for: each model load costs more than a segment, so a
-    shard holding a single segment is usually a net loss (see the wall-clock model above).
+    cache locality — stay together.
+
+    The shard COUNT scales with the workload so provisioning tracks job size:
+
+      * ``min_per_shard`` is a floor on segments-per-shard — a hard ceiling on the shard
+        count, so a shard never holds fewer segments than its model restore is worth.
+      * ``target_per_shard`` (default ``TARGET_SEGMENTS_PER_SHARD``) is the ADAPTIVE aim:
+        ~this many segments per worker. A short clip therefore provisions a couple of
+        workers, not one-per-two-segments; a long clip fans out until it hits ``max_shards``.
+
+    n_shards = clamp(ceil(n / target_per_shard), 1, min(max_shards, ceil(n / min_per_shard))).
+    The result: a 14-segment clip plans ~4 workers (not 7), and a 60-segment clip still
+    saturates the cap. No worker is created that would only sit idle-billed after ~2 segments.
     """
     idx = sorted(set(pending))
     if not idx:
         return []
+    n = len(idx)
     max_shards = max(1, int(max_shards))
     min_per_shard = max(1, int(min_per_shard))
-    n_shards = max(1, min(max_shards, math.ceil(len(idx) / min_per_shard)))
-    per = math.ceil(len(idx) / n_shards)
-    return [idx[s:s + per] for s in range(0, len(idx), per)]
+    tps = int(target_per_shard if target_per_shard is not None else TARGET_SEGMENTS_PER_SHARD)
+    tps = max(1, tps)
+    hard_cap = max(1, math.ceil(n / min_per_shard))          # never a shard too small to earn its restore
+    adaptive = max(1, math.ceil(n / tps))                    # ~tps segments per worker
+    n_shards = max(1, min(max_shards, hard_cap, adaptive))
+    per = math.ceil(n / n_shards)
+    return [idx[s:s + per] for s in range(0, n, per)]
 
 
 def merge_shard_results(results: Iterable[dict], output_dir: str, log_fn=None) -> dict:
@@ -221,9 +243,30 @@ def generate_tts_fanout(translated_segments: list, target_language: str, output_
 
 
 def _modal_shard_runner():
-    """Default runner: map the shards onto the Modal TTSEngine defined in modal_app.py."""
+    """Default runner: map the shards onto the deployed Modal TTSEngine.
+
+    The worker ceiling and idle window are set PER-RUN from the actual shard count, via
+    ``Cls.with_options`` (which returns an independently-autoscaling variant) — so nothing
+    is baked at deploy time and a short clip cannot leave more GPU replicas idle-billed than
+    it had work for:
+
+      * ``max_containers = len(specs)`` — exactly one container per shard, never more. The
+        map submits len(specs) inputs, so this pins the autoscaler to the plan; it can't
+        speculatively spin up spares.
+      * ``scaledown_window`` — a small constant (runtime-tunable via MODAL_TTS_SCALEDOWN),
+        deliberately NOT scaled with video length: the map drains once per dub, so after the
+        last shard every worker is idle regardless of duration, and the idle bill is
+        workers x window. Minimising the window (not inflating it for long videos) is what
+        cuts that bill. The base @app.cls value is only the floor for non-fanned paths.
+    """
     def run(specs):
         import modal
-        engine = modal.Cls.from_name("indic-dubbing", "TTSEngine")()
-        return engine.synth_shard.map(specs)
+        specs = list(specs)                      # materialise once; also lets us count workers
+        n_workers = max(1, len(specs))
+        scaledown = max(2, int(os.environ.get("MODAL_TTS_SCALEDOWN", "5")))
+        engine_cls = modal.Cls.from_name("indic-dubbing", "TTSEngine").with_options(
+            max_containers=n_workers,
+            scaledown_window=scaledown,
+        )
+        return engine_cls().synth_shard.map(specs)
     return run
