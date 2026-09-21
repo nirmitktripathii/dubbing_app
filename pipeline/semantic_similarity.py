@@ -51,6 +51,16 @@ _model = None
 _load_failed = False
 _load_lock = threading.Lock()
 _warned = False
+# The actual reason the last load failed (import vs model download), kept so a caller that
+# only sees available()==False can surface the CAUSE — e.g. into a file-first pipeline log
+# that never sees this module's logger. None until a load is attempted and fails.
+_last_error = None
+
+
+def unavailable_reason():
+    """The reason the semantic model could not load ('import: ...' or 'load <name>: ...'),
+    or None if it loaded or has not been tried. For logging the CAUSE, not just the symptom."""
+    return _last_error
 
 
 def _warn_once(msg: str, exc: Exception = None):
@@ -65,7 +75,7 @@ def _warn_once(msg: str, exc: Exception = None):
 
 def _get_model():
     """Return the loaded SentenceTransformer, or None if it cannot be loaded (latched)."""
-    global _model, _load_failed
+    global _model, _load_failed, _last_error
     if _model is not None:
         return _model
     if _load_failed:
@@ -80,6 +90,7 @@ def _get_model():
             from sentence_transformers import SentenceTransformer
         except Exception as e:  # noqa: BLE001
             _load_failed = True
+            _last_error = f"import sentence-transformers: {type(e).__name__}: {e}"
             _warn_once(
                 "SEMANTIC GATING DISABLED: `sentence-transformers` is not importable, so "
                 "cross-lingual similarity cannot be measured. Candidate selection will fall "
@@ -93,6 +104,7 @@ def _get_model():
             return _model
         except Exception as e:  # noqa: BLE001
             _load_failed = True
+            _last_error = f"load model {name!r}: {type(e).__name__}: {e}"
             _warn_once(
                 f"SEMANTIC GATING DISABLED: could not load semantic model {name!r} "
                 f"(offline, gated, or download failure). Candidate selection will fall back "

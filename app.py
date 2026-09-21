@@ -482,8 +482,11 @@ if start_btn or resume_btn:
 
         log("  Merging video, audio, and subtitles with FFmpeg...")
         final_video_path = os.path.join(temp_dir, "final_dubbed_video.mp4")
+        # v2 UI keeps hard-burned captions (its prior behaviour); the production headless/Modal
+        # path defaults to the cheaper soft-mux + stream-copy. See video_merge.py / AUDIT P2.
         merge_video_audio_subs(
-            video_path, synced_audio_path, translated_srt_path, final_video_path, log_fn=log
+            video_path, synced_audio_path, translated_srt_path, final_video_path,
+            log_fn=log, burn_subs=True,
         )
         progress.progress(100)
         status.markdown("✅ **Dubbing complete!**")

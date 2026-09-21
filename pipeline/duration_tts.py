@@ -282,6 +282,47 @@ def _load_indicf5(device: str = "auto", log_fn=None):
         )
 
 
+def _move_indicf5_to(device: str, log_fn=None):
+    """Move the already-cached IndicF5 model onto ``device`` in place. For Modal snapshots.
+
+    A Modal CPU memory snapshot is captured with the model materialised in CPU RAM — loaded by
+    ``_load_indicf5("cpu")`` inside a ``@modal.enter(snap=True)`` phase, before any GPU is
+    attached, so the ~1.3 GB weight materialisation and the heavy imports are baked into the
+    snapshot. After restore the GPU is present, and this moves the SAME cached object onto it,
+    reaching the exact device state a direct ``_load_indicf5("cuda")`` would have produced — no
+    reload, no re-download. If nothing is loaded yet it falls back to a normal load so callers
+    stay correct off Modal.
+
+    Additive: the Kaggle/serial/supervised paths never call this, so their behaviour is
+    unchanged. The generate path re-places ema_model+vocoder per call anyway (see
+    generate_tts_for_segments); moving them here just makes the whole model coherently resident
+    on ``device`` immediately after restore.
+    """
+    global _indicf5_model, _indicf5_device
+    if _indicf5_model is None:
+        return _load_indicf5(device, log_fn=log_fn)
+    if _indicf5_device == device:
+        return _indicf5_model, _indicf5_device
+    model = _indicf5_model.to(device)
+    for attr in ("ema_model", "vocoder"):
+        sub = getattr(model, attr, None)
+        if sub is not None:
+            try:
+                sub.to(device)
+            except Exception:
+                pass
+    _indicf5_model = model
+    _indicf5_device = device
+    msg = f"[DurationTTS] moved cached IndicF5 to {device}"
+    print(msg, flush=True)
+    if log_fn is not None:
+        try:
+            log_fn(f"    {msg}")
+        except Exception:
+            pass
+    return model, device
+
+
 def unload_indicf5():
     """Explicitly unload the model and free VRAM."""
     global _indicf5_model, _indicf5_device
@@ -815,6 +856,38 @@ def _apply_drift_correction(
 MANIFEST_NAME = "tts_manifest.json"
 
 
+def resolve_nfe_step(nfe_step: Optional[int] = None, log_fn=None) -> int:
+    """Resolve the diffusion step count: explicit arg > DUBBING_NFE_STEP env > 32.
+
+    32 is the IndicF5 quality baseline; the knob exists so latency can be traded against
+    quality deliberately (never lowered silently). This is the ONE resolver — the fan-out
+    orchestrator (deploy/tts_fanout.py) calls it too, because nfe_step is part of the
+    segment signature: if the two paths resolved it differently they would compute
+    different signatures for identical work and silently re-synthesize everything.
+    """
+    def _say(m):
+        if log_fn is not None:
+            try:
+                log_fn(m)
+            except Exception:
+                pass
+
+    if nfe_step is None:
+        _env_nfe = os.environ.get("DUBBING_NFE_STEP", "").strip()
+        if _env_nfe:
+            try:
+                nfe_step = int(_env_nfe)
+            except ValueError:
+                _say(f"WARNING: DUBBING_NFE_STEP='{_env_nfe}' is not an integer; using default 32.")
+                nfe_step = 32
+        else:
+            nfe_step = 32
+    if nfe_step < 1:
+        _say(f"WARNING: nfe_step={nfe_step} is invalid; clamping to 1.")
+        nfe_step = 1
+    return nfe_step
+
+
 def _segment_signature(text: str, target_duration: float, lang_code: str, nfe_step: int) -> str:
     """Stable hash of everything that determines a segment's audio. If any of these change
     between runs (e.g. translation re-ran and produced different text), the signature
@@ -876,6 +949,7 @@ def generate_tts_for_segments(
     nfe_step: Optional[int] = None,
     watchdog_mode: str = "thread",
     heartbeat_path: Optional[str] = None,
+    only_indices: Optional[set] = None,
 ) -> list:
     """
     Generate duration-controlled TTS audio for each translated segment.
@@ -919,6 +993,13 @@ def generate_tts_for_segments(
                                supervisor polls for liveness. Written best-effort (never
                                raises, never materially blocks): boot -> loading -> synth
                                with the current segment index. Ignored when None.
+        only_indices:          Restrict synthesis to this set of GLOBAL segment indices
+                               (fan-out sharding). The full segment list is still passed
+                               in, so indices, filenames and manifest keys are identical
+                               to a serial run and shards merge without renumbering; the
+                               segments outside the set are returned untouched and not
+                               synthesized. None (default) = synthesize everything, the
+                               serial behaviour. See deploy/tts_fanout.py.
 
     Returns:
         Same list of segments, with 'audio_path' added to each element.
@@ -970,22 +1051,7 @@ def generate_tts_for_segments(
 
     _beat("boot")
 
-    # Resolve the diffusion step count: explicit arg > DUBBING_NFE_STEP env > 32.
-    # 32 is the IndicF5 quality baseline; the knob exists so latency can be traded
-    # against quality deliberately (never lowered silently).
-    if nfe_step is None:
-        _env_nfe = os.environ.get("DUBBING_NFE_STEP", "").strip()
-        if _env_nfe:
-            try:
-                nfe_step = int(_env_nfe)
-            except ValueError:
-                tts_log(f"WARNING: DUBBING_NFE_STEP='{_env_nfe}' is not an integer; using default 32.")
-                nfe_step = 32
-        else:
-            nfe_step = 32
-    if nfe_step < 1:
-        tts_log(f"WARNING: nfe_step={nfe_step} is invalid; clamping to 1.")
-        nfe_step = 1
+    nfe_step = resolve_nfe_step(nfe_step, log_fn=tts_log)
     if nfe_step != 32:
         tts_log(f"Diffusion steps: nfe_step={nfe_step} (default is 32 — latency/quality trade-off active).")
     else:
@@ -1066,6 +1132,17 @@ def generate_tts_for_segments(
 
     results = []
     for i, seg in enumerate(translated_segments):
+        # ── Shard filter (fan-out) ────────────────────────────────────────────
+        # `only_indices` lets a worker synthesize just its slice of a run while still
+        # seeing the WHOLE segment list, so `i` stays the GLOBAL index: filenames
+        # (segment_%04d.wav) and manifest keys remain identical to a serial run, and the
+        # shards' outputs merge without renumbering. Skipped segments are still appended
+        # so the returned list stays 1:1 with the input; they are simply not synthesized
+        # and their manifest entries are left untouched for the owning shard to write.
+        if only_indices is not None and i not in only_indices:
+            results.append({**seg, "audio_path": os.path.join(output_dir, f"segment_{i:04d}.wav")})
+            continue
+
         # Advance the heartbeat as we move to each segment. If synthesis of THIS segment
         # wedges, no further beat fires and the supervisor kills+relaunches after the
         # per-segment stall budget. (Covers every path below, incl. the resume-skip and

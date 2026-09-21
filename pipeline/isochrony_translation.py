@@ -46,6 +46,7 @@ import ssl
 import re
 import random
 import threading
+import concurrent.futures
 from typing import Optional
 import builtins
 
@@ -217,6 +218,56 @@ def _throttle(model: str) -> None:
         _LAST_CALL[model] = time.monotonic()
 
 
+def _gemini_concurrency() -> int:
+    """How many batched Gemini calls may be IN FLIGHT at once. `_throttle` still spaces the
+    START of each request to a given model by 60/RPM, so concurrency never bursts past the
+    per-minute cap — it only overlaps the response WAITS of independent batches, which is where
+    a long clip's translation wall clock actually goes. 1 restores the old strictly-sequential
+    behaviour; env-tunable via DUBBING_GEMINI_CONCURRENCY (default 4, clamped to [1, 16])."""
+    try:
+        v = int(os.environ.get("DUBBING_GEMINI_CONCURRENCY", "4"))
+    except (TypeError, ValueError):
+        return 4
+    return max(1, min(v, 16))
+
+
+def _run_batches_concurrent(chunks, run_one, concurrency, log_fn=None):
+    """Fold ``run_one(chunk) -> (dict, served_list)`` over independent ``chunks`` with at most
+    ``concurrency`` calls in flight, returning ``(merged_dict, served_list)``.
+
+    Correctness is order-independent: chunks are DISJOINT segment slices, so each partial dict
+    carries a distinct set of segment ids and ``merged.update`` can never overwrite one chunk's
+    result with another's — the merged dict is identical no matter which chunk finishes first.
+    ``served`` names are concatenated in chunk order so the "served by" line is deterministic.
+    With ``concurrency <= 1`` or a single chunk this is byte-for-byte the old sequential loop.
+    """
+    chunks = list(chunks)
+    if concurrency <= 1 or len(chunks) <= 1:
+        merged, served = {}, []
+        for ch in chunks:
+            part, srv = run_one(ch)
+            merged.update(part)
+            served.extend(srv)
+        return merged, served
+
+    if log_fn:
+        try:
+            log_fn(f"  [IsochronyTranslation] Dispatching {len(chunks)} batches, "
+                   f"up to {concurrency} in flight...")
+        except Exception:
+            pass
+    results = [None] * len(chunks)     # index by submission order for deterministic aggregation
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as ex:
+        fut_to_idx = {ex.submit(run_one, ch): i for i, ch in enumerate(chunks)}
+        for fut in concurrent.futures.as_completed(fut_to_idx):
+            results[fut_to_idx[fut]] = fut.result()   # run_one guards itself; never expected to raise
+    merged, served = {}, []
+    for part, srv in results:
+        merged.update(part)
+        served.extend(srv)
+    return merged, served
+
+
 _RETRY_DELAY_RE = re.compile(
     r"retry[_ ]?delay['\"]?\s*[:=]\s*['\"]?(\d+(?:\.\d+)?)\s*s?", re.IGNORECASE
 )
@@ -370,7 +421,7 @@ class SegmentCandidatesResponse(BaseModel):
 class SegmentAudit(BaseModel):
     segment_id: int = Field(description="The integer ID of the audited segment")
     verdict: str = Field(
-        description="One of: ok, drift, inversion, omission, fabrication, addition"
+        description="One of: ok, drift, inversion, omission, fabrication, addition, incomplete"
     )
     needs_fix: bool = Field(
         description="True if the translation must be corrected for meaning fidelity"
@@ -1033,10 +1084,17 @@ def _build_audit_prompt(
     target_language: str,
     window_idx: int = 0,
     total_windows: int = 1,
+    check_completeness: bool = True,
 ) -> str:
     """Build an audit prompt for one window of segments, explicitly showing
     surrounding context before & after to prevent false-positive flags on
-    sentence fragments split across cuts."""
+    sentence fragments split across cuts.
+
+    When ``check_completeness`` is set, the reviewer ALSO flags a translation that
+    is grammatically UNFINISHED (drops the closing verb/copula, trails off on a
+    postposition) — but ONLY when THAT segment's own english is itself a complete
+    sentence. That source-completeness gate keeps this disjoint from "fabrication":
+    a fragment translating a fragment stays "ok" and is never force-completed."""
     lang_cap = target_language.capitalize()
     target_json = json.dumps(target_items, ensure_ascii=False, indent=2)
 
@@ -1069,7 +1127,37 @@ def _build_audit_prompt(
     body = "\n".join(context_sections)
     target_ids_str = f"from {target_items[0]['segment_id']} to {target_items[-1]['segment_id']}"
 
-    return f"""You are a senior bilingual {lang_cap} dubbing reviewer. Audit a finished translation for MEANING FIDELITY ONLY.
+    if check_completeness:
+        header_scope = "MEANING FIDELITY and GRAMMATICAL COMPLETENESS"
+        incomplete_rule = (
+            f'- "incomplete": the {lang_cap} translation is grammatically UNFINISHED — it drops the '
+            f'finite verb or copula the sentence requires (e.g. it ends on a noun or postposition '
+            f'where Hindi "है"/"हैं"/"था" is needed), or it trails off on a postposition '
+            f'(में, का, के, को, से, पर). Use this verdict ONLY when THIS segment\'s OWN english is a '
+            f'COMPLETE sentence (it ends with . ! or ?). Example: english "Welcome to Fun Science '
+            f'Demos." rendered as "फन साइंस डेमोज़ में स्वागत।" is INCOMPLETE — the natural finished '
+            f'form is "फन साइंस डेमोज़ में आपका स्वागत है।". If this segment\'s english is itself a '
+            f'fragment that continues in the next segment, NEVER use "incomplete" (that would be '
+            f'"fabrication" in reverse).\n'
+        )
+        verdict_enum = "ok|inversion|fabrication|addition|omission|drift|incomplete"
+        fluency_note = (
+            'Do NOT flag for style, word choice, naturalness, or length/timing. A terse but faithful, '
+            'grammatically complete line is "ok". A fragment that stops mid-thought because its english '
+            'ALSO stops mid-thought is "ok" — but a translation left grammatically unfinished while its '
+            'OWN english is a complete sentence is "incomplete", not "ok".'
+        )
+    else:
+        header_scope = "MEANING FIDELITY ONLY"
+        incomplete_rule = ""
+        verdict_enum = "ok|inversion|fabrication|addition|omission|drift"
+        fluency_note = (
+            'Do NOT flag for style, word choice, naturalness, fluency, or length/timing. A terse but '
+            'faithful line is "ok". A fragment that stops mid-thought because its english also stops '
+            'mid-thought is "ok".'
+        )
+
+    return f"""You are a senior bilingual {lang_cap} dubbing reviewer. Audit a finished translation for {header_scope}.
 
 You are given a window of numbered segments. Read the PRIOR and SUBSEQUENT context segments to understand incomplete thoughts and sentences that span across segment boundaries. Then judge EACH TARGET segment's translation against ITS OWN english source.
 
@@ -1078,18 +1166,18 @@ The English was split by automatic speech recognition, which routinely CUTS SENT
 - A translation that faithfully renders a sentence FRAGMENT — even one that reads incomplete on its own — is CORRECT. Verdict "ok".
 - Judge each translation ONLY against the words in ITS OWN english segment; use the surrounding context only to understand where the sentence began or where it continues.
 
-Flag a segment (needs_fix = true) ONLY for a real MEANING error against its own english source:
+Flag a segment (needs_fix = true) ONLY for a real error against its own english source:
 - "inversion": reverses or negates the meaning (drops or adds a "not", says the opposite).
 - "fabrication": invents an ending or information not present in THIS segment's english — most commonly by "completing" a sentence whose real continuation lives in the next segment.
 - "addition": states meaning not in this segment's english (including content that belongs to a neighbouring segment).
 - "omission": drops a meaningful part of what this segment's english actually says.
 - "drift": says something materially different from the source, not covered above.
-Everything else is verdict "ok", needs_fix false.
+{incomplete_rule}Everything else is verdict "ok", needs_fix false.
 
-Do NOT flag for style, word choice, naturalness, fluency, or length/timing. A terse but faithful line is "ok". A fragment that stops mid-thought because its english also stops mid-thought is "ok".
+{fluency_note}
 
 Return ONLY valid JSON (no markdown fences, no commentary) of exactly this shape:
-{{"audits": [{{"segment_id": <int>, "verdict": "ok|inversion|fabrication|addition|omission|drift", "needs_fix": <true|false>, "reason": "<one short sentence naming the problem, or 'faithful'>"}}]}}
+{{"audits": [{{"segment_id": <int>, "verdict": "{verdict_enum}", "needs_fix": <true|false>, "reason": "<one short sentence naming the problem, or 'faithful'>"}}]}}
 Include EVERY segment_id in the TARGET SEGMENTS ({target_ids_str}) exactly once. Do NOT include verdicts for context segments.
 
 {body}"""
@@ -1135,6 +1223,70 @@ def _parse_audit(raw: str, expected_ids: Optional[set] = None) -> dict:
     return out
 
 
+# Closed-class Hindi postpositions and compound-postposition tails. A target
+# sentence that ENDS on one of these (before final punctuation), while its own
+# english is a complete sentence, has trailed off — grammatically unfinished.
+_HI_POSTPOSITIONS = {
+    "में", "का", "के", "की", "को", "से", "पर", "ने", "तक", "पे", "द्वारा",
+}
+_HI_COMPOUND_TAILS = {
+    "लिए", "साथ", "बाद", "पास", "ऊपर", "नीचे", "सामने", "बारे", "तरफ", "ओर",
+    "अनुसार", "दौरान", "खिलाफ", "रूप", "कारण", "जरिए", "जरिये", "माध्यम", "बजाय",
+    "अलावा", "भीतर", "बाहर", "पीछे", "आगे", "बीच",
+}
+_SENT_SPLIT_RE = re.compile(r"[।.!?]+")
+
+
+def _source_is_complete_sentence(text: str) -> bool:
+    """A source english span is treated as a complete sentence when it ends in
+    terminal punctuation. Whisper's resegmentation aims for complete sentences, so
+    this is the discriminator that keeps the completeness check from ever trying to
+    finish a genuine mid-clause fragment (which would be fabrication)."""
+    t = (text or "").strip()
+    return bool(t) and t[-1] in ".!?"
+
+
+def _scan_dangling_targets(segments: list, translated_segments: list, internal_lang: str) -> dict:
+    """Deterministic, zero-API completeness backstop for Hindi (Devanagari).
+
+    Flags a segment when BOTH: (a) its own english is a complete sentence, and
+    (b) its translation's FINAL sentence ends on a closed-class postposition or a
+    compound-postposition tail (के लिए / के बाद / …) — an unambiguous 'trailed off'
+    pattern. Returns {segment_id: reason}. High precision by construction: it fires
+    only on the closed postposition set, so it never rewrites a valid verb-final
+    line. The subtler 'dropped copula on a noun-final clause' case (e.g. '…में
+    स्वागत।' missing 'है') is out of reach of a closed-class rule and is left to the
+    LLM audit's "incomplete" verdict."""
+    if internal_lang != "hindi":
+        return {}
+    flagged = {}
+    for i, seg in enumerate(segments):
+        if i >= len(translated_segments):
+            break
+        if not _source_is_complete_sentence(seg.get("text", "")):
+            continue
+        tgt = (translated_segments[i].get("text") or "").strip()
+        if not tgt:
+            continue
+        parts = [p.strip() for p in _SENT_SPLIT_RE.split(tgt) if p.strip()]
+        if not parts:
+            continue
+        toks = parts[-1].split()
+        if not toks:
+            continue
+        last = toks[-1]
+        prev = toks[-2] if len(toks) >= 2 else ""
+        dangling = last in _HI_POSTPOSITIONS or (
+            last in _HI_COMPOUND_TAILS and prev in ("के", "की", "का")
+        )
+        if dangling:
+            flagged[i] = (
+                f'grammatically incomplete: the sentence trails off on "{last}" without its '
+                f"finishing verb/phrase — complete it naturally using only this segment's meaning."
+            )
+    return flagged
+
+
 def _audit_once(
     client,
     segments: list,
@@ -1142,11 +1294,13 @@ def _audit_once(
     target_language: str,
     log_fn: Optional[Callable[[str], None]] = None,
     filter_ids: Optional[set] = None,
+    check_completeness: bool = True,
 ) -> dict:
-    """Run meaning audit on the Gemini refine chain. For long transcripts, splits
-    into overlapping windows (AUDIT_WINDOW_SIZE with AUDIT_WINDOW_OVERLAP context).
-    If `filter_ids` is provided (e.g. during auto-heal), only audits windows containing
-    those flagged segments, saving API calls.
+    """Run meaning (and, when `check_completeness`, grammatical-completeness) audit on
+    the Gemini refine chain. For long transcripts, splits into overlapping windows
+    (AUDIT_WINDOW_SIZE with AUDIT_WINDOW_OVERLAP context). If `filter_ids` is provided
+    (e.g. during auto-heal), only audits windows containing those flagged segments,
+    saving API calls.
     Returns {segment_id: {verdict, needs_fix, reason}}."""
     windows = _slice_audit_windows(
         segments, translated_segments,
@@ -1180,6 +1334,7 @@ def _audit_once(
             target_language,
             window_idx=w_idx,
             total_windows=w_tot,
+            check_completeness=check_completeness,
         )
 
         try:
@@ -1292,8 +1447,12 @@ def translate_segments_isochrony(
         _log(f"[IsochronyTranslation] Semantic gate: IndicSBERT active "
              f"(threshold {semantic_threshold}, ruler {active_ruler()}).")
     else:
+        # Surface the ACTUAL cause into this (file-first) log — the distinguishing WARNING is
+        # emitted on semantic_similarity's Python logger, which a subprocess/container log may
+        # never capture. Distinguishes "package missing" from "model download/load failed".
+        reason = semantic_similarity.unavailable_reason()
         _log("[IsochronyTranslation] Semantic gate UNAVAILABLE — selecting on phoneme fit "
-             "only (see WARNING above). Install sentence-transformers to enable it.")
+             "only. Cause: " + (reason or "unknown (model load returned no error detail)"))
 
     # Per-segment best-so-far record, tracked across every iteration (global minima).
     best_by_seg: dict = {i: None for i in range(len(segments))}
@@ -1329,16 +1488,22 @@ def translate_segments_isochrony(
         batch_size = 8
 
     def _generate_batch(items, prompt_builder, temperature, models, phase="batch"):
-        """Run one batched Gemini generation on the given model chain; returns
+        """Run batched Gemini generation on the given model chain; returns
         {seg_id: [candidate,...]}. `models` selects the phase — Gemma-first for
         the iteration-0 bulk, the Gemini ladder for refinement. `phase` is only a
-        label for the "served by" confirmation line."""
-        out = {}
-        served: List[str] = []
-        for bstart in range(0, len(items), batch_size):
-            chunk = items[bstart:bstart + batch_size]
-            bnum = (bstart // batch_size) + 1
-            total = -(-len(items) // batch_size)
+        label for the "served by" confirmation line.
+
+        The independent per-chunk calls run with bounded concurrency
+        (_gemini_concurrency) so a long clip's many batches overlap their response
+        waits instead of running strictly one-after-another; _throttle still keeps
+        each model under its RPM. DUBBING_GEMINI_CONCURRENCY=1 => the old serial path."""
+        items = list(items)
+        chunks = [items[b:b + batch_size] for b in range(0, len(items), batch_size)]
+        total = len(chunks)
+
+        def run_one(numbered):
+            bnum, chunk = numbered
+            served_local: List[str] = []
             _log(f"  [IsochronyTranslation] Gemini batch {bnum}/{total} ({len(chunk)} segments)...")
             try:
                 prompt = prompt_builder(chunk)
@@ -1348,7 +1513,7 @@ def translate_segments_isochrony(
                     response_mime_type="application/json",
                     log_fn=log_fn,
                     models=models,
-                    served=served,
+                    served=served_local,
                     # On an unparseable reply, reask the SAME model for clean JSON
                     # (up to twice) before falling through the chain.
                     validate_fn=_parse_batch,
@@ -1358,7 +1523,7 @@ def translate_segments_isochrony(
                 parsed = _parse_batch(raw)
                 if not parsed:
                     raise ValueError("no parseable segments in batch reply")
-                out.update(parsed)
+                return parsed, served_local
             except Exception as e:
                 _log(f"    [IsochronyTranslation] Batch {bnum} failed: {e}. Falling back sequentially...")
                 # Sequential fallback expects the enriched-item shape.
@@ -1366,10 +1531,15 @@ def translate_segments_isochrony(
                     it if "phoneme_budget" in it else enriched[it["segment_id"]]
                     for it in chunk
                 ]
-                out.update(_translate_sequential(
+                part = _translate_sequential(
                     client, seq_items, internal_lang, n_candidates,
-                    log_fn=log_fn, models=models, served=served,
-                ))
+                    log_fn=log_fn, models=models, served=served_local,
+                )
+                return part, served_local
+
+        out, served = _run_batches_concurrent(
+            list(enumerate(chunks, 1)), run_one, _gemini_concurrency(), log_fn=log_fn,
+        )
         if served:
             # Confirm which model(s) ACTUALLY served this phase — for the bulk
             # phase this is the check that Gemma (not Gemini) took the load.
@@ -1568,24 +1738,38 @@ def translate_segments_isochrony(
 
     _audit_flag = os.environ.get("DUBBING_TRANSLATION_AUDIT", "1").strip().lower()
     audit_on = _audit_flag not in ("0", "false", "no", "off", "")
+    _completeness_flag = os.environ.get("DUBBING_COMPLETENESS_CHECK", "1").strip().lower()
+    completeness_on = _completeness_flag not in ("0", "false", "no", "off", "")
 
     if not audit_on:
         _log("[IsochronyTranslation] Step 5 translation audit DISABLED (DUBBING_TRANSLATION_AUDIT=0).")
     else:
         _log("[IsochronyTranslation] Step 5: whole-transcript meaning audit "
-             "(catches inversion / fabricated completions the per-segment gate cannot)...")
-        audits = _audit_once(client, segments, translated_segments, target_language, log_fn=log_fn)
-        if not audits:
+             "(catches inversion / fabricated completions + grammatically unfinished lines "
+             "the per-segment gate cannot)...")
+        audits = _audit_once(client, segments, translated_segments, target_language,
+                             log_fn=log_fn, check_completeness=completeness_on)
+        # Deterministic Devanagari backstop (no API cost): force-flag a target that
+        # trails off on a postposition though its OWN english is a complete sentence,
+        # in case the LLM audit (tuned for fragment-tolerance) let it pass.
+        dangling = _scan_dangling_targets(segments, translated_segments, internal_lang) if completeness_on else {}
+        if not audits and not dangling:
             _log("[IsochronyTranslation] Audit unavailable — keeping per-segment selections "
                  "unaudited (run not aborted).")
             for ts in translated_segments:
                 ts["audit_verdict"] = "audit_unavailable"
         else:
+            if not audits:
+                audits = {}
             first_flags = {i for i in range(len(segments))
                            if audits.get(i) and audits[i]["needs_fix"]}
+            for i, reason in dangling.items():
+                if not (audits.get(i) and audits[i]["needs_fix"]):
+                    audits[i] = {"verdict": "incomplete", "needs_fix": True, "reason": reason}
+                    first_flags.add(i)
             n_flag0 = len(first_flags)
             _log(f"[IsochronyTranslation] Audit pass 1: {n_flag0}/{len(segments)} segment(s) "
-                 f"flagged for meaning" + (f": {sorted(first_flags)}" if first_flags else "."))
+                 f"flagged (meaning + completeness)" + (f": {sorted(first_flags)}" if first_flags else "."))
 
             for fix_round in range(1, AUDIT_MAX_FIX_ROUNDS + 1):
                 flagged = [i for i in range(len(segments))
@@ -1671,7 +1855,8 @@ def translate_segments_isochrony(
 
                 new_audits = _audit_once(client, segments, translated_segments,
                                          target_language, log_fn=log_fn,
-                                         filter_ids=set(flagged))
+                                         filter_ids=set(flagged),
+                                         check_completeness=completeness_on)
                 if not new_audits:
                     _log("[IsochronyTranslation] Re-audit unavailable; keeping prior verdicts, "
                          "stopping heal loop.")
