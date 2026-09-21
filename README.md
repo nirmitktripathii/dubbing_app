@@ -18,6 +18,37 @@ Hindi · Bengali · Marathi · Gujarati · Punjabi · Tamil · Telugu · Kannada
 
 ---
 
+## 🎥 See it in action
+
+**A 79-second science demo, dubbed English → Hindi.** Same footage, same 79 s runtime, background audio left untouched — only the spoken track is re-voiced in Hindi and **timed to the original's exact segment slots**. Press play on both:
+
+<table>
+<tr>
+<td width="50%" valign="top">
+
+**🇬🇧 English — original**
+
+https://github.com/user-attachments/assets/6036d159-0cb8-4741-95f6-d8bce58ffebb
+
+<sub><i>"Hi, I am Jared. Welcome to Fun Science Demos."</i></sub>
+
+</td>
+<td width="50%" valign="top">
+
+**🇮🇳 Hindi — AI-dubbed**
+
+https://github.com/user-attachments/assets/6c2ebe5d-b3e4-4dcd-8f91-a26e87b3e01f
+
+<sub><i>"मैं जेरेड हूँ। फन साइंस डेमो में स्वागत है।"</i></sub>
+
+</td>
+</tr>
+</table>
+
+<sub>13 segments · the English and Hindi subtitle tracks share <b>identical time windows</b> (the opening line occupies <code>00:00.27&nbsp;→&nbsp;00:02.87</code> in both) — the dub is fit to the shot, not laid over it. Both clips live in <a href="docs/demo"><code>docs/demo/</code></a>.</sub>
+
+---
+
 ## ✨ What is this?
 
 A full **video-to-video dubbing pipeline**. You give it an English video; it returns the same video speaking a target Indic language — with the **background audio preserved**, the **speaker's voice optionally cloned**, and, crucially, the translated speech **timed to fit the original mouth movements** instead of running long or short.
