@@ -3,15 +3,22 @@
 
     python deploy/demo_dev_server.py            # then open http://localhost:8765
     (access code: dev)
+    python deploy/demo_dev_server.py --voice-dir <dir with curated <code>.wav + manifest.json>
 
 Builds the real FastAPI app (deploy/api.py + deploy/demo_ui.py) with in-memory fakes in place
 of the Modal Dict / Volume / dub_video. The fake job walks the real stage strings
 modal_app._parse_stage emits, writes the same meter fields modal_app writes, and "dubs" by
 copying the upload — so the page, the progress mapping and the cost maths are exercised end to
 end. The page shows a banner saying the figures are simulated.
+
+With --voice-dir, the voice hint and the simulated log come from the real resolver
+(pipeline/voice_refs.py) over that directory, and the "dubbed" video's audio track is replaced by
+the reference clip a real Basic-mode run would clone — so a curated voice can be heard in the
+page's player. It is the reference voice, not a dub.
 """
 import os
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -46,6 +53,35 @@ class FakeVol:
     def reload(self): pass
 
 
+def _resolve_voice(lang, log_fn):
+    """The real Basic-mode resolver's decision for ``lang``. The pinned Hindi clip is not
+    downloaded here, so Hindi and fallback languages report the decision without audio."""
+    from pipeline import voice_refs
+    code = {v: k for k, v in voice_refs.CODE_TO_LANGUAGE.items()}.get(lang)
+    if code is None:
+        return None
+    ref = voice_refs.resolve_basic_reference(
+        code, log_fn=lambda m: log_fn(f"  [voice] {m}"),
+        download_pinned=lambda: None)
+    log_fn(f"  [voice] resolved: {ref['source']} {ref['detail'] or ''}".rstrip())
+    return ref
+
+
+def _mux_reference(src, ref_wav, out, log_fn):
+    """Replace ``src``'s audio with ``ref_wav`` (video looped/cut to the clip). True on success."""
+    try:
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-stream_loop", "-1", "-i", src,
+                        "-i", ref_wav, "-map", "0:v:0", "-map", "1:a:0", "-c:v", "libx264",
+                        "-preset", "ultrafast", "-c:a", "aac", "-shortest", out],
+                       check=True, capture_output=True, timeout=120)
+    except Exception as e:
+        log_fn(f"  [voice] could not attach the reference clip ({e}); copying the upload instead")
+        return False
+    log_fn("  [voice] SIMULATED output: its audio is the reference clip a real run would clone, "
+           "not a dub")
+    return True
+
+
 class FakeDub:
     def spawn(self, job_id, input_name, target_lang, mode):
         threading.Thread(target=self._run, args=(job_id, input_name, target_lang), daemon=True).start()
@@ -56,15 +92,19 @@ class FakeDub:
             cur.update(kw)
             STATUS[job_id] = cur
         t0 = time.time()
-        log = []
+        log, ref = [], None
         put(status="running", stage="starting", started_at=t0)
         for stage, line, dwell in SCRIPT:
             log.append(line.format(lang=lang))
             put(stage=stage.format(lang=lang), log="\n".join(log), heartbeat=time.time())
             time.sleep(dwell)
+            if stage.startswith("step 5/7"):
+                ref = _resolve_voice(lang, log.append)
+                put(log="\n".join(log))
         src = os.path.join(JOBS_DIR, job_id, input_name)
         out = os.path.join(JOBS_DIR, job_id, f"dubbed_{lang.lower()}.mp4")
-        shutil.copyfile(src, out)
+        if not (ref and ref.get("audio") and _mux_reference(src, ref["audio"], out, log.append)):
+            shutil.copyfile(src, out)
         # Fake meters in the exact shape modal_app writes (numbers are illustrative only).
         put(meter={"gpu_transcribe_s": 24.0, "gpu_transcribe_n": 1},
             tts_meter={"workers": [{"task": "ta-1", "up_s": 21.0, "n_segments": 3},
@@ -79,7 +119,15 @@ class FakeDub:
 
 
 def main():
+    import argparse
     import uvicorn
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--voice-dir", help="curated voice-reference directory (sets DUBBING_VOICE_REF_DIR)")
+    args = ap.parse_args()
+    if args.voice_dir:
+        os.environ["DUBBING_VOICE_REF_DIR"] = os.path.abspath(args.voice_dir)
+        from deploy.demo_ui import voice_coverage
+        print(f"Voice references from {os.environ['DUBBING_VOICE_REF_DIR']}: {voice_coverage()}")
     os.makedirs(JOBS_DIR, exist_ok=True)
     app = build_api(dub_video=FakeDub(), job_status=STATUS, jobs_vol=FakeVol(), jobs_dir=JOBS_DIR)
     port = int(os.environ.get("PORT", "8765"))

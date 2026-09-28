@@ -83,3 +83,5 @@ task.md
 
 # Local demo-UI simulator job dirs (deploy/demo_dev_server.py)
 deploy/.demo_jobs/
+# Locally curated voice references (Rasa, CC BY 4.0) for demo_dev_server.py --voice-dir
+deploy/.voice_refs/
