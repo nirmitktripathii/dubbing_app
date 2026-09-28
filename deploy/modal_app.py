@@ -383,11 +383,16 @@ def _finalize_job(job_id, out_dir, target_lang, rc, log_tail, t0, set_status):
     sys.path.insert(0, REPO_MOUNT)
     from deploy.api import probe_duration   # one duration impl for the gate and the meter
     # Per-worker TTS timings written by tts_fanout (the shards return them to this process).
-    try:
-        with open(os.path.join(out_dir, "tts_meter.json"), encoding="utf-8") as fh:
-            set_status(tts_meter=json.load(fh))
-    except Exception:
-        pass
+    # tts_fanout writes into ITS output_dir, which run_headless sets to <out_dir>/tts_chunks —
+    # reading only <out_dir> silently dropped the TTS line from every estimate.
+    for meter_path in (os.path.join(out_dir, "tts_chunks", "tts_meter.json"),
+                       os.path.join(out_dir, "tts_meter.json")):
+        try:
+            with open(meter_path, encoding="utf-8") as fh:
+                set_status(tts_meter=json.load(fh))
+            break
+        except Exception:
+            continue
     if rc != 0:
         set_status(status="failed", rc=rc, log=log_tail, finished_at=time.time(),
                    error=f"run_headless exited {rc}; see log tail.")
