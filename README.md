@@ -192,12 +192,12 @@ streamlit run app.py
 
 | Setting | Env var | Default | Purpose |
 |---|---|---|---|
-| Bulk (iteration-0) model | `DUBBING_GEMINI_BULK_MODEL` | `gemma-4-31b-it` → `gemma-4-26b-a4b-it` | High-volume first pass on the lenient Gemma limits. Falls through the Gemini ladder if Gemma is unavailable. |
+| Bulk (iteration-0) model | `DUBBING_GEMINI_BULK_MODEL` | `gemini-3.1-flash-lite` → `gemini-3.5-flash-lite` | Every translation call is allowlisted to these two models; any other id (e.g. Gemma) is ignored with a log line. |
 | Refine model | `DUBBING_GEMINI_REFINE_MODEL` / `DUBBING_GEMINI_MODEL` | `gemini-3.1-flash-lite` | Used only for refinement rounds on hard segments. Falls back to `gemini-3.5-flash-lite`. |
 | Requests-per-minute cap | `DUBBING_GEMINI_RPM` | `30` (Gemma) / `15` (Gemini) | Client-side throttle: min interval between calls = `60/RPM`. |
 | Requests-per-day cap | `DUBBING_GEMINI_RPD` | *(unset)* | Optional hard per-model daily cap; a capped model is skipped so the job degrades with a clear error instead of hammering 429s. |
 | Cache directory | `DUBBING_CACHE_DIR` | `./.dubbing_cache` | Where the candidate pool + daily-usage counter live. |
-| Candidate cache path | `DUBBING_TRANSLATION_CACHE` | `<cache_dir>/translations.json` | Full override for the candidate-pool file. |
+| Candidate cache path | `DUBBING_TRANSLATION_CACHE` | `<cache_dir>/translations_gemini.json` | Full override for the candidate-pool file. |
 | Cache on/off | `use_cache` param | `True` | Pass `use_cache=False` to `translate_segments_isochrony` to bypass the disk cache for a run. |
 
 > **Gemma on the Gemini API doesn't support structured output (`response_schema`).** The stage detects a Gemma model and parses JSON from plain text instead (fence-strip + balanced-bracket match), so the hybrid routing is transparent to the caller. The candidate cache **accumulates across runs** — quality only improves, and repeated phrases within a single video are served from cache after the first generation.
