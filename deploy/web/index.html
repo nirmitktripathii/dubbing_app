@@ -1,0 +1,478 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IndicAI Dubbing</title>
+<meta name="description" content="Upload an English clip, get it dubbed into an Indian language.">
+<style>
+  :root {
+    --bg: #f6f5f2; --surface: #ffffff; --surface-2: #f0eee9; --border: #e3e0d8;
+    --text: #1d1b16; --muted: #6b665a; --accent: #d9480f; --accent-ink: #ffffff;
+    --accent-soft: #fff0e8; --ok: #2b8a3e; --ok-soft: #e6f4ea; --err: #c92a2a; --err-soft: #fdecec;
+    --bar-track: #ebe8e1; --log-bg: #1b1a17; --log-text: #e9e6de;
+    --shadow: 0 1px 2px rgba(20, 18, 12, .06), 0 8px 24px rgba(20, 18, 12, .06);
+    --radius: 14px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #141311; --surface: #1d1c19; --surface-2: #262521; --border: #34322c;
+      --text: #efece5; --muted: #a39d90; --accent: #ff7a3d; --accent-ink: #1a0d05;
+      --accent-soft: #2e1d13; --ok: #69db7c; --ok-soft: #16281b; --err: #ff8787; --err-soft: #2e1717;
+      --bar-track: #2d2b26; --log-bg: #0f0e0c; --log-text: #dcd8ce;
+      --shadow: 0 1px 2px rgba(0, 0, 0, .3), 0 8px 24px rgba(0, 0, 0, .25);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #141311; --surface: #1d1c19; --surface-2: #262521; --border: #34322c;
+    --text: #efece5; --muted: #a39d90; --accent: #ff7a3d; --accent-ink: #1a0d05;
+    --accent-soft: #2e1d13; --ok: #69db7c; --ok-soft: #16281b; --err: #ff8787; --err-soft: #2e1717;
+    --bar-track: #2d2b26; --log-bg: #0f0e0c; --log-text: #dcd8ce;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .3), 0 8px 24px rgba(0, 0, 0, .25);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 32px 16px 64px; }
+  header { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+  .mark {
+    width: 38px; height: 38px; border-radius: 10px; background: var(--accent);
+    display: grid; place-items: center; color: var(--accent-ink); flex: none;
+  }
+  h1 { font-size: 22px; margin: 0; letter-spacing: -.01em; }
+  .tagline { color: var(--muted); margin: 0 0 24px; }
+  .banner {
+    background: var(--accent-soft); border: 1px solid var(--border); border-radius: 10px;
+    padding: 10px 14px; margin-bottom: 16px; font-size: 14px;
+  }
+  .card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    box-shadow: var(--shadow); padding: 22px; margin-bottom: 18px;
+  }
+  .card h2 { font-size: 16px; margin: 0 0 14px; }
+  .drop {
+    border: 2px dashed var(--border); border-radius: 12px; padding: 28px 16px;
+    text-align: center; cursor: pointer; background: var(--surface-2);
+    transition: border-color .15s, background .15s;
+  }
+  .drop:hover, .drop.over { border-color: var(--accent); background: var(--accent-soft); }
+  .drop strong { display: block; font-size: 15px; }
+  .drop span { color: var(--muted); font-size: 13px; }
+  .drop.has-file { padding: 14px 16px; text-align: left; display: flex; gap: 14px; align-items: center; }
+  .drop.has-file video { width: 132px; aspect-ratio: 16/9; object-fit: cover; border-radius: 8px; background: #000; flex: none; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 16px; }
+  @media (max-width: 560px) { .grid { grid-template-columns: 1fr; } }
+  label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+  select, input[type=password], input[type=text] {
+    width: 100%; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border);
+    background: var(--surface); color: var(--text); font: inherit;
+  }
+  select:focus, input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 18px; }
+  button, .btn {
+    appearance: none; border: 0; border-radius: 10px; padding: 11px 18px; font: inherit;
+    font-weight: 600; cursor: pointer; background: var(--accent); color: var(--accent-ink);
+    text-decoration: none; display: inline-flex; align-items: center; gap: 8px; white-space: nowrap;
+  }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .btn.ghost, button.ghost { background: var(--surface-2); color: var(--text); border: 1px solid var(--border); }
+  .msg { font-size: 14px; border-radius: 10px; padding: 10px 12px; margin-top: 14px; display: none; }
+  .msg.err { display: block; background: var(--err-soft); color: var(--err); }
+  .msg.ok { display: block; background: var(--ok-soft); color: var(--ok); }
+  .hidden { display: none !important; }
+
+  .status-top { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+  .desc { font-size: 17px; font-weight: 600; }
+  .pct { font-size: 28px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .bar { height: 10px; background: var(--bar-track); border-radius: 99px; overflow: hidden; margin: 10px 0 12px; }
+  .bar > div { height: 100%; width: 0; background: var(--accent); border-radius: 99px; transition: width .6s ease; }
+  .bar.done > div { background: var(--ok); }
+  .bar.failed > div { background: var(--err); }
+  .meta { display: flex; flex-wrap: wrap; gap: 6px 18px; color: var(--muted); font-size: 13px; }
+  .meta b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .steps { list-style: none; padding: 0; margin: 16px 0 0; display: grid; gap: 6px; }
+  .steps li { display: flex; gap: 10px; align-items: center; font-size: 14px; color: var(--muted); }
+  .steps li .dot {
+    width: 18px; height: 18px; border-radius: 50%; border: 2px solid var(--border); flex: none;
+    display: grid; place-items: center; font-size: 11px;
+  }
+  .steps li.done { color: var(--text); }
+  .steps li.done .dot { background: var(--ok); border-color: var(--ok); color: var(--surface); }
+  .steps li.active { color: var(--text); font-weight: 600; }
+  .steps li.active .dot { border-color: var(--accent); border-top-color: transparent; animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  details { margin-top: 16px; }
+  summary { cursor: pointer; font-size: 13px; font-weight: 600; color: var(--muted); }
+  pre.log {
+    background: var(--log-bg); color: var(--log-text); border-radius: 10px; padding: 12px;
+    font: 12px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; max-height: 280px;
+    overflow: auto; white-space: pre-wrap; word-break: break-word; margin: 8px 0 0;
+  }
+
+  .players { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 640px) { .players { grid-template-columns: 1fr; } }
+  .players figure { margin: 0; }
+  .players video { width: 100%; border-radius: 10px; background: #000; display: block; }
+  .players figcaption { font-size: 13px; color: var(--muted); margin-top: 6px; }
+  .link { display: flex; gap: 8px; margin-top: 12px; }
+  .link input { font: 12px ui-monospace, Consolas, monospace; }
+
+  .cost-total { display: flex; gap: 28px; flex-wrap: wrap; align-items: baseline; }
+  .cost-total .big { font-size: 30px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .cost-total .lbl { color: var(--muted); font-size: 13px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 14px; font-size: 14px; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--border); }
+  th { font-size: 12px; color: var(--muted); font-weight: 600; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .foot { color: var(--muted); font-size: 12px; margin-top: 12px; }
+  .pending { color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="mark" aria-hidden="true">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h2M7 8v8M11 5v14M15 8v8M19 11v2"/></svg>
+    </div>
+    <h1>IndicAI Dubbing</h1>
+  </header>
+  <p class="tagline">Upload an English clip and get it back dubbed into one of 11 Indian languages, with the timing matched to the original.</p>
+
+  <div id="simBanner" class="banner hidden">Local simulation: no Modal and no GPU are involved. The progress, logs and cost shown here are made up for testing.</div>
+  <div id="offBanner" class="banner hidden">The demo is switched off on this deployment because no access code is configured.</div>
+
+  <!-- 1. Upload -->
+  <section class="card" id="formCard">
+    <h2>1 · Upload a clip</h2>
+    <div class="drop" id="drop" tabindex="0" role="button" aria-label="Choose a video file">
+      <div id="dropEmpty">
+        <strong>Drop a video here, or click to choose one</strong>
+        <span id="limits">MP4, MOV, MKV or WebM</span>
+      </div>
+      <video id="srcThumb" class="hidden" muted playsinline></video>
+      <div id="dropFile" class="hidden"><strong id="fileName"></strong><span id="fileMeta"></span></div>
+    </div>
+    <input type="file" id="file" accept="video/*,.mkv" class="hidden">
+
+    <div class="grid">
+      <div>
+        <label for="lang">Dub into</label>
+        <select id="lang"></select>
+        <div class="hint" id="voiceHint"></div>
+      </div>
+      <div>
+        <label for="mode">Voice</label>
+        <select id="mode">
+          <option value="basic">Native voice (recommended)</option>
+          <option value="vc">Clone the original speaker (beta)</option>
+        </select>
+      </div>
+      <div>
+        <label for="code">Access code</label>
+        <input type="password" id="code" autocomplete="off" placeholder="Provided with your invite">
+        <div class="hint">Saved in this browser only.</div>
+      </div>
+    </div>
+    <div class="row">
+      <button id="go" disabled>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
+        Dub video
+      </button>
+      <span id="uploadNote" class="pending"></span>
+    </div>
+    <div id="formMsg" class="msg"></div>
+  </section>
+
+  <!-- 2. Progress -->
+  <section class="card hidden" id="progCard">
+    <h2>2 · Progress</h2>
+    <div class="status-top">
+      <div class="desc" id="desc">Starting…</div>
+      <div class="pct" id="pct">0%</div>
+    </div>
+    <div class="bar" id="bar"><div></div></div>
+    <div class="meta">
+      <span>Elapsed <b id="elapsed">0:00</b></span>
+      <span>Clip <b id="clipLen">–</b></span>
+      <span>Language <b id="jobLang">–</b></span>
+      <span>Job <b id="jobId">–</b></span>
+    </div>
+    <ul class="steps" id="steps"></ul>
+    <details id="logBox">
+      <summary>Pipeline log</summary>
+      <pre class="log" id="log">Waiting for the first log lines…</pre>
+    </details>
+    <div id="progMsg" class="msg"></div>
+  </section>
+
+  <!-- 3. Result -->
+  <section class="card hidden" id="resultCard">
+    <h2>3 · Your dubbed video</h2>
+    <div class="players">
+      <figure id="origFig" class="hidden"><video id="origVideo" controls playsinline></video><figcaption>Original</figcaption></figure>
+      <figure><video id="dubVideo" controls playsinline></video><figcaption id="dubCaption">Dubbed</figcaption></figure>
+    </div>
+    <div class="row">
+      <a class="btn" id="dlBtn" href="#" download>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></svg>
+        Download MP4
+      </a>
+      <button class="ghost" id="again">Dub another clip</button>
+    </div>
+    <div class="link">
+      <input type="text" id="shareUrl" readonly aria-label="Shareable link">
+      <button class="ghost" id="copyBtn">Copy link</button>
+    </div>
+    <div class="hint">Anyone with this link can watch or download the video.</div>
+  </section>
+
+  <!-- 4. Cost (owner view; hide with ?cost=0) -->
+  <section class="card hidden" id="costCard">
+    <h2>Modal compute cost for this dub</h2>
+    <div id="costBody" class="pending">The cost is calculated once the dub finishes.</div>
+  </section>
+</div>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const store = {
+    get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+    set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+  };
+  const params = new URLSearchParams(location.search);
+  const SHOW_COST = params.get("cost") !== "0";
+  const STEPS = [
+    ["1", "Extract audio"], ["2", "Separate voice from background"], ["3", "Transcribe speech"],
+    ["4", "Translate with timing constraints"], ["5", "Prepare the voice"],
+    ["6", "Synthesise dubbed speech"], ["7", "Mix and merge the video"],
+  ];
+  let file = null, fileUrl = null, jobId = null, pollTimer = null, tickTimer = null;
+  let lastElapsed = 0, lastElapsedAt = 0, running = false, doneExtraPolls = 0;
+
+  const fmtTime = (s) => {
+    if (s == null || isNaN(s)) return "–";
+    s = Math.max(0, Math.round(s));
+    const m = Math.floor(s / 60), r = s % 60;
+    return m >= 60 ? `${Math.floor(m / 60)}:${String(m % 60).padStart(2, "0")}:${String(r).padStart(2, "0")}`
+                   : `${m}:${String(r).padStart(2, "0")}`;
+  };
+  const usd = (x, d = 4) => x == null ? "–" : "$" + Number(x).toFixed(d);
+  const showMsg = (el, kind, text) => { el.className = "msg " + kind; el.textContent = text; };
+  const hideMsg = (el) => { el.className = "msg"; el.textContent = ""; };
+
+  // ── config ──
+  fetch("/ui/config").then(r => r.json()).then(cfg => {
+    const sel = $("lang");
+    cfg.languages.forEach(l => sel.add(new Option(l, l)));
+    const saved = store.get("dub.lang");
+    if (saved && cfg.languages.includes(saved)) sel.value = saved;
+    // Which reference voice the language gets. A language with no native voice yet is dubbed
+    // with the Hindi voice, so say so instead of letting the accent be a surprise.
+    const voices = cfg.voices || {};
+    const voiceHint = () => {
+      const l = sel.value, v = voices[l];
+      $("voiceHint").textContent =
+        v === "native" ? `Native ${l} speaker voice.` :
+        v === "pinned" ? "Native Hindi speaker voice." :
+        v === "fallback" ? `No native ${l} voice installed yet; a Hindi voice is used, so expect a Hindi accent.` : "";
+    };
+    sel.addEventListener("change", voiceHint);
+    voiceHint();
+    $("limits").textContent = `MP4, MOV, MKV or WebM · up to ${fmtTime(cfg.max_seconds)} long · max ${cfg.max_upload_mb} MB`;
+    if (cfg.simulated) $("simBanner").classList.remove("hidden");
+    if (!cfg.enabled) $("offBanner").classList.remove("hidden");
+  }).catch(() => {});
+  $("code").value = store.get("dub.code") || "";
+  const savedMode = store.get("dub.mode"); if (savedMode) $("mode").value = savedMode;
+
+  // ── file picking ──
+  const drop = $("drop"), input = $("file");
+  const pick = (f) => {
+    if (!f) return;
+    file = f;
+    if (fileUrl) URL.revokeObjectURL(fileUrl);
+    fileUrl = URL.createObjectURL(f);
+    drop.classList.add("has-file");
+    $("dropEmpty").classList.add("hidden");
+    $("dropFile").classList.remove("hidden");
+    const thumb = $("srcThumb");
+    thumb.classList.remove("hidden");
+    thumb.src = fileUrl;
+    $("fileName").textContent = f.name;
+    const mb = (f.size / 1048576).toFixed(1) + " MB";
+    $("fileMeta").textContent = " · " + mb;
+    thumb.onloadedmetadata = () => {
+      $("fileMeta").textContent = ` · ${fmtTime(thumb.duration)} · ${mb}`;
+      try { thumb.currentTime = Math.min(1, thumb.duration / 2); } catch {}
+    };
+    $("go").disabled = false;
+    hideMsg($("formMsg"));
+  };
+  drop.addEventListener("click", () => input.click());
+  drop.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); input.click(); } });
+  input.addEventListener("change", () => pick(input.files[0]));
+  ["dragenter", "dragover"].forEach(ev => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add("over"); }));
+  ["dragleave", "drop"].forEach(ev => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove("over"); }));
+  drop.addEventListener("drop", (e) => pick(e.dataTransfer.files[0]));
+
+  // ── submit (XHR, so the upload itself shows progress) ──
+  $("go").addEventListener("click", () => {
+    const code = $("code").value.trim();
+    if (!file) return;
+    if (!code) { showMsg($("formMsg"), "err", "Enter the access code you were given."); $("code").focus(); return; }
+    store.set("dub.code", code); store.set("dub.lang", $("lang").value); store.set("dub.mode", $("mode").value);
+    const fd = new FormData();
+    fd.append("file", file, file.name);
+    fd.append("target_lang", $("lang").value);
+    fd.append("mode", $("mode").value);
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", "/ui/dub");
+    xhr.setRequestHeader("X-Demo-Code", code);
+    xhr.setRequestHeader("Idempotency-Key", (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random()));
+    $("go").disabled = true;
+    hideMsg($("formMsg"));
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) $("uploadNote").textContent = `Uploading… ${Math.round(e.loaded / e.total * 100)}%`;
+    };
+    xhr.onload = () => {
+      $("uploadNote").textContent = "";
+      let body = {};
+      try { body = JSON.parse(xhr.responseText); } catch {}
+      if (xhr.status === 200 && body.job_id) {
+        startJob(body.job_id, true);
+      } else {
+        $("go").disabled = false;
+        const detail = body.detail || xhr.statusText || "Upload failed";
+        showMsg($("formMsg"), "err", xhr.status === 403 ? "That access code isn't valid." : detail);
+      }
+    };
+    xhr.onerror = () => { $("go").disabled = false; $("uploadNote").textContent = ""; showMsg($("formMsg"), "err", "Network error during upload. Try again."); };
+    xhr.send(fd);
+  });
+
+  // ── progress ──
+  const renderSteps = (stage, status) => {
+    const m = /step\s+(\d+(?:\.\d+)?)\/7/.exec(stage || "");
+    const cur = m ? parseFloat(m[1]) : (status === "done" ? 99 : 0);
+    $("steps").innerHTML = STEPS.map(([n, label]) => {
+      const k = parseFloat(n);
+      const cls = status === "done" || k < Math.floor(cur) ? "done" : (k === Math.floor(cur) && status === "running" ? "active" : "");
+      return `<li class="${cls}"><span class="dot">${cls === "done" ? "✓" : ""}</span>${label}</li>`;
+    }).join("");
+  };
+
+  const startJob = (id, fresh) => {
+    jobId = id; running = true; doneExtraPolls = 0;
+    history.replaceState(null, "", location.pathname + location.search + "#job=" + id);
+    $("progCard").classList.remove("hidden");
+    $("resultCard").classList.add("hidden");
+    $("jobId").textContent = id.slice(0, 8);
+    $("bar").className = "bar";
+    if (SHOW_COST) { $("costCard").classList.remove("hidden"); $("costBody").className = "pending"; $("costBody").textContent = "The cost is calculated once the dub finishes."; }
+    renderSteps("", "queued");
+    if (fresh) $("progCard").scrollIntoView({ behavior: "smooth", block: "start" });
+    clearInterval(tickTimer);
+    tickTimer = setInterval(() => { if (running) $("elapsed").textContent = fmtTime(lastElapsed + (Date.now() - lastElapsedAt) / 1000); }, 1000);
+    poll();
+  };
+
+  const poll = async () => {
+    clearTimeout(pollTimer);
+    let st;
+    try {
+      const r = await fetch(`/ui/dub/${jobId}`, { headers: { "X-Demo-Code": $("code").value.trim() } });
+      if (r.status === 404) { stopWith("This job no longer exists."); return; }
+      if (r.status === 403) { stopWith("Enter the access code above to follow this job."); return; }
+      st = await r.json();
+    } catch { pollTimer = setTimeout(poll, 5000); return; }
+
+    $("desc").textContent = st.description;
+    $("pct").textContent = st.percent + "%";
+    $("bar").firstElementChild.style.width = st.percent + "%";
+    $("clipLen").textContent = fmtTime(st.input_seconds);
+    $("jobLang").textContent = st.target_lang || "–";
+    if (st.elapsed_s != null) { lastElapsed = st.elapsed_s; lastElapsedAt = Date.now(); $("elapsed").textContent = fmtTime(st.elapsed_s); }
+    renderSteps(st.stage, st.status);
+    const log = $("log");
+    const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 8;
+    if (st.log && st.log.length) log.textContent = st.log.join("\n");
+    if (atBottom) log.scrollTop = log.scrollHeight;
+
+    if (SHOW_COST) renderCost(st.cost, st.status);
+
+    if (st.status === "done") {
+      running = false;
+      $("bar").className = "bar done";
+      showResult(st);
+      // The orchestrator writes its own meter last; poll briefly until the cost is final.
+      if (SHOW_COST && !(st.cost && st.cost.final) && doneExtraPolls++ < 10) pollTimer = setTimeout(poll, 3000);
+      return;
+    }
+    if (st.status === "failed") {
+      running = false;
+      $("bar").className = "bar failed";
+      $("logBox").open = true;
+      showMsg($("progMsg"), "err", st.error || "The dub failed. The log above shows where.");
+      $("go").disabled = false;
+      if (SHOW_COST && !(st.cost && st.cost.final) && doneExtraPolls++ < 10) pollTimer = setTimeout(poll, 3000);
+      return;
+    }
+    pollTimer = setTimeout(poll, 3000);
+  };
+
+  const stopWith = (text) => { running = false; showMsg($("progMsg"), "err", text); };
+
+  const showResult = (st) => {
+    if (!$("resultCard").classList.contains("hidden")) return;
+    $("resultCard").classList.remove("hidden");
+    const v = $("dubVideo");
+    v.src = st.video_url;
+    $("dubCaption").textContent = `Dubbed · ${st.target_lang}`;
+    if (fileUrl) { $("origFig").classList.remove("hidden"); $("origVideo").src = fileUrl; }
+    $("dlBtn").href = st.download_url;
+    $("shareUrl").value = new URL(st.download_url, location.origin).href;
+    $("go").disabled = !file;
+    $("resultCard").scrollIntoView({ behavior: "smooth", block: "start" });
+  };
+
+  const renderCost = (c, status) => {
+    const body = $("costBody");
+    if (!c) { body.className = "pending"; body.textContent = status === "done" || status === "failed" ? "No meter was recorded for this job (it ran on a build without metering)." : "The cost is calculated once the dub finishes."; return; }
+    const rows = c.lines.map(l => `<tr><td>${l.label}<div class="hint">${l.note || ""}</div></td><td class="num">${fmtTime(l.seconds)}</td><td class="num">${usd(l.usd, 5)}</td></tr>`).join("");
+    body.className = "";
+    body.innerHTML = `
+      <div class="cost-total">
+        <div><div class="big">${usd(c.total_usd)}</div><div class="lbl">${c.final ? "total for this dub" : "so far (still metering)…"}</div></div>
+        <div><div class="big">${c.input_seconds ? fmtTime(c.input_seconds) : "–"}</div><div class="lbl">clip length (t)</div></div>
+        <div><div class="big">${usd(c.usd_per_video_minute)}</div><div class="lbl">per minute of video</div></div>
+      </div>
+      <table><thead><tr><th>Container</th><th class="num">Billed time</th><th class="num">Cost</th></tr></thead><tbody>${rows}</tbody></table>
+      <div class="foot">${c.method} Not included: ${c.excludes.join("; ")}.</div>`;
+  };
+
+  $("again").addEventListener("click", () => {
+    history.replaceState(null, "", location.pathname + location.search);
+    $("resultCard").classList.add("hidden"); $("progCard").classList.add("hidden"); $("costCard").classList.add("hidden");
+    hideMsg($("progMsg"));
+    $("formCard").scrollIntoView({ behavior: "smooth" });
+  });
+  $("copyBtn").addEventListener("click", async () => {
+    const u = $("shareUrl").value;
+    try { await navigator.clipboard.writeText(u); $("copyBtn").textContent = "Copied"; }
+    catch { $("shareUrl").select(); }
+    setTimeout(() => $("copyBtn").textContent = "Copy link", 1500);
+  });
+
+  // Resume a job after a reload (#job=<id>).
+  const m = /job=([0-9a-f]{32})/.exec(location.hash);
+  if (m) startJob(m[1], false);
+})();
+</script>
+</body>
+</html>

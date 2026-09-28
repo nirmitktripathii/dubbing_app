@@ -44,6 +44,8 @@ MAX_UPLOAD_MB = int(os.environ.get("DUB_MAX_UPLOAD_MB", "500"))
 VALID_MODES = {"basic", "vc", "xlingual"}
 # Per-plan input ceilings (seconds of video). RapidAPI enforces call quotas; this guards GPU.
 PLAN_MAX_SECONDS = {"BASIC": 600, "PRO": 3600, "ULTRA": 7200, "": 120}  # "" = unauth/free probe
+# The web demo UI (deploy/demo_ui.py) submits as plan DEMO: access-code gated, its own ceiling.
+PLAN_MAX_SECONDS["DEMO"] = int(os.environ.get("DUB_DEMO_MAX_SECONDS", "300"))
 
 
 def probe_duration(path: str) -> float | None:
@@ -78,7 +80,8 @@ class ApiError(Exception):
 
 def prepare_job(*, job_status, jobs_vol, jobs_dir, dub_video, data: bytes, filename: str,
                 target_lang: str, mode: str, plan: str = "", user: str | None = None,
-                idempotency_key: str | None = None, max_upload_mb: int = MAX_UPLOAD_MB):
+                idempotency_key: str | None = None, max_upload_mb: int = MAX_UPLOAD_MB,
+                extra: dict | None = None):
     """Validate + persist input + spawn the GPU job. Pure (no FastAPI); raises ApiError.
 
     This is the POST /v1/dub business logic, extracted so auth/limits/idempotency/spawn are
@@ -137,6 +140,7 @@ def prepare_job(*, job_status, jobs_vol, jobs_dir, dub_video, data: bytes, filen
         "status": "queued", "mode": mode, "target_lang": target_lang, "user": user,
         "plan": plan, "max_seconds": max_seconds, "input_seconds": duration,
         "created_at": time.time(),
+        **(extra or {}),
     }
     if idempotency_key:
         job_status[f"idem:{idempotency_key}"] = job_id
@@ -218,7 +222,7 @@ def build_api(dub_video, job_status, jobs_vol, jobs_dir):
         if not st:
             raise HTTPException(404, "unknown job_id")
         # Don't leak the internal log tail unless failed (useful for support).
-        public = {k: v for k, v in st.items() if k not in ("log",)}
+        public = {k: v for k, v in st.items() if k not in ("log", "dl_token")}
         if st.get("status") == "failed":
             public["log"] = st.get("log", "")
         return public
@@ -240,4 +244,9 @@ def build_api(dub_video, job_status, jobs_vol, jobs_dir):
             raise HTTPException(410, "output no longer available")
         return FileResponse(out, media_type="video/mp4", filename=f"dubbed_{job_id}.mp4")
 
+    # The web demo UI (GET / + /ui/*): same prepare_job + dub_video path as /v1, gated by
+    # DEMO_ACCESS_CODE instead of the RapidAPI proxy secret. See deploy/demo_ui.py.
+    from deploy.demo_ui import add_demo_routes
+    add_demo_routes(api, dub_video=dub_video, job_status=job_status, jobs_vol=jobs_vol,
+                    jobs_dir=jobs_dir)
     return api

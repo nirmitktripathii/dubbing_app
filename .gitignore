@@ -80,3 +80,6 @@ task.md
 # README showcase demo clips — the ONLY committed videos; the *.mp4 rule above still
 # ignores every other video so stray renders never land in the repo.
 !docs/demo/*.mp4
+
+# Local demo-UI simulator job dirs (deploy/demo_dev_server.py)
+deploy/.demo_jobs/

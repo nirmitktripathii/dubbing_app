@@ -216,7 +216,7 @@ def test_threshold(fails):
     import typing
     ns = _extract(
         os.path.join(REPO, "deploy", "tts_fanout.py"),
-        {"plan_shards", "DEFAULT_MAX_SHARDS", "MIN_SEGMENTS_PER_SHARD"},
+        {"plan_shards", "DEFAULT_MAX_SHARDS", "MIN_SEGMENTS_PER_SHARD", "TARGET_SEGMENTS_PER_SHARD"},
         # tts_fanout uses `from __future__ import annotations`, which the ast-lift drops, so the
         # signature annotations (Iterable/Optional) evaluate eagerly — seed the typing names.
         {"os": os, "math": __import__("math"),

@@ -52,6 +52,10 @@ REPO_MOUNT = "/root/app"
 # pipeline reads it via DUBBING_SBERT_MODEL (baked into the image env below). The path MUST sit
 # under the CACHE_DIR mount ("/cache/hf") so it lands on the Volume. See _prep_indicsbert().
 SBERT_LOCAL_DIR = "/cache/hf/models/indic-sbert-st"
+# Native per-language reference voices for Basic mode (pipeline/voice_refs.py), written ONCE by
+# curate_voice_refs from AI4Bharat Rasa onto the hf_cache Volume. Until that runs, every
+# non-Hindi language falls back to the Hindi clip with a WARNING in the run log.
+VOICE_REF_DIR = "/cache/hf/voice_refs"
 
 # ── Image: mirrors the PROVEN Kaggle environment ──────────────────────────────────────────
 # The Kaggle notebook (kaggle/build_notebook.py) is the reference for what a working IndicF5
@@ -109,7 +113,7 @@ _FORWARD_ENV = {
 # DUBBING_SBERT_MODEL still wins: it is applied AFTER via _FORWARD_ENV (later .env override), e.g.
 # to point the gate at a different model. Before prewarm has run, this path does not exist yet, so
 # the gate degrades exactly as it does today (phoneme-only) — no regression, just a latent default.
-image = image.env({"DUBBING_SBERT_MODEL": SBERT_LOCAL_DIR})
+image = image.env({"DUBBING_SBERT_MODEL": SBERT_LOCAL_DIR, "DUBBING_VOICE_REF_DIR": VOICE_REF_DIR})
 if _FORWARD_ENV:
     image = image.env(_FORWARD_ENV)
 
@@ -124,6 +128,9 @@ job_status = modal.Dict.from_name("indic-dubbing-status", create_if_missing=True
 
 # SETUP: create these secrets: `modal secret create dubbing-secrets GEMINI_API_KEY=... HF_TOKEN=... RAPIDAPI_PROXY_SECRET=...`
 secrets = [modal.Secret.from_name("dubbing-secrets")]
+# SETUP: the web demo UI's access code (deploy/demo_ui.py), attached to the API container ONLY:
+#   modal secret create dubbing-demo DEMO_ACCESS_CODE=<something long>
+demo_secrets = [modal.Secret.from_name("dubbing-demo")]
 
 CACHE_DIR = "/cache/hf"
 JOBS_DIR = "/jobs"
@@ -298,6 +305,19 @@ def _make_set_status(job_id: str):
     return set_status
 
 
+def _meter_add(job_id: str, key: str, seconds: float):
+    """Accumulate container-seconds for the demo UI's cost estimate (deploy/demo_ui.py). Adds
+    rather than sets, so a Modal retry's second attempt is billed on top of the first -- which
+    is what Modal does. `<name>_n` counts attempts (each pays its own idle tail)."""
+    cur = job_status.get(job_id, {})
+    m = dict(cur.get("meter") or {})
+    n_key = key[:-2] + "_n"
+    m[key] = round(m.get(key, 0.0) + float(seconds), 2)
+    m[n_key] = m.get(n_key, 0) + 1
+    cur["meter"] = m
+    job_status[job_id] = cur
+
+
 def _pipeline_env(in_path: str, out_dir: str, target_lang: str, mode: str,
                   stages: str, fanout: bool):
     """Build the run_headless environment for one phase. `stages` is DUBBING_STAGES
@@ -359,11 +379,17 @@ def _run_headless_streamed(env, set_status):
 def _finalize_job(job_id, out_dir, target_lang, rc, log_tail, t0, set_status):
     """Detect the output, meter on its MEASURED duration, and set the terminal status. Shared
     by the split orchestrator and the un-split GPU path so metering is identical either way."""
-    import sys
+    import sys, json
     sys.path.insert(0, REPO_MOUNT)
     from deploy.api import probe_duration   # one duration impl for the gate and the meter
+    # Per-worker TTS timings written by tts_fanout (the shards return them to this process).
+    try:
+        with open(os.path.join(out_dir, "tts_meter.json"), encoding="utf-8") as fh:
+            set_status(tts_meter=json.load(fh))
+    except Exception:
+        pass
     if rc != 0:
-        set_status(status="failed", rc=rc, log=log_tail,
+        set_status(status="failed", rc=rc, log=log_tail, finished_at=time.time(),
                    error=f"run_headless exited {rc}; see log tail.")
         try:
             jobs_vol.commit()
@@ -379,7 +405,7 @@ def _finalize_job(job_id, out_dir, target_lang, rc, log_tail, t0, set_status):
     # probe cannot read the result (never silently meter zero).
     measured = probe_duration(final) if final else None
     billed = measured if measured is not None else job_status.get(job_id, {}).get("input_seconds", 0.0)
-    set_status(status="done", stage="complete", output=final,
+    set_status(status="done", stage="complete", output=final, finished_at=time.time(),
                video_seconds=billed, metered_from=("output" if measured is not None else "input"),
                elapsed_s=round(time.time() - t0, 1), log=log_tail)
     try:
@@ -435,11 +461,71 @@ def prewarm_models():
         raise RuntimeError(f"IndicSBERT loaded from {target} but scored None on the sanity pair")
     print(f"[prewarm] IndicSBERT ready (safetensors) at {target}; sanity score={sanity}", flush=True)
 
+    # 3) Reference-voice coverage. Reported, never fatal: a language without a native clip still
+    #    dubs (Hindi-clip fallback, WARNING in its log). Fix with curate_voice_refs.
+    from pipeline import voice_refs
+    cov = voice_refs.coverage(VOICE_REF_DIR)
+    missing = sorted(c for c, s in cov.items() if s == "fallback")
+    print(f"[prewarm] reference voices: {cov}", flush=True)
+    if missing:
+        print(f"[prewarm] WARNING: no native reference voice for {missing} — these use the Hindi "
+              "clip cross-lingually. Run: modal run deploy/modal_app.py::curate_voice_refs",
+              flush=True)
+
     try:
         hf_cache.commit()                     # persist IndicF5 remote code + converted IndicSBERT
     except Exception as e:
         print(f"[prewarm] hf_cache.commit warning: {e}", flush=True)
-    return {"ok": True, "indicsbert": target, "sanity_score": sanity}
+    return {"ok": True, "indicsbert": target, "sanity_score": sanity, "voice_refs": cov}
+
+
+@app.function(volumes=VOLUMES, secrets=secrets, timeout=60 * 45)
+def curate_voice_refs(languages: str = "", gender: str = "male"):
+    """One-time (CPU): pick a native reference voice per language from AI4Bharat Rasa.
+
+        modal run deploy/modal_app.py::curate_voice_refs
+        modal run deploy/modal_app.py::curate_voice_refs --languages ta,te --gender female
+
+    PREREQUISITE: accept the dataset terms at huggingface.co/datasets/ai4bharat/Rasa with the
+    HF account whose HF_TOKEN is in the `dubbing-secrets` Modal secret (Rasa is gated=auto).
+
+    Selection is by the pre-registered rules in pipeline/voice_refs.py (script, length band,
+    loudness, clipping, file-vs-stated duration, speaking rate). Only the metadata columns of
+    one parquet shard plus the audio of a few row groups are read per language — not the
+    dataset. Writes <code>.wav + manifest.json (provenance, license, sha256, per-check stats)
+    to VOICE_REF_DIR on the hf_cache Volume and commits it. Hindi keeps the pinned clip unless
+    named explicitly in --languages. A language that fails is recorded with its reason and
+    keeps the Hindi fallback; the call fails only if NO language succeeded.
+    """
+    import sys
+    sys.path.insert(0, REPO_MOUNT)
+    os.chdir(REPO_MOUNT)
+    os.environ.update(_env_for_hf())
+    from pipeline import voice_refs
+
+    try:
+        hf_cache.reload()
+    except Exception:
+        pass
+    langs = [c.strip() for c in languages.split(",") if c.strip()] or None
+    unknown = [c for c in (langs or []) if c not in voice_refs.CODE_TO_LANGUAGE]
+    if unknown:
+        raise ValueError(f"unknown language code(s) {unknown}; "
+                         f"valid: {sorted(voice_refs.CODE_TO_LANGUAGE)}")
+    manifest = voice_refs.curate(VOICE_REF_DIR, languages=langs, token=os.environ.get("HF_TOKEN"),
+                                 gender=gender.strip().lower() or "male",
+                                 log=lambda m: print(m, flush=True))
+    hf_cache.commit()
+    entries = manifest.get("languages", {})
+    asked = langs or [c for c in voice_refs.CODE_TO_LANGUAGE if c != "hi"]
+    ok = sorted(c for c in asked if (entries.get(c) or {}).get("status") == "ok")
+    failed = {c: (entries.get(c) or {}).get("reason") for c in asked if c not in ok}
+    summary = {"ok": ok, "failed": failed, "coverage": voice_refs.coverage(VOICE_REF_DIR),
+               "dir": VOICE_REF_DIR}
+    print(f"[curate] {summary}", flush=True)
+    if not ok:
+        raise RuntimeError(f"no language curated: {failed} — accepted the Rasa terms for HF_TOKEN?")
+    return summary
 
 
 @app.function(
@@ -466,15 +552,18 @@ def gpu_transcribe(job_id: str, input_name: str, target_lang: str = "Hindi", mod
     set_status = _make_set_status(job_id)
     _, out_dir, in_path = _job_paths(job_id, input_name)
     env = _pipeline_env(in_path, out_dir, target_lang, mode, stages="prep", fanout=False)
-    set_status(status="running", stage="transcribing", started_at=time.time())
+    t_fn = time.time()
+    set_status(status="running", stage="transcribing", started_at=t_fn)
     rc, log_tail = _run_headless_streamed(env, set_status)
     try:
         jobs_vol.commit()   # publish pipeline_state.json + separated audio to the orchestrator
         hf_cache.commit()
     except Exception:
         pass
+    _meter_add(job_id, "gpu_transcribe_s", time.time() - t_fn)
     if rc != 0:
-        set_status(status="failed", rc=rc, log=log_tail, error=f"transcribe (prep) exited {rc}")
+        set_status(status="failed", rc=rc, log=log_tail, finished_at=time.time(),
+                   error=f"transcribe (prep) exited {rc}")
     return {"rc": rc, "log": log_tail}
 
 
@@ -509,6 +598,7 @@ def gpu_full_run(job_id: str, input_name: str, target_lang: str = "Hindi", mode:
         hf_cache.commit()   # persist Stage-4 cache adds even if a later stage failed
     except Exception:
         pass
+    _meter_add(job_id, "gpu_full_s", time.time() - t0)
     return _finalize_job(job_id, out_dir, target_lang, rc, log_tail, t0, set_status)
 
 
@@ -537,6 +627,29 @@ def dub_video(job_id: str, input_name: str, target_lang: str = "Hindi", mode: st
     set_status = _make_set_status(job_id)
     _, out_dir, in_path = _job_paths(job_id, input_name)
 
+    # This CPU container is billed for its whole life -- including while it waits on the GPU
+    # functions it calls -- so its meter spans the call. Closed exactly once on every path;
+    # `metered` tells the demo UI the cost figure is complete.
+    t_fn = time.time()
+    closed = []
+
+    def close_meter():
+        if not closed:
+            closed.append(1)
+            _meter_add(job_id, "cpu_orchestrator_s", time.time() - t_fn)
+            set_status(metered=True)
+
+    try:
+        return _dub_video_body(job_id, input_name, target_lang, mode, set_status, out_dir,
+                               in_path, close_meter)
+    finally:
+        close_meter()
+
+
+def _dub_video_body(job_id, input_name, target_lang, mode, set_status, out_dir, in_path,
+                    close_meter):
+    """dub_video's routing, unchanged; split out so the orchestrator meter wraps every path."""
+    import traceback
     split_on = os.environ.get("DUBBING_MODAL_SPLIT", "1") != "0"
     if mode == "vc" or not split_on:
         # vc needs a co-resident GPU for Step 6.5; the kill-switch forces the proven path.
@@ -562,6 +675,7 @@ def dub_video(job_id: str, input_name: str, target_lang: str = "Hindi", mode: st
             hf_cache.commit()
         except Exception:
             pass
+        close_meter()   # before "done" is written, so a finished job carries its full cost
         return _finalize_job(job_id, out_dir, target_lang, rc, log_tail, t0, set_status)
     except Exception as e:
         # The orchestration itself broke (not a stage failure) — degrade to the proven single-
@@ -668,6 +782,7 @@ class TTSEngine:
         sees a fully-on-device model — the same state the old single-phase cuda load left."""
         from pipeline.duration_tts import _move_indicf5_to
         _move_indicf5_to("cuda")
+        self._t_up = time.time()   # demo-UI cost meter: when this worker started holding an L4
 
     @modal.method()
     def synth_shard(self, spec: dict) -> dict:
@@ -722,11 +837,16 @@ class TTSEngine:
                 with open(p, "rb") as fh:
                     wavs[str(i)] = fh.read()
 
-        return {"entries": entries, "wavs": wavs, "log": lines[-80:]}
+        # Container id + seconds since this worker's GPU came up. A worker serving two shards
+        # reports twice; demo_ui dedupes by task and keeps the larger (the container's age).
+        meter = {"task": os.environ.get("MODAL_TASK_ID", ""),
+                 "up_s": round(time.time() - getattr(self, "_t_up", time.time()), 2),
+                 "n_segments": len(only)}
+        return {"entries": entries, "wavs": wavs, "log": lines[-80:], "meter": meter}
 
 
 # ── FastAPI gateway, served by Modal ──────────────────────────────────────────────────────
-@app.function(volumes=VOLUMES, secrets=secrets, min_containers=1)
+@app.function(volumes=VOLUMES, secrets=secrets + demo_secrets, min_containers=1)
 @modal.asgi_app()
 def fastapi_app():
     import sys
@@ -736,9 +856,10 @@ def fastapi_app():
     return build_api(dub_video=dub_video, job_status=job_status, jobs_vol=jobs_vol, jobs_dir=JOBS_DIR)
 
 
-# ── Streamlit UI, served by Modal ─────────────────────────────────────────────────────────
-# SETUP: run the Streamlit UI either here (modal) or on Streamlit Community Cloud pointing at
-# the FastAPI URL. See deploy/streamlit_app.py and deploy/README.md.
+# ── Web demo UI ────────────────────────────────────────────────────────────────────────────
+# Served by fastapi_app itself: GET / is the page (deploy/web/index.html), /ui/* its endpoints
+# (deploy/demo_ui.py). One URL, same origin, same pipeline. The Streamlit client
+# (deploy/streamlit_app.py) still works against /v1 if preferred.
 
 # ── REMAINING LEVERS ───────────────────────────────────────────────────────────────────────
 # - DONE: the per-segment Gemini calls in Step 4 now run with bounded concurrency

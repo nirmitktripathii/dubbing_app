@@ -41,6 +41,7 @@ WAV bytes plus its manifest entries; this module (single writer) merges them int
 """
 from __future__ import annotations
 
+import json
 import math
 import os
 from typing import Callable, Iterable, Optional
@@ -55,6 +56,7 @@ from pipeline.duration_tts import (  # noqa: E402
     _segment_signature,
     resolve_nfe_step,
 )
+from pipeline.voice_refs import native_ref_id  # noqa: E402
 
 DEFAULT_MAX_SHARDS = int(os.environ.get("DUBBING_TTS_MAX_SHARDS", "8"))
 MIN_SEGMENTS_PER_SHARD = int(os.environ.get("DUBBING_TTS_MIN_PER_SHARD", "2"))
@@ -67,18 +69,21 @@ TARGET_SEGMENTS_PER_SHARD = int(os.environ.get("DUBBING_TTS_TARGET_PER_SHARD", "
 
 
 def completed_indices(segments: list, output_dir: str, target_language: str,
-                      nfe_step: Optional[int] = None) -> set:
+                      nfe_step: Optional[int] = None,
+                      reference_audio_path: Optional[str] = None) -> set:
     """Indices already finished on disk, by the SAME rule the serial resume uses.
 
     An index counts as done only when the manifest says ``ok``, the signature still matches
-    the current text/duration/lang/nfe, and the WAV exists and is bigger than a bare header.
-    A signature mismatch (e.g. translation re-ran and changed the line) is deliberately NOT
-    done, so stale audio is never glued onto changed text.
+    the current text/duration/lang/nfe/reference voice, and the WAV exists and is bigger than
+    a bare header. A signature mismatch (e.g. translation re-ran and changed the line, or a
+    native voice was curated since) is deliberately NOT done, so stale audio is never glued
+    onto changed text or mixed with a different voice.
     """
     lang_code = LANGUAGE_TO_CODE.get(target_language)
     if not lang_code:
         return set()
     nfe = resolve_nfe_step(nfe_step)
+    ref_id = "" if reference_audio_path else native_ref_id(lang_code)
     manifest = _load_manifest(os.path.join(output_dir, MANIFEST_NAME))
     done = set()
     for i, seg in enumerate(segments):
@@ -86,7 +91,7 @@ def completed_indices(segments: list, output_dir: str, target_language: str,
         if not entry or entry.get("status") != "ok":
             continue
         sig = _segment_signature(seg.get("text", "").strip(),
-                                 seg["end"] - seg["start"], lang_code, nfe)
+                                 seg["end"] - seg["start"], lang_code, nfe, ref_id)
         if entry.get("sig") != sig:
             continue
         path = os.path.join(output_dir, f"segment_{i:04d}.wav")
@@ -195,7 +200,8 @@ def generate_tts_fanout(translated_segments: list, target_language: str, output_
 
     os.makedirs(output_dir, exist_ok=True)
     n = len(translated_segments)
-    done = completed_indices(translated_segments, output_dir, target_language)
+    done = completed_indices(translated_segments, output_dir, target_language,
+                             reference_audio_path=reference_audio_path)
     pending = [i for i in range(n) if i not in done]
     if done:
         say(f"  Fan-out: {len(done)}/{n} segment(s) already complete on disk — resuming.")
@@ -228,6 +234,7 @@ def generate_tts_fanout(translated_segments: list, target_language: str, output_
 
     results = list(shard_runner(specs))
     merged = merge_shard_results(results, output_dir, log_fn=log_fn)
+    _write_meter(results, output_dir)
 
     produced = {int(k) for k in merged["manifest"].keys()
                 if merged["manifest"][k].get("status") == "ok"}
@@ -240,6 +247,19 @@ def generate_tts_fanout(translated_segments: list, target_language: str, output_
 
     return [{**s, "audio_path": os.path.join(output_dir, f"segment_{i:04d}.wav")}
             for i, s in enumerate(translated_segments)]
+
+
+def _write_meter(results: list, output_dir: str) -> None:
+    """Persist each worker's GPU-seconds for the demo UI's cost estimate (deploy/demo_ui.py).
+    Never raises: metering must not be able to fail a render."""
+    try:
+        workers = [r["meter"] for r in results if isinstance(r, dict) and r.get("meter")]
+        with open(os.path.join(output_dir, "tts_meter.json"), "w", encoding="utf-8") as fh:
+            json.dump({"workers": workers, "n_shards": len(results),
+                       "scaledown_s": max(2, int(os.environ.get("MODAL_TTS_SCALEDOWN", "5")))},
+                      fh)
+    except Exception:
+        pass
 
 
 def _modal_shard_runner():

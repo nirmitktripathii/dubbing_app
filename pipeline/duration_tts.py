@@ -113,15 +113,17 @@ LANGUAGE_TO_CODE = {
     "Assamese":  "as",
 }
 
-# Default Hindi male reference voice for Basic tier.
-# Downloaded from: sumedhu/hindi-emotion-voice-references (HuggingFace dataset)
-# Transcription verified via Whisper small on 2026-07-05.
-DEFAULT_HINDI_REF_REPO   = "sumedhu/hindi-emotion-voice-references"
-DEFAULT_HINDI_REF_FILE   = "hindi_best_clips/male/happy/HIN_M_HAPPY_00057.wav"
-DEFAULT_HINDI_REF_TEXT   = "सुबह केरल चाय का एक गिलास मुझे तरो ताजा घर देता है"
+# Basic-tier reference voices. The pinned Hindi clip (sumedhu/hindi-emotion-voice-references)
+# and the per-language native clips curated from its upstream, AI4Bharat Rasa, are resolved in
+# pipeline/voice_refs.py — one source of truth. Names re-exported for existing importers.
+from pipeline.voice_refs import (  # noqa: E402
+    DEFAULT_HINDI_REF_FILE,
+    DEFAULT_HINDI_REF_REPO,
+    DEFAULT_HINDI_REF_TEXT,
+    resolve_basic_reference,
+)
 
-# Pre-selected reference text for non-Hindi Basic tier languages.
-# Only text is needed here; Hindi has a proper audio reference above.
+# Text-only last resort, used only when no reference audio can be obtained at all.
 BASIC_VOICE_REFS = {
     "hi": DEFAULT_HINDI_REF_TEXT,   # overridden by audio download below
     "bn": "আমি আপনাকে একটি গুরুত্বপূর্ণ বিষয় সম্পর্কে বলতে যাচ্ছি।",
@@ -888,11 +890,18 @@ def resolve_nfe_step(nfe_step: Optional[int] = None, log_fn=None) -> int:
     return nfe_step
 
 
-def _segment_signature(text: str, target_duration: float, lang_code: str, nfe_step: int) -> str:
+def _segment_signature(text: str, target_duration: float, lang_code: str, nfe_step: int,
+                       ref_id: str = "") -> str:
     """Stable hash of everything that determines a segment's audio. If any of these change
     between runs (e.g. translation re-ran and produced different text), the signature
-    changes and the cached WAV is treated as stale and re-synthesized — never silently reused."""
+    changes and the cached WAV is treated as stale and re-synthesized — never silently reused.
+
+    ``ref_id`` is the Basic-mode reference voice identity from voice_refs ('' for the pinned
+    Hindi clip every earlier run used, so existing manifests keep matching; 'native:<sha12>'
+    for a curated native voice, so switching voice re-synthesizes instead of resuming)."""
     payload = f"{lang_code}|{nfe_step}|{target_duration:.4f}|{text}"
+    if ref_id:
+        payload += f"|ref={ref_id}"
     return hashlib.sha1(payload.encode("utf-8", errors="replace")).hexdigest()
 
 
@@ -1071,25 +1080,16 @@ def generate_tts_for_segments(
         tts_log(f"Mode: Premium (voice cloning from {reference_audio_path})")
         ref_audio = reference_audio_path
         ref_text = reference_text
+        ref_id = ""
     else:
-        tts_log(f"Mode: Basic (pre-selected voice, no cloning)")
-        # Download the default reference voice from HuggingFace to serve as the default speaker for all languages.
-        # SSL bypass is already globally active in this module.
-        try:
-            from huggingface_hub import hf_hub_download
-            tts_log(f"Downloading/resolving default reference voice from HF ({DEFAULT_HINDI_REF_REPO})...")
-            ref_audio = hf_hub_download(
-                repo_id=DEFAULT_HINDI_REF_REPO,
-                filename=DEFAULT_HINDI_REF_FILE,
-                repo_type="dataset",
-            )
-            ref_text = DEFAULT_HINDI_REF_TEXT
-            tts_log(f"Default reference voice resolved to: {ref_audio}")
-        except Exception as e:
-            tts_log(f"Warning: Could not download default reference audio: {e}")
-            tts_log("Falling back to text-only reference (may affect quality/stability).")
-            ref_audio = None
-            ref_text = BASIC_VOICE_REFS.get(lang_code, "")
+        # Basic: a native reference voice for the target language when one has been curated
+        # (pipeline/voice_refs.py), else the pinned Hindi clip — with a loud WARNING when that
+        # clip is used cross-lingually. SSL bypass is already globally active in this module.
+        _ref = resolve_basic_reference(lang_code, log_fn=tts_log,
+                                       text_only_refs=BASIC_VOICE_REFS)
+        ref_audio, ref_text, ref_id = _ref["audio"], _ref["text"], _ref["ref_id"]
+        if ref_audio:
+            tts_log(f"Reference voice [{_ref['source']}] resolved to: {ref_audio}")
 
     # Load model
     tts_log("Loading/resolving IndicF5 model...")
@@ -1151,7 +1151,7 @@ def generate_tts_for_segments(
         text = seg.get("text", "").strip()
         target_duration = seg["end"] - seg["start"]
         out_path = os.path.join(output_dir, f"segment_{i:04d}.wav")
-        signature = _segment_signature(text, target_duration, lang_code, nfe_step)
+        signature = _segment_signature(text, target_duration, lang_code, nfe_step, ref_id)
 
         # ── Resume: skip segments a prior run already finished as real audio ──
         # Only an "ok" segment whose file still exists (non-empty) AND whose signature

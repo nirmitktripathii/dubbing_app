@@ -71,6 +71,7 @@ from pipeline.duration_tts import (
     INDICF5_SAMPLE_RATE,
     SEGMENT_TIMEOUT_DEFAULT,
 )
+from pipeline.voice_refs import native_ref_id
 
 _IS_WINDOWS = os.name == "nt"
 
@@ -320,6 +321,9 @@ def generate_tts_supervised(
         return []
 
     nfe_step = _resolve_nfe_step(nfe_step, emit)
+    # The reference-voice identity the worker will put in its signatures (voice_refs), so a
+    # forced-silence entry written here still matches the worker's resume-skip check.
+    ref_id = "" if reference_audio_path else native_ref_id(lang_code)
     load_stall = load_stall if load_stall is not None else _env_float("DUBBING_TTS_LOAD_STALL", DEFAULT_LOAD_STALL)
     seg_stall = seg_stall if seg_stall is not None else _env_float("DUBBING_TTS_SEG_STALL", DEFAULT_SEG_STALL)
 
@@ -460,7 +464,7 @@ def generate_tts_supervised(
                 dur = float(seg["end"] - seg["start"])
                 out_path = os.path.join(output_dir, f"segment_{blamed_seg:04d}.wav")
                 _write_silence_wav(out_path, dur, INDICF5_SAMPLE_RATE)
-                sig = _segment_signature(text, dur, lang_code, nfe_step)
+                sig = _segment_signature(text, dur, lang_code, nfe_step, ref_id)
                 _mark_forced_silence(manifest_path, blamed_seg, sig, out_path)
                 forced.add(blamed_seg)
                 emit(
@@ -495,7 +499,7 @@ def generate_tts_supervised(
             text = (seg.get("text") or "").strip()
             dur = float(seg["end"] - seg["start"])
             _write_silence_wav(out_path, dur, INDICF5_SAMPLE_RATE)
-            sig = _segment_signature(text, dur, lang_code, nfe_step)
+            sig = _segment_signature(text, dur, lang_code, nfe_step, ref_id)
             manifest[str(i)] = {"status": "ok", "sig": sig, "path": out_path, "forced_silence": True}
             forced.add(i)
             gap_filled.append(i)

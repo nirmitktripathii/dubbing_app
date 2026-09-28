@@ -43,7 +43,7 @@ modal secret create dubbing-secrets \
 | key | used by | required? |
 |---|---|---|
 | `GEMINI_API_KEY` | Step 4 isochrony translation | **yes** — the run aborts without it |
-| `HF_TOKEN` | IndicF5 + the default reference voice from HF | yes for gated repos |
+| `HF_TOKEN` | IndicF5, the reference voices, `curate_voice_refs` (Rasa is gated) | yes for gated repos |
 | `RAPIDAPI_PROXY_SECRET` | `api.py::_auth`, so the endpoint can't be called around RapidAPI | before listing; unset = open (dev only) |
 
 > The `GEMINI_API_KEY` here should **not** stay a free-tier key once you charge for this —
@@ -77,6 +77,56 @@ modal deploy deploy/modal_app.py     # production
 - Model weights download to the cache Volume on the **first** job, then persist (no re-download).
 - Set `MODAL_WARM=1` to keep one GPU container warm (removes cold-start; costs idle GPU time).
 - GPU defaults to `L4` (fits Whisper + Demucs + IndicF5 + knn-vc). Override with `MODAL_GPU`.
+
+## Web demo UI (served by the API itself)
+One URL, no separate frontend host: after `modal deploy`, open the `fastapi_app` URL in a
+browser. `GET /` is the page (`deploy/web/index.html`), `/ui/*` its endpoints
+(`deploy/demo_ui.py`, hidden from the OpenAPI schema). Upload a clip -> live progress
+(description + %) and log -> dubbed video inline, a download button, and a shareable link.
+
+- **Access code (required):** `modal secret create dubbing-demo DEMO_ACCESS_CODE=<something long>`.
+  Unset -> the page submits nothing (503); wrong -> 403. Attached to the API container only.
+- **Clip ceiling:** `DUB_DEMO_MAX_SECONDS` (default 300 s), gated before any GPU starts.
+- **Share link:** `/ui/dub/<id>/video?t=<per-job token>` plays without the access code;
+  only demo jobs are reachable, and `/v1` never returns the token.
+- **Cost panel:** container-seconds timed inside each Modal function x list price
+  (`tools/cost_model.py`), plus scale-down idle tails. Excludes cold boot/snapshot restore,
+  the always-on API container and Gemini usage -- an estimate; `modal billing` is the truth.
+  It is marked final once the orchestrator closes its meter. Hide it with `?cost=0` when
+  showing a third party.
+- **Preview locally, no Modal/GPU:** `python deploy/demo_dev_server.py` -> http://localhost:8765
+  (code `dev`). Simulated pipeline; the page says so in a banner.
+- **Tests:** `python deploy/test_demo_ui.py`.
+- The language picker says which voice each language gets (native, or the Hindi fallback) —
+  see the next section.
+
+## Native reference voices for all 11 languages (Basic mode)
+IndicF5 copies the reference clip's voice **and accent**. Basic mode used to give every
+language the same Hindi clip (`sumedhu/hindi-emotion-voice-references`), so a Tamil dub was a
+Hindi speaker reading Tamil. That repo is a repack of **AI4Bharat Rasa**
+(`ai4bharat/Rasa`, CC BY 4.0), which has native speakers for all 11 languages.
+`pipeline/voice_refs.py` picks one clip per language from Rasa by pre-registered rules — right
+language label and script, 3.5–9 s after trimming, audible, unclipped, file length equal to
+the dataset's stated length, plausible speaking rate for its transcript — and stores the clip,
+its transcript and a sha256 manifest on the `hf_cache` Volume.
+
+One-time setup (CPU only, a few minutes; reads one parquet shard's metadata plus a few audio
+row groups per language, not the dataset):
+1. Open <https://huggingface.co/datasets/ai4bharat/Rasa> signed in as the account whose
+   `HF_TOKEN` is in `dubbing-secrets`, and accept the terms (the dataset is gated).
+2. `modal run deploy/modal_app.py::curate_voice_refs`
+   (options: `--languages ta,te` to redo some, `--gender female`). It prints per-language
+   OK/FAILED with the reason; a failed language keeps the Hindi fallback.
+3. `modal deploy deploy/modal_app.py` so running containers pick up the new clips.
+
+Resolution per run (logged in Step 6): native clip → Hindi keeps the pinned, verified clip →
+any other language without a native clip uses the Hindi clip **with a WARNING** → text-only if
+HF is unreachable. The voice identity is part of each segment's resume signature, so audio
+made with the old voice is re-synthesized, never mixed in. `prewarm_models` reports coverage.
+Tests: `python tools/test_voice_refs.py`.
+
+Clone mode (`vc`) also benefits: it synthesizes with the native voice first, then converts
+the timbre to the original speaker (knn-vc), which does not change the accent.
 
 ## Streamlit UI
 ```bash

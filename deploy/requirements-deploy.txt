@@ -16,5 +16,9 @@ fastapi>=0.115
 pydantic>=2.9,<3
 python-multipart>=0.0.9
 requests>=2.31
+# curate_voice_refs reads AI4Bharat Rasa's parquet shards column-by-column (metadata first,
+# audio only for the chosen row group). Usually arrives transitively via f5-tts -> datasets;
+# listed so the curation step never depends on that accident.
+pyarrow>=14
 # streamlit is already pinned in ../requirements.txt (1.57.0).
 # modal is installed on the deploy host, not in the image.

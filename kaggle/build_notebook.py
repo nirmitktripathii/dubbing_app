@@ -328,6 +328,9 @@ _PIPELINE_FILES = [
     # Step-6.5 voice-conversion cloning path (mode "vc" / DUBBING_VOICE_CLONE=2). Pure
     # torch/torchaudio, backend-agnostic; no Kaggle path adaptation needed.
     "voice_conversion.py",
+    # Basic-mode reference resolution (native per-language voice, else the pinned Hindi
+    # clip). Imported by duration_tts.py at module load, so it MUST ship with it.
+    "voice_refs.py",
 ]
 _UTILS_FILES = [
     "audio_extraction.py",
@@ -1448,6 +1451,8 @@ def _generate_large_files_module():
         (os.path.join(base, "pipeline", "tts_supervisor.py"),        f"{WORK_DIR}/pipeline/tts_supervisor.py"),
         # Step-6.5 voice-conversion cloning path (mode "vc").
         (os.path.join(base, "pipeline", "voice_conversion.py"),      f"{WORK_DIR}/pipeline/voice_conversion.py"),
+        # Basic-mode reference resolution; duration_tts.py imports it at module load.
+        (os.path.join(base, "pipeline", "voice_refs.py"),            f"{WORK_DIR}/pipeline/voice_refs.py"),
         (os.path.join(base, "utils", "transcription.py"),            f"{WORK_DIR}/utils/transcription.py"),
         (os.path.join(base, "utils", "audio_sync.py"),               f"{WORK_DIR}/utils/audio_sync.py"),
     ]
