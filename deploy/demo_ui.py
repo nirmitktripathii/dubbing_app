@@ -11,10 +11,12 @@ It submits through the SAME `prepare_job` + `dub_video.spawn` path as POST /v1/d
 exercises exactly the deployed pipeline — duration gate, idempotency, split orchestrator,
 TTS fan-out — not a parallel copy of it.
 
-ACCESS. The page is public and every submit spends GPU money, so /ui/dub requires the
-DEMO_ACCESS_CODE from the Modal secret `dubbing-demo`. Unset => the demo refuses (503): a
-check that cannot run has not passed. It never reuses RAPIDAPI_PROXY_SECRET — handing that to
-a third party would let them call /v1 around RapidAPI.
+ACCESS. The page is public and every submit spends GPU money, so /ui/dub requires a code from
+the Modal secret `dubbing-demo`: DEMO_ACCESS_CODE (the one you hand out) or, optionally,
+DEMO_OWNER_CODE (the owner's own; jobs record which one was used, as user demo-ui / demo-owner).
+Both get the same DEMO limits. DEMO_ACCESS_CODE unset => the demo refuses (503): a check that
+cannot run has not passed. Never hand out a code that equals RAPIDAPI_PROXY_SECRET — it would
+let a third party call /v1 around RapidAPI; that is why the shared code is separate.
 
 COST. What the page reports is an ESTIMATE: container-seconds we timed inside each Modal
 function x Modal's per-second list price (the constants in tools/cost_model.py, so there is one
@@ -189,14 +191,22 @@ def add_demo_routes(api: FastAPI, *, dub_video, job_status, jobs_vol, jobs_dir) 
     def _code() -> str:
         return os.environ.get("DEMO_ACCESS_CODE", "")
 
-    def _check(request: Request) -> None:
+    def _check(request: Request) -> str:
+        """Returns who is calling ("demo-ui" or "demo-owner"); raises 503/403 otherwise."""
         code = _code()
         if not code:
             raise HTTPException(503, "Demo UI is disabled: DEMO_ACCESS_CODE is not set "
                                      "(Modal secret 'dubbing-demo').")
-        got = request.headers.get("x-demo-code") or ""
-        if not hmac.compare_digest(got.encode(), code.encode()):
-            raise HTTPException(403, "Wrong access code.")
+        got = (request.headers.get("x-demo-code") or "").encode()
+        owner = os.environ.get("DEMO_OWNER_CODE", "")
+        # Compare against both unconditionally so timing does not reveal which one matched.
+        is_shared = hmac.compare_digest(got, code.encode())
+        is_owner = bool(owner) & hmac.compare_digest(got, owner.encode())
+        if is_owner:
+            return "demo-owner"
+        if is_shared:
+            return "demo-ui"
+        raise HTTPException(403, "Wrong access code.")
 
     def _demo_job(job_id: str) -> dict:
         st = job_status.get(job_id)
@@ -217,7 +227,7 @@ def add_demo_routes(api: FastAPI, *, dub_video, job_status, jobs_vol, jobs_dir) 
 
     @api.post("/ui/dub", include_in_schema=False)
     async def ui_create(request: Request):
-        _check(request)
+        who = _check(request)
         form = await request.form()
         upload = form.get("file")
         if upload is None or not hasattr(upload, "read"):
@@ -232,7 +242,7 @@ def add_demo_routes(api: FastAPI, *, dub_video, job_status, jobs_vol, jobs_dir) 
                 job_status=job_status, jobs_vol=jobs_vol, jobs_dir=jobs_dir,
                 dub_video=dub_video, data=data,
                 filename=getattr(upload, "filename", None) or "input.mp4",
-                target_lang=target_lang, mode=mode, plan="DEMO", user="demo-ui",
+                target_lang=target_lang, mode=mode, plan="DEMO", user=who,
                 idempotency_key=request.headers.get("idempotency-key"),
                 extra={"source": DEMO_SOURCE, "dl_token": secrets.token_urlsafe(18)},
             )

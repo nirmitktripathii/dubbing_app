@@ -86,6 +86,9 @@ browser. `GET /` is the page (`deploy/web/index.html`), `/ui/*` its endpoints
 
 - **Access code (required):** `modal secret create dubbing-demo DEMO_ACCESS_CODE=<something long>`.
   Unset -> the page submits nothing (503); wrong -> 403. Attached to the API container only.
+  Optionally add `DEMO_OWNER_CODE=<yours>` to the same secret: a second code for your own use,
+  same DEMO limits, logged as user `demo-owner`. Hand out only `DEMO_ACCESS_CODE`, and never a
+  code equal to `RAPIDAPI_PROXY_SECRET` (it would also open `/v1` around RapidAPI).
 - **Clip ceiling:** `DUB_DEMO_MAX_SECONDS` (default 300 s), gated before any GPU starts.
 - **Share link:** `/ui/dub/<id>/video?t=<per-job token>` plays without the access code;
   only demo jobs are reachable, and `/v1` never returns the token.

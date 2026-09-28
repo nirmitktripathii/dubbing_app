@@ -129,7 +129,7 @@ job_status = modal.Dict.from_name("indic-dubbing-status", create_if_missing=True
 # SETUP: create these secrets: `modal secret create dubbing-secrets GEMINI_API_KEY=... HF_TOKEN=... RAPIDAPI_PROXY_SECRET=...`
 secrets = [modal.Secret.from_name("dubbing-secrets")]
 # SETUP: the web demo UI's access code (deploy/demo_ui.py), attached to the API container ONLY:
-#   modal secret create dubbing-demo DEMO_ACCESS_CODE=<something long>
+#   modal secret create dubbing-demo DEMO_ACCESS_CODE=<something long> [DEMO_OWNER_CODE=<yours>]
 demo_secrets = [modal.Secret.from_name("dubbing-demo")]
 
 CACHE_DIR = "/cache/hf"

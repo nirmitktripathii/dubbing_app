@@ -81,6 +81,11 @@ def test_access_and_links():
     check("wrong code -> 403, nothing spawned", r.status_code == 403 and not spawner.calls,
           f"{r.status_code}")
 
+    os.environ.pop("DEMO_OWNER_CODE", None)
+    r = client.post("/ui/dub", files=files, data={"target_lang": "Hindi"}, headers={"X-Demo-Code": ""})
+    check("owner code unset: an empty code does not match it", r.status_code == 403
+          and not spawner.calls, f"{r.status_code}")
+
     r = client.post("/ui/dub", files=files, data={"target_lang": "Klingon"},
                     headers={"X-Demo-Code": "s3cret-code"})
     check("unknown language -> 400", r.status_code == 400, f"{r.status_code}")
@@ -93,6 +98,37 @@ def test_access_and_links():
     check("spawned with the chosen language", spawner.calls[0][2] == "Tamil", str(spawner.calls[0]))
     check("demo job gated at the DEMO ceiling", status[job]["plan"] == "DEMO"
           and status[job]["max_seconds"] == demo_ui.PLAN_MAX_SECONDS["DEMO"], str(status[job]))
+    check("shared code recorded as demo-ui", status[job]["user"] == "demo-ui", str(status[job]))
+
+    # Owner code: a second accepted code, same DEMO limits, recorded separately.
+    os.environ["DEMO_OWNER_CODE"] = "owner-only-code"
+    r = client.post("/ui/dub", files=files, data={"target_lang": "Telugu", "mode": "basic"},
+                    headers={"X-Demo-Code": "owner-only-code", "Idempotency-Key": "owner-1"})
+    ok = r.status_code == 200 and len(spawner.calls) == 2
+    check("owner code accepted, job queued", ok, f"{r.status_code} {r.text}")
+    if ok:
+        oj = r.json()["job_id"]
+        check("owner job recorded as demo-owner, still at the DEMO ceiling",
+              status[oj]["user"] == "demo-owner" and status[oj]["plan"] == "DEMO", str(status[oj]))
+        r = client.get(f"/ui/dub/{oj}", headers={"X-Demo-Code": "owner-only-code"})
+        check("owner code reads status", r.status_code == 200, f"{r.status_code}")
+    r = client.post("/ui/dub", files=files, data={"target_lang": "Hindi"},
+                    headers={"X-Demo-Code": "owner-only-cod"})
+    check("near-miss of the owner code -> 403", r.status_code == 403, f"{r.status_code}")
+    prev = os.environ.get("RAPIDAPI_PROXY_SECRET")
+    os.environ["RAPIDAPI_PROXY_SECRET"] = "a-different-proxy-secret"   # read at build time
+    sp2 = Spawner()
+    gated = TestClient(build_api(dub_video=sp2, job_status={}, jobs_vol=FakeVol(),
+                                 jobs_dir=tempfile.mkdtemp()))
+    r = gated.post("/v1/dub", files=files, data={"target_lang": "Hindi"},
+                   headers={"X-RapidAPI-Proxy-Secret": "owner-only-code"})
+    check("a demo code does not open /v1 when the proxy secret differs",
+          r.status_code == 403 and not sp2.calls, f"{r.status_code}")
+    if prev is None:
+        os.environ.pop("RAPIDAPI_PROXY_SECRET", None)
+    else:
+        os.environ["RAPIDAPI_PROXY_SECRET"] = prev
+    os.environ.pop("DEMO_OWNER_CODE", None)
 
     r = client.get(f"/ui/dub/{job}", headers={"X-Demo-Code": "wrong"})
     check("status with wrong code -> 403", r.status_code == 403, f"{r.status_code}")
