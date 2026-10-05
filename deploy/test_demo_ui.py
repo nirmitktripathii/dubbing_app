@@ -157,6 +157,42 @@ def test_access_and_links():
     r = client.get(f"/ui/dub/{job}/video?t=forged")
     check("forged token -> 403", r.status_code == 403, f"{r.status_code}")
 
+    # Transcripts: the two SRTs run_headless writes beside the video, served three ways.
+    tr = st.get("transcripts") or {}
+    check("done status lists English + target transcripts in srt/txt/vtt",
+          set(tr) == {"source", "target"} and tr["source"]["label"] == "English"
+          and tr["target"]["label"] == "Tamil"
+          and all(set(v) >= {"srt", "txt", "vtt"} for v in tr.values()), str(tr))
+    eng = "1\r\n00:00:00,270 --> 00:00:02,870\r\nHi, I'm Jared.\r\n\r\n2\r\n00:00:03,090 --> 00:00:09,390\r\nToday: erosion,\r\nand water.\r\n"
+    with open(os.path.join(jobs, job, "english_subtitles.srt"), "w", encoding="utf-8-sig", newline="") as fh:
+        fh.write(eng)
+    r = client.get(tr["source"]["srt"])
+    check("English SRT served as written (BOM stripped), no code needed",
+          r.status_code == 200 and r.text == eng, f"{r.status_code} {r.text!r}")
+    r = client.get(tr["source"]["txt"])
+    check("TXT is one line per cue, no timings or indices",
+          r.status_code == 200 and r.text == "Hi, I'm Jared.\nToday: erosion, and water.\n", repr(r.text))
+    r = client.get(tr["source"]["vtt"])
+    check("VTT has the header and '.' millisecond separators",
+          r.status_code == 200 and r.text.startswith("WEBVTT\n\n")
+          and "00:00:00.270 --> 00:00:02.870\nHi, I'm Jared." in r.text and "," not in r.text.split("\n")[2]
+          and r.headers["content-type"].startswith("text/vtt"), repr(r.text))
+    r = client.get(tr["target"]["srt"])
+    check("missing target transcript -> 404 (page hides the pane)", r.status_code == 404, f"{r.status_code}")
+    with open(os.path.join(jobs, job, "Tamil_subtitles.srt"), "w", encoding="utf-8") as fh:
+        fh.write("1\n00:00:00,270 --> 00:00:02,870\nவணக்கம், நான் ஜாரெட்.\n")
+    r = client.get(tr["target"]["txt"] + "&download=1")
+    check("Tamil TXT downloads as UTF-8 attachment",
+          r.status_code == 200 and r.text == "வணக்கம், நான் ஜாரெட்.\n"
+          and "attachment" in r.headers.get("content-disposition", "")
+          and "transcript_tamil_" in r.headers.get("content-disposition", ""), f"{r.status_code} {r.headers}")
+    r = client.get(f"/ui/dub/{job}/transcript/source.srt?t=forged")
+    check("transcript with a forged token -> 403", r.status_code == 403, f"{r.status_code}")
+    r = client.get(tr["source"]["srt"].replace("source.srt", "source.json"))
+    check("unknown transcript format -> 404", r.status_code == 404, f"{r.status_code}")
+    r = client.get(tr["source"]["srt"].replace("source.srt", "..%2Fsecrets.srt"))
+    check("path-ish 'which' -> 404", r.status_code == 404, f"{r.status_code}")
+
     # A RapidAPI job (no source/dl_token) is invisible to the demo endpoints.
     status["f" * 32] = {"status": "done", "output": out}
     r = client.get(f"/ui/dub/{'f' * 32}", headers={"X-Demo-Code": "s3cret-code"})

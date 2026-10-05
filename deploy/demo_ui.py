@@ -6,6 +6,9 @@
     POST /ui/dub                    multipart: file, target_lang, mode  (X-Demo-Code header)
     GET  /ui/dub/{job_id}           progress %, description, log tail, cost (X-Demo-Code)
     GET  /ui/dub/{job_id}/video?t=  the dubbed mp4 — a SHAREABLE link, gated by a per-job token
+    GET  /ui/dub/{job_id}/transcript/{which}.{fmt}?t=
+                                    which = source (English) | target (dubbed language),
+                                    fmt = srt | txt | vtt — same per-job token as the video
 
 It submits through the SAME `prepare_job` + `dub_video.spawn` path as POST /v1/dub, so the page
 exercises exactly the deployed pipeline — duration gate, idempotency, split orchestrator,
@@ -34,7 +37,7 @@ import secrets
 import time
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 
 from deploy.api import ApiError, MAX_UPLOAD_MB, PLAN_MAX_SECONDS, prepare_job
 
@@ -166,6 +169,44 @@ def estimate_cost(st: dict) -> dict | None:
     }
 
 
+# ── Transcripts ────────────────────────────────────────────────────────────────────────────
+# run_headless writes both next to the output video: english_subtitles.srt (Step 3) and
+# <Language>_subtitles.srt (Step 4). They are served as written (srt), as plain text (txt), and
+# as WebVTT (vtt) — the only caption format a browser <track> element accepts.
+TRANSCRIPT_FORMATS = {"srt": "application/x-subrip", "txt": "text/plain", "vtt": "text/vtt"}
+_SRT_TIME = re.compile(r"(\d{2}:\d{2}:\d{2}),(\d{3})")
+
+
+def transcript_path(out_video: str, which: str, target_lang: str) -> str:
+    name = "english_subtitles.srt" if which == "source" else f"{target_lang}_subtitles.srt"
+    return os.path.join(os.path.dirname(out_video), name)
+
+
+def _srt_blocks(srt: str) -> list[tuple[str, str]]:
+    """[(timing line, text)] from an SRT, skipping index lines and malformed blocks."""
+    blocks = []
+    for raw in re.split(r"\r?\n\s*\r?\n", srt.strip().lstrip("﻿")):
+        lines = [l for l in raw.splitlines() if l.strip()]
+        timing = next((i for i, l in enumerate(lines) if "-->" in l), None)
+        if timing is None:
+            continue
+        text = "\n".join(lines[timing + 1:]).strip()
+        if text:
+            blocks.append((lines[timing].strip(), text))
+    return blocks
+
+
+def srt_to(srt: str, fmt: str) -> str:
+    if fmt == "srt":
+        return srt
+    blocks = _srt_blocks(srt)
+    if fmt == "txt":
+        return "\n".join(text.replace("\n", " ") for _, text in blocks) + "\n"
+    # vtt: header, '.' as the millisecond separator, no numeric cue ids needed
+    cues = [_SRT_TIME.sub(r"\1.\2", timing) + "\n" + text for timing, text in blocks]
+    return "WEBVTT\n\n" + "\n\n".join(cues) + "\n"
+
+
 # ── Routes ─────────────────────────────────────────────────────────────────────────────────
 _REDACT = re.compile(r"(AIza[0-9A-Za-z_\-]{20,}|hf_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_\-]{20,})")
 
@@ -271,27 +312,57 @@ def add_demo_routes(api: FastAPI, *, dub_video, job_status, jobs_vol, jobs_dir) 
             "cost": estimate_cost(st),
         }
         if st.get("status") == "done":
-            base = f"/ui/dub/{job_id}/video?t={st.get('dl_token', '')}"
+            tok = st.get("dl_token", "")
+            base = f"/ui/dub/{job_id}/video?t={tok}"
             out["video_url"] = base
             out["download_url"] = base + "&download=1"
             out["video_seconds"] = st.get("video_seconds")
+            # URLs only; the page fetches each one and hides any that is missing (404), so a
+            # status poll never has to reload the volume to check the files exist.
+            tr = f"/ui/dub/{job_id}/transcript"
+            out["transcripts"] = {
+                which: {"label": label,
+                        **{fmt: f"{tr}/{which}.{fmt}?t={tok}" for fmt in TRANSCRIPT_FORMATS}}
+                for which, label in (("source", "English"),
+                                     ("target", st.get("target_lang") or "Dubbed"))}
         return out
 
-    @api.get("/ui/dub/{job_id}/video", include_in_schema=False)
-    def ui_video(job_id: str, t: str = "", download: int = 0):
+    def _done_output(job_id: str, t: str) -> tuple[dict, str]:
+        """(status, output video path) for a finished demo job whose link token matches."""
         st = _demo_job(job_id)
         tok = st.get("dl_token") or ""
         if not tok or not hmac.compare_digest(t.encode(), tok.encode()):
             raise HTTPException(403, "invalid link")
         if st.get("status") != "done":
             raise HTTPException(409, f"not ready (status={st.get('status')})")
-        out = st.get("output", "")
         try:
             jobs_vol.reload()
         except Exception:
             pass
+        return st, st.get("output", "")
+
+    @api.get("/ui/dub/{job_id}/video", include_in_schema=False)
+    def ui_video(job_id: str, t: str = "", download: int = 0):
+        st, out = _done_output(job_id, t)
         if not out or not os.path.exists(out):
             raise HTTPException(410, "output no longer available")
         name = f"dubbed_{(st.get('target_lang') or 'video').lower()}_{job_id[:8]}.mp4"
         return FileResponse(out, media_type="video/mp4", filename=name,
                             content_disposition_type="attachment" if download else "inline")
+
+    @api.get("/ui/dub/{job_id}/transcript/{which}.{fmt}", include_in_schema=False)
+    def ui_transcript(job_id: str, which: str, fmt: str, t: str = "", download: int = 0):
+        if which not in ("source", "target") or fmt not in TRANSCRIPT_FORMATS:
+            raise HTTPException(404, "unknown transcript")
+        st, out = _done_output(job_id, t)
+        lang = st.get("target_lang") or ""
+        path = transcript_path(out, which, lang) if out else ""
+        if not path or not os.path.exists(path):
+            raise HTTPException(404, "transcript not available for this job")
+        with open(path, encoding="utf-8-sig", newline="") as fh:   # srt served as written
+            body = srt_to(fh.read(), fmt)
+        tag = "english" if which == "source" else (lang or "dubbed").lower()
+        name = f"transcript_{tag}_{job_id[:8]}.{fmt}"
+        disp = "attachment" if download else "inline"
+        return Response(body, media_type=f"{TRANSCRIPT_FORMATS[fmt]}; charset=utf-8",
+                        headers={"Content-Disposition": f'{disp}; filename="{name}"'})

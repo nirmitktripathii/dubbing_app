@@ -82,6 +82,23 @@ def _mux_reference(src, ref_wav, out, log_fn):
     return True
 
 
+def _write_fake_transcripts(out_dir, lang, seconds):
+    """english_subtitles.srt + <Language>_subtitles.srt, named exactly as run_headless names
+    them, so the page's transcript panes, downloads and captions run against real files. The
+    text says it is simulated — nothing was transcribed or translated."""
+    def ts(s):
+        ms = int(round(s * 1000))
+        return f"{ms // 3600000:02d}:{ms // 60000 % 60:02d}:{ms // 1000 % 60:02d},{ms % 1000:03d}"
+    n = max(2, min(6, int(seconds // 4)))
+    step = seconds / n
+    for name, text in (("english_subtitles.srt", "[simulated English line {i}]"),
+                       (f"{lang}_subtitles.srt", f"[simulated {lang} line {{i}}]")):
+        blocks = [f"{i}\n{ts((i - 1) * step + 0.2)} --> {ts(i * step - 0.2)}\n{text.format(i=i)}\n"
+                  for i in range(1, n + 1)]
+        with open(os.path.join(out_dir, name), "w", encoding="utf-8") as fh:
+            fh.write("\n".join(blocks))
+
+
 class FakeDub:
     def spawn(self, job_id, input_name, target_lang, mode):
         threading.Thread(target=self._run, args=(job_id, input_name, target_lang), daemon=True).start()
@@ -105,6 +122,7 @@ class FakeDub:
         out = os.path.join(JOBS_DIR, job_id, f"dubbed_{lang.lower()}.mp4")
         if not (ref and ref.get("audio") and _mux_reference(src, ref["audio"], out, log.append)):
             shutil.copyfile(src, out)
+        _write_fake_transcripts(os.path.dirname(out), lang, STATUS[job_id].get("input_seconds") or 12.0)
         # Fake meters in the exact shape modal_app writes (numbers are illustrative only).
         put(meter={"gpu_transcribe_s": 24.0, "gpu_transcribe_n": 1},
             tts_meter={"workers": [{"task": "ta-1", "up_s": 21.0, "n_segments": 3},

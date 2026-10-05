@@ -122,6 +122,23 @@
   .link { display: flex; gap: 8px; margin-top: 12px; }
   .link input { font: 12px ui-monospace, Consolas, monospace; }
 
+  h3.sub { font-size: 15px; margin: 24px 0 4px; }
+  .transcripts { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 10px; }
+  @media (max-width: 640px) { .transcripts { grid-template-columns: 1fr; } }
+  .tpane { border: 1px solid var(--border); border-radius: 10px; overflow: hidden; display: flex; flex-direction: column; min-width: 0; }
+  .tpane header { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin: 0;
+                  padding: 8px 10px; background: var(--surface-2); border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  .tpane header strong { font-size: 14px; }
+  .tpane header .dls { display: flex; gap: 6px; }
+  .tpane header .btn { padding: 5px 10px; font-size: 12px; border-radius: 8px; }
+  .cues { max-height: 300px; overflow: auto; padding: 4px 0; }
+  .cue { display: grid; grid-template-columns: 52px 1fr; gap: 8px; width: 100%; text-align: left; background: none;
+         color: var(--text); border: 0; border-radius: 0; padding: 6px 10px; font: inherit; font-size: 14px;
+         font-weight: 400; cursor: pointer; white-space: normal; }
+  .cue:hover { background: var(--surface-2); }
+  .cue.on { background: var(--accent-soft); }
+  .cue time { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; padding-top: 2px; }
+  .tpane .pending { padding: 10px; }
   .cost-total { display: flex; gap: 28px; flex-wrap: wrap; align-items: baseline; }
   .cost-total .big { font-size: 30px; font-weight: 700; font-variant-numeric: tabular-nums; }
   .cost-total .lbl { color: var(--muted); font-size: 13px; }
@@ -229,6 +246,10 @@
       <button class="ghost" id="copyBtn">Copy link</button>
     </div>
     <div class="hint">Anyone with this link can watch or download the video.</div>
+
+    <h3 class="sub">Transcripts</h3>
+    <div class="hint">Click a line to jump the dubbed video to it. The player's CC button shows either transcript as captions.</div>
+    <div class="transcripts" id="transcripts"></div>
   </section>
 
   <!-- 4. Cost (owner view; hide with ?cost=0) -->
@@ -438,8 +459,80 @@
     $("dlBtn").href = st.download_url;
     $("shareUrl").value = new URL(st.download_url, location.origin).href;
     $("go").disabled = !file;
+    renderTranscripts(st);
     $("resultCard").scrollIntoView({ behavior: "smooth", block: "start" });
   };
+
+  // ── transcripts ──
+  const LANG_CODES = { English: "en", Hindi: "hi", Tamil: "ta", Telugu: "te", Kannada: "kn", Malayalam: "ml",
+                       Marathi: "mr", Bengali: "bn", Gujarati: "gu", Punjabi: "pa", Odia: "or", Assamese: "as" };
+  const toSec = (t) => { const [h, m, s] = t.trim().replace(",", ".").split(":"); return +h * 3600 + +m * 60 + parseFloat(s); };
+  const parseSrt = (srt) => srt.replace(/^﻿/, "").split(/\r?\n\s*\r?\n/).map(b => {
+    const lines = b.split(/\r?\n/).filter(l => l.trim());
+    const i = lines.findIndex(l => l.includes("-->"));
+    if (i < 0) return null;
+    const [a, z] = lines[i].split("-->");
+    const text = lines.slice(i + 1).join(" ").trim();
+    return text ? { start: toSec(a), end: toSec(z), text } : null;
+  }).filter(Boolean);
+  let cueButtons = [];
+
+  const renderTranscripts = (st) => {
+    const box = $("transcripts"), v = $("dubVideo");
+    box.innerHTML = ""; cueButtons = [];
+    v.querySelectorAll("track").forEach(t => t.remove());
+    const tr = st.transcripts || {};
+    ["target", "source"].forEach(which => {
+      const t = tr[which];
+      if (!t) return;
+      const pane = document.createElement("div");
+      pane.className = "tpane";
+      const head = document.createElement("header");
+      const title = document.createElement("strong");
+      title.textContent = t.label;
+      const dls = document.createElement("div");
+      dls.className = "dls";
+      [["srt", "SRT"], ["txt", "TXT"]].forEach(([fmt, lbl]) => {
+        const a = document.createElement("a");
+        a.className = "btn ghost"; a.href = t[fmt] + "&download=1"; a.setAttribute("download", "");
+        a.textContent = "↓ " + lbl;
+        a.title = `Download the ${t.label} transcript as ${lbl}`;
+        dls.append(a);
+      });
+      head.append(title, dls);
+      const cues = document.createElement("div");
+      cues.className = "cues";
+      cues.innerHTML = '<div class="pending">Loading…</div>';
+      pane.append(head, cues);
+      box.append(pane);
+
+      fetch(t.srt).then(r => r.ok ? r.text() : Promise.reject(r.status)).then(srt => {
+        cues.innerHTML = "";
+        parseSrt(srt).forEach(c => {
+          const b = document.createElement("button");
+          b.className = "cue"; b.type = "button";
+          const time = document.createElement("time");
+          time.textContent = fmtTime(c.start);
+          const span = document.createElement("span");
+          span.textContent = c.text;
+          b.append(time, span);
+          b.addEventListener("click", () => { v.currentTime = c.start + 0.01; v.play().catch(() => {}); });
+          cues.append(b);
+          cueButtons.push({ el: b, ...c });
+        });
+        if (!cues.children.length) cues.innerHTML = '<div class="pending">This transcript is empty.</div>';
+        // Captions on the player itself (WebVTT; same-origin, same per-job token).
+        const track = document.createElement("track");
+        track.kind = "subtitles"; track.label = t.label; track.src = t.vtt;
+        track.srclang = LANG_CODES[which === "source" ? "English" : st.target_lang] || "und";
+        v.append(track);
+      }).catch(() => pane.remove());   // missing on this job: don't show a broken pane
+    });
+  };
+  $("dubVideo").addEventListener("timeupdate", () => {
+    const t = $("dubVideo").currentTime;
+    cueButtons.forEach(c => c.el.classList.toggle("on", t >= c.start && t < c.end));
+  });
 
   const renderCost = (c, status) => {
     const body = $("costBody");
