@@ -1,0 +1,97 @@
+# CD: a merge to main that touches the service redeploys the Modal app, after CI passes.
+#
+# One-time setup (repo Settings):
+#   Secrets and variables -> Actions -> New repository secret (or, better, an Environment
+#   secret on an environment named "production" so it can require a reviewer):
+#     MODAL_TOKEN_ID, MODAL_TOKEN_SECRET   from `modal token new` or the Modal dashboard
+#   The pipeline's own secrets (HF token, Gemini key, demo codes) live in Modal's
+#   `dubbing-secrets` / `dubbing-demo`, not here; GitHub never sees them.
+#
+# Rollback: Actions -> Deploy -> Run workflow, with `ref` set to the last good commit.
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "deploy/**"
+      - "pipeline/**"
+      - "tools/**"
+      - "utils/**"
+      - "run_headless.py"
+      - "requirements.txt"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Commit, tag or branch to deploy (default: the branch you ran this from)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+# Two deploys must never overlap, and a newer push must not cancel one that is mid-build.
+concurrency:
+  group: modal-deploy
+  cancel-in-progress: false
+
+env:
+  APP_URL: https://nirmitktripathii--indic-dubbing-fastapi-app.modal.run
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    needs: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 45          # the image build is the slow part on a cold layer cache
+    environment:
+      name: production
+      url: ${{ env.APP_URL }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the Modal client
+        run: pip install modal
+
+      - name: Check the Modal credentials exist
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+        run: |
+          if [ -z "$MODAL_TOKEN_ID" ] || [ -z "$MODAL_TOKEN_SECRET" ]; then
+            echo "::error::MODAL_TOKEN_ID / MODAL_TOKEN_SECRET are not set for this environment."
+            exit 1
+          fi
+
+      # The image is built by Modal, not here; this runner only uploads the repo and calls the API.
+      - name: modal deploy
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+        run: modal deploy deploy/modal_app.py
+
+      # The old container can still answer for a short while after a deploy, so retry.
+      - name: Smoke test the live service
+        run: |
+          ok=0
+          for i in $(seq 1 12); do
+            cfg=$(curl -fsS --max-time 30 "$APP_URL/ui/config" || true)
+            page=$(curl -fsS --max-time 30 "$APP_URL/" || true)
+            if echo "$cfg" | grep -q '"enabled"' && echo "$page" | grep -q 'id="formCard"'; then ok=1; break; fi
+            echo "attempt $i: not ready yet"; sleep 15
+          done
+          [ "$ok" = 1 ] || { echo "::error::the deployed service did not answer /ui/config and /"; exit 1; }
+          # The public page must never carry the pipeline log or the compute-cost panel.
+          if echo "$page" | grep -q -E 'id="(logBox|costCard)"'; then
+            echo "::error::the live page contains the owner-only log/cost panel"; exit 1
+          fi
+          echo "live and serving: $APP_URL"
