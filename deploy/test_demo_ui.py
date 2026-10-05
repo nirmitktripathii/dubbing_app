@@ -141,12 +141,19 @@ def test_access_and_links():
     with open(out, "wb") as fh:
         fh.write(b"DUBBED-BYTES")
     status[job] = {**status[job], "status": "done", "stage": "complete", "output": out,
-                   "finished_at": time.time(), "log": "Step 7/7: done\nkey AIzaSyA1234567890abcdefghijklmnop"}
+                   "finished_at": time.time(), "log": "Step 7/7: done\nkey AIzaSyA1234567890abcdefghijklmnop",
+                   "meter": {"gpu_transcribe_s": 40.0, "cpu_orchestrator_s": 90.0}, "metered": True}
     st = client.get(f"/ui/dub/{job}", headers={"X-Demo-Code": "s3cret-code"}).json()
     check("done -> 100% with a video link", st["percent"] == 100 and st.get("video_url"), str(st))
-    check("log tail redacts an API-key-shaped string",
-          not any("AIza" in l for l in st["log"]) and any("[redacted]" in l for l in st["log"]),
-          str(st["log"]))
+    raw = json.dumps(st)
+    check("the page's status carries no pipeline log and no compute cost (owner-only)",
+          "log" not in st and "cost" not in st and "Step 7/7" not in raw and "AIza" not in raw
+          and "usd" not in raw and "meter" not in raw, raw)
+    status[job]["error"] = "boom key AIzaSyA1234567890abcdefghijklmnop"
+    st_err = client.get(f"/ui/dub/{job}", headers={"X-Demo-Code": "s3cret-code"}).json()
+    check("the error shown on the page redacts an API-key-shaped string",
+          "AIza" not in st_err["error"] and "[redacted]" in st_err["error"], st_err["error"])
+    del status[job]["error"]
 
     r = client.get(st["video_url"])
     check("shareable link serves the dubbed bytes, no code needed",
