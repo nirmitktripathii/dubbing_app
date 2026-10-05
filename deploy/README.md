@@ -251,3 +251,19 @@ python deploy/test_tts_fanout.py   # CPU tests: sharding, merge, resume/stalenes
   before any paid listing (§4.5). No GPU needed; it can invalidate the business model.
 - **Artifacts on S3/R2** instead of the jobs Volume for multi-region download + lifecycle.
 - **Studio mastering**: EBU R128 loudness, sidechain ducking, `nfe 48` for the paid tier.
+
+## CI/CD (GitHub Actions)
+
+- `.github/workflows/ci.yml` runs on every pull request and push to `main`: it compiles
+  `deploy/` and `pipeline/`, imports the Modal app, and runs the four CPU suites
+  (`test_demo_ui`, `test_youtube_fetch`, `test_api_gate`, `test_tts_fanout`). No secrets, no GPU.
+- `.github/workflows/deploy.yml` runs `modal deploy deploy/modal_app.py` when a merge to `main`
+  touches the service (`deploy/`, `pipeline/`, `tools/`, `utils/`, `run_headless.py`,
+  `requirements.txt`), but only after CI passes. It then smoke-tests the live URL and fails if
+  the public page ever carries the owner-only log/cost panel.
+- **One-time setup:** create a GitHub Environment named `production` and add the secrets
+  `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET` (a Modal token made for CI, not your personal one).
+  Add a required reviewer to that environment if every deploy should wait for a click.
+- **Rollback:** Actions -> Deploy -> Run workflow, with `ref` set to the last good commit.
+- A CI deploy bakes in no `DUBBING_*` override (see `_FORWARD_ENV` in `modal_app.py`); set one
+  by hand with `modal deploy` only for an experiment, since the next CI deploy will drop it.
