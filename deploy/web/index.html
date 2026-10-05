@@ -10,7 +10,7 @@
     --bg: #f6f5f2; --surface: #ffffff; --surface-2: #f0eee9; --border: #e3e0d8;
     --text: #1d1b16; --muted: #6b665a; --accent: #d9480f; --accent-ink: #ffffff;
     --accent-soft: #fff0e8; --ok: #2b8a3e; --ok-soft: #e6f4ea; --err: #c92a2a; --err-soft: #fdecec;
-    --bar-track: #ebe8e1; --log-bg: #1b1a17; --log-text: #e9e6de;
+    --bar-track: #ebe8e1;
     --shadow: 0 1px 2px rgba(20, 18, 12, .06), 0 8px 24px rgba(20, 18, 12, .06);
     --radius: 14px;
   }
@@ -19,7 +19,7 @@
       --bg: #141311; --surface: #1d1c19; --surface-2: #262521; --border: #34322c;
       --text: #efece5; --muted: #a39d90; --accent: #ff7a3d; --accent-ink: #1a0d05;
       --accent-soft: #2e1d13; --ok: #69db7c; --ok-soft: #16281b; --err: #ff8787; --err-soft: #2e1717;
-      --bar-track: #2d2b26; --log-bg: #0f0e0c; --log-text: #dcd8ce;
+      --bar-track: #2d2b26;
       --shadow: 0 1px 2px rgba(0, 0, 0, .3), 0 8px 24px rgba(0, 0, 0, .25);
     }
   }
@@ -27,7 +27,7 @@
     --bg: #141311; --surface: #1d1c19; --surface-2: #262521; --border: #34322c;
     --text: #efece5; --muted: #a39d90; --accent: #ff7a3d; --accent-ink: #1a0d05;
     --accent-soft: #2e1d13; --ok: #69db7c; --ok-soft: #16281b; --err: #ff8787; --err-soft: #2e1717;
-    --bar-track: #2d2b26; --log-bg: #0f0e0c; --log-text: #dcd8ce;
+    --bar-track: #2d2b26;
     --shadow: 0 1px 2px rgba(0, 0, 0, .3), 0 8px 24px rgba(0, 0, 0, .25);
   }
   * { box-sizing: border-box; }
@@ -116,11 +116,6 @@
   @keyframes spin { to { transform: rotate(360deg); } }
   details { margin-top: 16px; }
   summary { cursor: pointer; font-size: 13px; font-weight: 600; color: var(--muted); }
-  pre.log {
-    background: var(--log-bg); color: var(--log-text); border-radius: 10px; padding: 12px;
-    font: 12px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; max-height: 280px;
-    overflow: auto; white-space: pre-wrap; word-break: break-word; margin: 8px 0 0;
-  }
 
   .players { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
   @media (max-width: 640px) { .players { grid-template-columns: 1fr; } }
@@ -147,9 +142,6 @@
   .cue.on { background: var(--accent-soft); }
   .cue time { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; padding-top: 2px; }
   .tpane .pending { padding: 10px; }
-  .cost-total { display: flex; gap: 28px; flex-wrap: wrap; align-items: baseline; }
-  .cost-total .big { font-size: 30px; font-weight: 700; font-variant-numeric: tabular-nums; }
-  .cost-total .lbl { color: var(--muted); font-size: 13px; }
   table { width: 100%; border-collapse: collapse; margin-top: 14px; font-size: 14px; }
   th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--border); }
   th { font-size: 12px; color: var(--muted); font-weight: 600; }
@@ -168,7 +160,7 @@
   </header>
   <p class="tagline">Upload an English clip, or paste a YouTube link, and get it back dubbed into one of 11 Indian languages, with the timing matched to the original.</p>
 
-  <div id="simBanner" class="banner hidden">Local simulation: no Modal and no GPU are involved. The progress, logs and cost shown here are made up for testing.</div>
+  <div id="simBanner" class="banner hidden">Local simulation: no Modal and no GPU are involved. The progress shown here is made up for testing.</div>
   <div id="offBanner" class="banner hidden">The demo is switched off on this deployment because no access code is configured.</div>
 
   <!-- 1. Upload -->
@@ -238,10 +230,6 @@
       <span>Job <b id="jobId">–</b></span>
     </div>
     <ul class="steps" id="steps"></ul>
-    <details id="logBox">
-      <summary>Pipeline log</summary>
-      <pre class="log" id="log">Waiting for the first log lines…</pre>
-    </details>
     <div id="progMsg" class="msg"></div>
   </section>
 
@@ -269,12 +257,6 @@
     <div class="hint">Click a line to jump the dubbed video to it. The player's CC button shows either transcript as captions.</div>
     <div class="transcripts" id="transcripts"></div>
   </section>
-
-  <!-- 4. Cost (owner view; hide with ?cost=0) -->
-  <section class="card hidden" id="costCard">
-    <h2>Modal compute cost for this dub</h2>
-    <div id="costBody" class="pending">The cost is calculated once the dub finishes.</div>
-  </section>
 </div>
 
 <script>
@@ -285,7 +267,6 @@
     set(k, v) { try { localStorage.setItem(k, v); } catch {} },
   };
   const params = new URLSearchParams(location.search);
-  const SHOW_COST = params.get("cost") !== "0";
   const STEPS = [
     ["1", "Extract audio"], ["2", "Separate voice from background"], ["3", "Transcribe speech"],
     ["4", "Translate with timing constraints"], ["5", "Prepare the voice"],
@@ -293,7 +274,7 @@
   ];
   let file = null, fileUrl = null, jobId = null, pollTimer = null, tickTimer = null;
   let srcKind = "file", ytId = null;
-  let lastElapsed = 0, lastElapsedAt = 0, running = false, doneExtraPolls = 0;
+  let lastElapsed = 0, lastElapsedAt = 0, running = false;
 
   const fmtTime = (s) => {
     if (s == null || isNaN(s)) return "–";
@@ -302,7 +283,6 @@
     return m >= 60 ? `${Math.floor(m / 60)}:${String(m % 60).padStart(2, "0")}:${String(r).padStart(2, "0")}`
                    : `${m}:${String(r).padStart(2, "0")}`;
   };
-  const usd = (x, d = 4) => x == null ? "–" : "$" + Number(x).toFixed(d);
   const showMsg = (el, kind, text) => { el.className = "msg " + kind; el.textContent = text; };
   const hideMsg = (el) => { el.className = "msg"; el.textContent = ""; };
 
@@ -485,13 +465,12 @@
   };
 
   const startJob = (id, fresh) => {
-    jobId = id; running = true; doneExtraPolls = 0;
+    jobId = id; running = true;
     history.replaceState(null, "", location.pathname + location.search + "#job=" + id);
     $("progCard").classList.remove("hidden");
     $("resultCard").classList.add("hidden");
     $("jobId").textContent = id.slice(0, 8);
     $("bar").className = "bar";
-    if (SHOW_COST) { $("costCard").classList.remove("hidden"); $("costBody").className = "pending"; $("costBody").textContent = "The cost is calculated once the dub finishes."; }
     renderSteps("", "queued");
     if (fresh) $("progCard").scrollIntoView({ behavior: "smooth", block: "start" });
     clearInterval(tickTimer);
@@ -516,28 +495,17 @@
     $("jobLang").textContent = st.target_lang || "–";
     if (st.elapsed_s != null) { lastElapsed = st.elapsed_s; lastElapsedAt = Date.now(); $("elapsed").textContent = fmtTime(st.elapsed_s); }
     renderSteps(st.stage, st.status);
-    const log = $("log");
-    const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 8;
-    if (st.log && st.log.length) log.textContent = st.log.join("\n");
-    if (atBottom) log.scrollTop = log.scrollHeight;
-
-    if (SHOW_COST) renderCost(st.cost, st.status);
-
     if (st.status === "done") {
       running = false;
       $("bar").className = "bar done";
       showResult(st);
-      // The orchestrator writes its own meter last; poll briefly until the cost is final.
-      if (SHOW_COST && !(st.cost && st.cost.final) && doneExtraPolls++ < 10) pollTimer = setTimeout(poll, 3000);
       return;
     }
     if (st.status === "failed") {
       running = false;
       $("bar").className = "bar failed";
-      $("logBox").open = true;
-      showMsg($("progMsg"), "err", st.error || "The dub failed. The log above shows where.");
+      showMsg($("progMsg"), "err", st.error || "The dub failed. Please try again.");
       $("go").disabled = !canGo();
-      if (SHOW_COST && !(st.cost && st.cost.final) && doneExtraPolls++ < 10) pollTimer = setTimeout(poll, 3000);
       return;
     }
     pollTimer = setTimeout(poll, 3000);
@@ -633,24 +601,9 @@
     cueButtons.forEach(c => c.el.classList.toggle("on", t >= c.start && t < c.end));
   });
 
-  const renderCost = (c, status) => {
-    const body = $("costBody");
-    if (!c) { body.className = "pending"; body.textContent = status === "done" || status === "failed" ? "No meter was recorded for this job (it ran on a build without metering)." : "The cost is calculated once the dub finishes."; return; }
-    const rows = c.lines.map(l => `<tr><td>${l.label}<div class="hint">${l.note || ""}</div></td><td class="num">${fmtTime(l.seconds)}</td><td class="num">${usd(l.usd, 5)}</td></tr>`).join("");
-    body.className = "";
-    body.innerHTML = `
-      <div class="cost-total">
-        <div><div class="big">${usd(c.total_usd)}</div><div class="lbl">${c.final ? "total for this dub" : "so far (still metering)…"}</div></div>
-        <div><div class="big">${c.input_seconds ? fmtTime(c.input_seconds) : "–"}</div><div class="lbl">clip length (t)</div></div>
-        <div><div class="big">${usd(c.usd_per_video_minute)}</div><div class="lbl">per minute of video</div></div>
-      </div>
-      <table><thead><tr><th>Container</th><th class="num">Billed time</th><th class="num">Cost</th></tr></thead><tbody>${rows}</tbody></table>
-      <div class="foot">${c.method} Not included: ${c.excludes.join("; ")}.</div>`;
-  };
-
   $("again").addEventListener("click", () => {
     history.replaceState(null, "", location.pathname + location.search);
-    $("resultCard").classList.add("hidden"); $("progCard").classList.add("hidden"); $("costCard").classList.add("hidden");
+    $("resultCard").classList.add("hidden"); $("progCard").classList.add("hidden");
     hideMsg($("progMsg"));
     $("formCard").scrollIntoView({ behavior: "smooth" });
   });

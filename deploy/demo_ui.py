@@ -6,7 +6,7 @@
     POST /ui/dub                    multipart: file, target_lang, mode  (X-Demo-Code header)
     POST /ui/dub/youtube            form/JSON: url, target_lang, mode — a PUBLIC YouTube video
                                     within the duration limit, fetched server-side (X-Demo-Code)
-    GET  /ui/dub/{job_id}           progress %, description, log tail, cost (X-Demo-Code)
+    GET  /ui/dub/{job_id}           progress %, description, stage, error (X-Demo-Code)
     GET  /ui/dub/{job_id}/video?t=  the dubbed mp4 — a SHAREABLE link, gated by a per-job token
     GET  /ui/dub/{job_id}/transcript/{which}.{fmt}?t=
                                     which = source (English) | target (dubbed language),
@@ -27,12 +27,17 @@ Both get the same DEMO limits. DEMO_ACCESS_CODE unset => the demo refuses (503):
 cannot run has not passed. Never hand out a code that equals RAPIDAPI_PROXY_SECRET — it would
 let a third party call /v1 around RapidAPI; that is why the shared code is separate.
 
-COST. What the page reports is an ESTIMATE: container-seconds we timed inside each Modal
+WHAT THE PAGE NEVER SEES. The pipeline log and the compute cost are owner-only: /ui/dub/{id}
+returns neither (the log names internal models, paths and providers; the cost is the owner's
+business). The owner reads both from the job record in the `indic-dubbing-status` Dict or via
+/v1/jobs; estimate_cost() is kept for that owner-side use.
+
+COST. estimate_cost() is an ESTIMATE: container-seconds we timed inside each Modal
 function x Modal's per-second list price (the constants in tools/cost_model.py, so there is one
 price table in the repo). It includes the configured scale-down idle tail of every container we
 start. It EXCLUDES what no timer inside a function can see — image boot / snapshot restore
 before the function body runs, the always-on API container, and Gemini API usage. The invoice
-(`modal billing`) is the ground truth; the page says so beside the number.
+(`modal billing`) is the ground truth; not this estimate.
 """
 from __future__ import annotations
 
@@ -227,9 +232,11 @@ def srt_to(srt: str, fmt: str) -> str:
 _REDACT = re.compile(r"(AIza[0-9A-Za-z_\-]{20,}|hf_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_\-]{20,})")
 
 
-def _log_lines(st: dict, n: int = 80) -> list[str]:
-    text = _REDACT.sub("[redacted]", str(st.get("log") or ""))
-    return [l for l in text.splitlines() if l.strip()][-n:]
+def _public_error(st: dict) -> str | None:
+    """The one free-text field the page shows. It comes from an exception message, so redact
+    anything key-shaped before it leaves the server."""
+    err = st.get("error")
+    return _REDACT.sub("[redacted]", str(err)) if err else None
 
 
 def voice_coverage() -> dict:
@@ -364,8 +371,7 @@ def add_demo_routes(api: FastAPI, *, dub_video, job_status, jobs_vol, jobs_dir,
             "input_seconds": st.get("input_seconds"),
             # Upload-accepted -> finished: what the person waiting actually experienced.
             "elapsed_s": round(end - created, 1) if created else None,
-            "log": _log_lines(st), "error": st.get("error"),
-            "cost": estimate_cost(st),
+            "error": _public_error(st),
             "youtube": st.get("youtube"),
         }
         if st.get("status") == "done":
