@@ -90,6 +90,10 @@ image = (
     # f5_tts.infer.utils_infer), and api.py parses the /v1/dub multipart form off the raw
     # Request, so FastAPI never synthesizes the Body_* model whose OpenAPI generation used to
     # 500. The resolved web-stack version is therefore not load-bearing.
+    # YouTube-link inputs (deploy/youtube_fetch.py). yt-dlp is unpinned-floor on purpose:
+    # YouTube changes break old releases within weeks. `deno` is the JS runtime yt-dlp now
+    # needs for full YouTube format extraction (its EJS challenge solver).
+    .pip_install("yt-dlp[default]>=2026.8.19", "deno")
     .add_local_dir(".", REPO_MOUNT, copy=True,
                    ignore=["dubbing_output*", "*.zip", "*.mp4", "*.mkv", "*.mov", "*.wav",
                            ".git", "graphify-out", "**/__pycache__", ".claude"])
@@ -850,6 +854,33 @@ class TTSEngine:
         return {"entries": entries, "wavs": wavs, "log": lines[-80:], "meter": meter}
 
 
+# ── YouTube-link input (CPU) ──────────────────────────────────────────────────────────────
+@app.function(volumes=VOLUMES, secrets=secrets, timeout=60 * 10)
+def fetch_youtube(job_id: str, url: str, target_lang: str, mode: str, plan: str, user: str,
+                  extra: dict):
+    """Fetch a public YouTube video into the job dir and admit it through the same duration
+    gate as an upload (deploy/youtube_fetch.run_fetch_job), then spawn dub_video. CPU only:
+    a link that is too long, private, live, or blocked fails here, before any GPU starts.
+    YouTube blocks datacenter IPs, so this needs YTDLP_COOKIES or YTDLP_PROXY in
+    `dubbing-secrets` (see the module docstring); without them it fails with that message."""
+    import sys
+    sys.path.insert(0, REPO_MOUNT)
+    os.chdir(REPO_MOUNT)
+    from deploy.youtube_fetch import run_fetch_job
+    t0 = time.time()
+    spawned = False
+    try:
+        spawned = run_fetch_job(job_id=job_id, url=url, target_lang=target_lang, mode=mode,
+                                plan=plan, user=user, job_status=job_status, jobs_vol=jobs_vol,
+                                jobs_dir=JOBS_DIR, dub_video=dub_video, extra=extra)
+    finally:
+        _meter_add(job_id, "cpu_fetch_s", time.time() - t0)
+        if not spawned:   # no orchestrator will close the meter for a job that never started
+            st = job_status.get(job_id, {})
+            st["metered"] = True
+            job_status[job_id] = st
+
+
 # ── FastAPI gateway, served by Modal ──────────────────────────────────────────────────────
 @app.function(volumes=VOLUMES, secrets=secrets + demo_secrets, min_containers=1)
 @modal.asgi_app()
@@ -858,7 +889,8 @@ def fastapi_app():
     sys.path.insert(0, REPO_MOUNT)
     # api.py builds the FastAPI app and wires it to dub_video / job_status / jobs_vol.
     from deploy.api import build_api
-    return build_api(dub_video=dub_video, job_status=job_status, jobs_vol=jobs_vol, jobs_dir=JOBS_DIR)
+    return build_api(dub_video=dub_video, job_status=job_status, jobs_vol=jobs_vol, jobs_dir=JOBS_DIR,
+                     fetch_youtube=fetch_youtube)
 
 
 # ── Web demo UI ────────────────────────────────────────────────────────────────────────────

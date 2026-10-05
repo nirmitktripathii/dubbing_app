@@ -26,6 +26,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("DEMO_ACCESS_CODE", "dev")
 os.environ["DUB_DEMO_SIMULATED"] = "1"
+os.environ.setdefault("DUB_YOUTUBE_DIRECT", "1")   # this machine's IP can reach YouTube
 
 from deploy.api import build_api  # noqa: E402
 
@@ -136,6 +137,21 @@ class FakeDub:
         put(meter=m, metered=True)
 
 
+class FakeFetch:
+    """The REAL deploy/youtube_fetch.run_fetch_job in a thread: real yt-dlp, real metadata and
+    duration gates, real download — from this machine's IP, which YouTube does not block the
+    way it blocks Modal's. Only the dub after it is simulated (FakeDub)."""
+    def __init__(self, dub):
+        self.dub = dub
+
+    def spawn(self, job_id, url, target_lang, mode, plan, user, extra):
+        from deploy.youtube_fetch import run_fetch_job
+        threading.Thread(target=run_fetch_job, daemon=True, kwargs=dict(
+            job_id=job_id, url=url, target_lang=target_lang, mode=mode, plan=plan, user=user,
+            job_status=STATUS, jobs_vol=FakeVol(), jobs_dir=JOBS_DIR, dub_video=self.dub,
+            extra=extra)).start()
+
+
 def main():
     import argparse
     import uvicorn
@@ -147,7 +163,15 @@ def main():
         from deploy.demo_ui import voice_coverage
         print(f"Voice references from {os.environ['DUBBING_VOICE_REF_DIR']}: {voice_coverage()}")
     os.makedirs(JOBS_DIR, exist_ok=True)
-    app = build_api(dub_video=FakeDub(), job_status=STATUS, jobs_vol=FakeVol(), jobs_dir=JOBS_DIR)
+    dub = FakeDub()
+    try:
+        import yt_dlp  # noqa: F401
+        fetch = FakeFetch(dub)
+    except ImportError:
+        fetch = None
+        print("yt-dlp not installed: the YouTube-link tab is hidden (pip install yt-dlp).")
+    app = build_api(dub_video=dub, job_status=STATUS, jobs_vol=FakeVol(), jobs_dir=JOBS_DIR,
+                    fetch_youtube=fetch)
     port = int(os.environ.get("PORT", "8765"))
     print(f"Demo UI (SIMULATED) on http://localhost:{port}  — access code: "
           f"{os.environ['DEMO_ACCESS_CODE']}")

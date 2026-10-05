@@ -4,15 +4,21 @@
     GET  /                          the page (deploy/web/index.html)
     GET  /ui/config                 languages, limits, whether the demo is enabled
     POST /ui/dub                    multipart: file, target_lang, mode  (X-Demo-Code header)
+    POST /ui/dub/youtube            form/JSON: url, target_lang, mode — a PUBLIC YouTube video
+                                    within the duration limit, fetched server-side (X-Demo-Code)
     GET  /ui/dub/{job_id}           progress %, description, log tail, cost (X-Demo-Code)
     GET  /ui/dub/{job_id}/video?t=  the dubbed mp4 — a SHAREABLE link, gated by a per-job token
     GET  /ui/dub/{job_id}/transcript/{which}.{fmt}?t=
                                     which = source (English) | target (dubbed language),
                                     fmt = srt | txt | vtt — same per-job token as the video
+    GET  /ui/dub/{job_id}/source?t= the input video as the pipeline received it (same token)
 
 It submits through the SAME `prepare_job` + `dub_video.spawn` path as POST /v1/dub, so the page
 exercises exactly the deployed pipeline — duration gate, idempotency, split orchestrator,
-TTS fan-out — not a parallel copy of it.
+TTS fan-out — not a parallel copy of it. A YouTube link is fetched by a CPU function
+(deploy/youtube_fetch.py) and then admitted through api.admit_job, the same duration gate an
+upload passes; the limit is checked on YouTube's metadata before any download, and again by
+ffprobe on the file that arrives.
 
 ACCESS. The page is public and every submit spends GPU money, so /ui/dub requires a code from
 the Modal secret `dubbing-demo`: DEMO_ACCESS_CODE (the one you hand out) or, optionally,
@@ -35,11 +41,13 @@ import os
 import re
 import secrets
 import time
+import uuid
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, Response
 
-from deploy.api import ApiError, MAX_UPLOAD_MB, PLAN_MAX_SECONDS, prepare_job
+from deploy.api import ApiError, MAX_UPLOAD_MB, PLAN_MAX_SECONDS, check_mode, prepare_job
+from deploy.youtube_fetch import FetchRejected, access_configured, canonical_url, parse_youtube_url
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 
@@ -87,6 +95,10 @@ def progress_for(st: dict) -> tuple[int, str]:
         return 100, "Done — your dubbed video is ready"
     if status == "queued":
         return 1, "Queued — waiting for a GPU"
+    if stage.startswith("fetch"):
+        if status == "failed":
+            return 1, "Couldn't fetch the YouTube video"
+        return 1, "Fetching the YouTube video"
     m = _STEP_RE.search(stage)
     if m and m.group(1) in STEP_BANDS:
         lo, hi, desc = STEP_BANDS[m.group(1)]
@@ -113,6 +125,7 @@ def estimate_cost(st: dict) -> dict | None:
     meter.gpu_transcribe_s  L4 body time of gpu_transcribe (Steps 1-3), summed over attempts
     meter.gpu_full_s        L4 body time of gpu_full_run (vc mode / kill-switch / fallback)
     meter.cpu_orchestrator_s  wall time of the CPU dub_video orchestrator
+    meter.cpu_fetch_s       wall time of the CPU fetch_youtube function (YouTube-link jobs)
     tts_meter.workers       per TTSEngine shard: container task id + seconds since it came up
     """
     from tools.cost_model import cpu_s, gpu_s   # the repo's single price table
@@ -146,6 +159,9 @@ def estimate_cost(st: dict) -> dict | None:
         s = sum(per_task.values()) + tail * len(per_task)
         add(f"L4 GPU — speech synthesis, {len(per_task)} worker(s)", s, gpu_s(s),
             f"incl. {tail:.0f} s idle tail each")
+    if m.get("cpu_fetch_s"):
+        s = m["cpu_fetch_s"] + MODAL_DEFAULT_SCALEDOWN_S
+        add("CPU — YouTube fetch", s, cpu_s(s), f"incl. {MODAL_DEFAULT_SCALEDOWN_S:.0f} s idle tail")
     if m.get("cpu_orchestrator_s"):
         s = m["cpu_orchestrator_s"] + MODAL_DEFAULT_SCALEDOWN_S
         add("CPU — orchestrator (translation + assembly)", s, cpu_s(s),
@@ -228,7 +244,8 @@ def voice_coverage() -> dict:
         return {}
 
 
-def add_demo_routes(api: FastAPI, *, dub_video, job_status, jobs_vol, jobs_dir) -> None:
+def add_demo_routes(api: FastAPI, *, dub_video, job_status, jobs_vol, jobs_dir,
+                    fetch_youtube=None) -> None:
     def _code() -> str:
         return os.environ.get("DEMO_ACCESS_CODE", "")
 
@@ -264,6 +281,7 @@ def add_demo_routes(api: FastAPI, *, dub_video, job_status, jobs_vol, jobs_dir) 
     def config():
         return {"enabled": bool(_code()), "languages": LANGUAGES, "voices": voice_coverage(),
                 "max_seconds": PLAN_MAX_SECONDS["DEMO"], "max_upload_mb": MAX_UPLOAD_MB,
+                "youtube": fetch_youtube is not None and access_configured(),
                 "simulated": os.environ.get("DUB_DEMO_SIMULATED") == "1"}
 
     @api.post("/ui/dub", include_in_schema=False)
@@ -291,6 +309,44 @@ def add_demo_routes(api: FastAPI, *, dub_video, job_status, jobs_vol, jobs_dir) 
             raise HTTPException(e.status_code, e.detail)
         return {"job_id": r["job_id"], "status": r["status"]}
 
+    @api.post("/ui/dub/youtube", include_in_schema=False)
+    async def ui_create_youtube(request: Request):
+        """Accept a YouTube link; the fetch (and its duration gate) runs in a CPU function, so
+        this returns a job id at once and the page follows the fetch like any other stage."""
+        who = _check(request)
+        if fetch_youtube is None or not access_configured():
+            raise HTTPException(503, "YouTube links are not enabled on this deployment "
+                                     "(no YouTube access is configured). Upload the file instead.")
+        if "json" in (request.headers.get("content-type") or ""):
+            form = await request.json()
+        else:
+            form = await request.form()
+        target_lang = str(form.get("target_lang") or "Hindi")
+        if target_lang not in LANGUAGES:
+            raise HTTPException(400, f"target_lang must be one of {LANGUAGES}")
+        try:
+            mode = check_mode(str(form.get("mode") or "basic"))
+            vid = parse_youtube_url(str(form.get("url") or ""))
+        except ApiError as e:
+            raise HTTPException(e.status_code, e.detail)
+        except FetchRejected as e:
+            raise HTTPException(400, str(e))
+        idem = request.headers.get("idempotency-key")
+        if idem:
+            prior = job_status.get(f"idem:{idem}")
+            if prior:
+                return {"job_id": prior, "status": job_status.get(prior, {}).get("status")}
+        job_id = uuid.uuid4().hex
+        extra = {"source": DEMO_SOURCE, "dl_token": secrets.token_urlsafe(18)}
+        job_status[job_id] = {"status": "fetching", "stage": "fetching", "mode": mode,
+                              "target_lang": target_lang, "user": who, "plan": "DEMO",
+                              "created_at": time.time(), "youtube": {"id": vid,
+                              "url": canonical_url(vid)}, **extra}
+        if idem:
+            job_status[f"idem:{idem}"] = job_id
+        fetch_youtube.spawn(job_id, canonical_url(vid), target_lang, mode, "DEMO", who, extra)
+        return {"job_id": job_id, "status": "fetching"}
+
     @api.get("/ui/dub/{job_id}", include_in_schema=False)
     def ui_status(job_id: str, request: Request):
         _check(request)
@@ -310,6 +366,7 @@ def add_demo_routes(api: FastAPI, *, dub_video, job_status, jobs_vol, jobs_dir) 
             "elapsed_s": round(end - created, 1) if created else None,
             "log": _log_lines(st), "error": st.get("error"),
             "cost": estimate_cost(st),
+            "youtube": st.get("youtube"),
         }
         if st.get("status") == "done":
             tok = st.get("dl_token", "")
@@ -317,6 +374,7 @@ def add_demo_routes(api: FastAPI, *, dub_video, job_status, jobs_vol, jobs_dir) 
             out["video_url"] = base
             out["download_url"] = base + "&download=1"
             out["video_seconds"] = st.get("video_seconds")
+            out["source_url"] = f"/ui/dub/{job_id}/source?t={tok}"
             # URLs only; the page fetches each one and hides any that is missing (404), so a
             # status poll never has to reload the volume to check the files exist.
             tr = f"/ui/dub/{job_id}/transcript"
@@ -366,3 +424,13 @@ def add_demo_routes(api: FastAPI, *, dub_video, job_status, jobs_vol, jobs_dir) 
         disp = "attachment" if download else "inline"
         return Response(body, media_type=f"{TRANSCRIPT_FORMATS[fmt]}; charset=utf-8",
                         headers={"Content-Disposition": f'{disp}; filename="{name}"'})
+
+    @api.get("/ui/dub/{job_id}/source", include_in_schema=False)
+    def ui_source(job_id: str, t: str = ""):
+        """The input as the pipeline received it — for a YouTube job, the page's "Original"."""
+        st, _ = _done_output(job_id, t)
+        name = os.path.basename(st.get("input_name") or "")
+        path = os.path.join(jobs_dir, job_id, name) if name else ""
+        if not path or not os.path.isfile(path):
+            raise HTTPException(404, "source not available for this job")
+        return FileResponse(path, media_type="video/mp4", content_disposition_type="inline")

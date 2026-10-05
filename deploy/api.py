@@ -78,6 +78,16 @@ class ApiError(Exception):
         super().__init__(detail)
 
 
+def check_mode(mode: str) -> str:
+    """The validated, lower-cased mode; raises ApiError for an unknown or retired one."""
+    mode = (mode or "basic").lower()
+    if mode not in VALID_MODES:
+        raise ApiError(400, f"mode must be one of {sorted(VALID_MODES)}")
+    if mode == "xlingual":
+        raise ApiError(400, "mode 'xlingual' is deprecated (garbled cross-lingual output); use 'vc'.")
+    return mode
+
+
 def prepare_job(*, job_status, jobs_vol, jobs_dir, dub_video, data: bytes, filename: str,
                 target_lang: str, mode: str, plan: str = "", user: str | None = None,
                 idempotency_key: str | None = None, max_upload_mb: int = MAX_UPLOAD_MB,
@@ -87,11 +97,7 @@ def prepare_job(*, job_status, jobs_vol, jobs_dir, dub_video, data: bytes, filen
     This is the POST /v1/dub business logic, extracted so auth/limits/idempotency/spawn are
     testable on CPU with fakes (the FastAPI multipart layer is env-version-fragile).
     """
-    mode = (mode or "basic").lower()
-    if mode not in VALID_MODES:
-        raise ApiError(400, f"mode must be one of {sorted(VALID_MODES)}")
-    if mode == "xlingual":
-        raise ApiError(400, "mode 'xlingual' is deprecated (garbled cross-lingual output); use 'vc'.")
+    mode = check_mode(mode)
 
     # Idempotency: a repeated key returns the existing job without re-running / re-billing.
     if idempotency_key:
@@ -109,10 +115,28 @@ def prepare_job(*, job_status, jobs_vol, jobs_dir, dub_video, data: bytes, filen
     job_dir = os.path.join(jobs_dir, job_id)
     os.makedirs(job_dir, exist_ok=True)
     input_name = os.path.basename(filename or "input.mp4")
-    in_path = os.path.join(job_dir, input_name)
-    with open(in_path, "wb") as fh:
+    with open(os.path.join(job_dir, input_name), "wb") as fh:
         fh.write(data)
 
+    admit_job(job_status=job_status, jobs_vol=jobs_vol, dub_video=dub_video, job_id=job_id,
+              job_dir=job_dir, input_name=input_name, target_lang=target_lang, mode=mode,
+              plan=plan, user=user, extra=extra)
+    if idempotency_key:
+        job_status[f"idem:{idempotency_key}"] = job_id
+    return {"job_id": job_id, "status": "queued", "poll": f"/v1/dub/{job_id}"}
+
+
+def admit_job(*, job_status, jobs_vol, dub_video, job_id: str, job_dir: str, input_name: str,
+              target_lang: str, mode: str, plan: str = "", user: str | None = None,
+              extra: dict | None = None) -> float:
+    """Gate an input file that is ALREADY in ``job_dir`` on duration, then spawn the GPU job.
+
+    The one admission path for every input source — an upload (prepare_job) or a fetched
+    YouTube video (deploy/youtube_fetch.py) — so nothing reaches a GPU around this gate.
+    A status record already present for ``job_id`` (a fetch's progress and log) is kept and
+    updated, not replaced. Returns the probed duration; raises ApiError and deletes
+    ``job_dir`` on rejection.
+    """
     # ── The pre-GPU duration gate ────────────────────────────────────────────────────────
     # File size in MB is NOT a proxy for GPU cost: a heavily-compressed 3-hour video clears
     # a 500 MB limit and would then occupy a GPU for hours on a plan whose ceiling is 120 s.
@@ -122,7 +146,7 @@ def prepare_job(*, job_status, jobs_vol, jobs_dir, dub_video, data: bytes, filen
     # a media file we can dub.
     plan = (plan or "").upper()
     max_seconds = PLAN_MAX_SECONDS.get(plan, PLAN_MAX_SECONDS[""])
-    duration = probe_duration(in_path)
+    duration = probe_duration(os.path.join(job_dir, input_name))
     if duration is None:
         shutil.rmtree(job_dir, ignore_errors=True)
         raise ApiError(400, "could not determine media duration (not a readable video/audio file)")
@@ -136,20 +160,20 @@ def prepare_job(*, job_status, jobs_vol, jobs_dir, dub_video, data: bytes, filen
     except Exception:
         pass
 
+    prev = job_status.get(job_id) or {}
     job_status[job_id] = {
-        "status": "queued", "mode": mode, "target_lang": target_lang, "user": user,
-        "plan": plan, "max_seconds": max_seconds, "input_seconds": duration,
-        "created_at": time.time(),
+        **prev,
+        "status": "queued", "stage": "queued", "mode": mode, "target_lang": target_lang,
+        "user": user, "plan": plan, "max_seconds": max_seconds, "input_seconds": duration,
+        "input_name": input_name, "created_at": prev.get("created_at") or time.time(),
         **(extra or {}),
     }
-    if idempotency_key:
-        job_status[f"idem:{idempotency_key}"] = job_id
 
     dub_video.spawn(job_id, input_name, target_lang, mode)   # fire-and-forget GPU job
-    return {"job_id": job_id, "status": "queued", "poll": f"/v1/dub/{job_id}"}
+    return duration
 
 
-def build_api(dub_video, job_status, jobs_vol, jobs_dir):
+def build_api(dub_video, job_status, jobs_vol, jobs_dir, fetch_youtube=None):
     api = FastAPI(title="Indic AI Dubbing API", version="1.0")
 
     expected_secret = os.environ.get("RAPIDAPI_PROXY_SECRET", "")
@@ -248,5 +272,5 @@ def build_api(dub_video, job_status, jobs_vol, jobs_dir):
     # DEMO_ACCESS_CODE instead of the RapidAPI proxy secret. See deploy/demo_ui.py.
     from deploy.demo_ui import add_demo_routes
     add_demo_routes(api, dub_video=dub_video, job_status=job_status, jobs_vol=jobs_vol,
-                    jobs_dir=jobs_dir)
+                    jobs_dir=jobs_dir, fetch_youtube=fetch_youtube)
     return api

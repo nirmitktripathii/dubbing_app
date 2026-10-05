@@ -64,6 +64,14 @@
   .drop span { color: var(--muted); font-size: 13px; }
   .drop.has-file { padding: 14px 16px; text-align: left; display: flex; gap: 14px; align-items: center; }
   .drop.has-file video { width: 132px; aspect-ratio: 16/9; object-fit: cover; border-radius: 8px; background: #000; flex: none; }
+  .tabs { display: inline-flex; background: var(--surface-2); border: 1px solid var(--border); border-radius: 10px; padding: 3px; margin-bottom: 14px; }
+  .tabs button { background: transparent; color: var(--muted); padding: 7px 14px; border-radius: 8px; font-weight: 600; }
+  .tabs button[aria-selected="true"] { background: var(--surface); color: var(--text); box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+  .yt { border: 2px dashed var(--border); border-radius: 12px; padding: 16px; }
+  .yt input[type=url] { width: 100%; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border); background: var(--surface); color: var(--text); font: inherit; }
+  .yt-preview { display: flex; gap: 14px; align-items: center; margin-top: 12px; }
+  .yt-preview img { width: 132px; aspect-ratio: 16/9; object-fit: cover; border-radius: 8px; background: #000; flex: none; }
+  .yt-preview span { color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 16px; }
   @media (max-width: 560px) { .grid { grid-template-columns: 1fr; } }
   label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; }
@@ -158,14 +166,24 @@
     </div>
     <h1>IndicAI Dubbing</h1>
   </header>
-  <p class="tagline">Upload an English clip and get it back dubbed into one of 11 Indian languages, with the timing matched to the original.</p>
+  <p class="tagline">Upload an English clip, or paste a YouTube link, and get it back dubbed into one of 11 Indian languages, with the timing matched to the original.</p>
 
   <div id="simBanner" class="banner hidden">Local simulation: no Modal and no GPU are involved. The progress, logs and cost shown here are made up for testing.</div>
   <div id="offBanner" class="banner hidden">The demo is switched off on this deployment because no access code is configured.</div>
 
   <!-- 1. Upload -->
   <section class="card" id="formCard">
-    <h2>1 · Upload a clip</h2>
+    <h2>1 · Choose a clip</h2>
+    <div class="tabs hidden" id="srcTabs" role="tablist">
+      <button type="button" role="tab" id="tabFile" aria-selected="true">Upload a file</button>
+      <button type="button" role="tab" id="tabYt" aria-selected="false">YouTube link</button>
+    </div>
+    <div class="yt hidden" id="ytPane">
+      <label for="ytUrl">YouTube link</label>
+      <input type="url" id="ytUrl" placeholder="https://www.youtube.com/watch?v=…" autocomplete="off" spellcheck="false">
+      <div class="hint" id="ytLimits">Public videos only, up to 5:00 long. The server downloads it, so nothing is uploaded from your device.</div>
+      <div class="yt-preview hidden" id="ytPreview"><img id="ytThumb" alt=""><span id="ytMeta"></span></div>
+    </div>
     <div class="drop" id="drop" tabindex="0" role="button" aria-label="Choose a video file">
       <div id="dropEmpty">
         <strong>Drop a video here, or click to choose one</strong>
@@ -274,6 +292,7 @@
     ["6", "Synthesise dubbed speech"], ["7", "Mix and merge the video"],
   ];
   let file = null, fileUrl = null, jobId = null, pollTimer = null, tickTimer = null;
+  let srcKind = "file", ytId = null;
   let lastElapsed = 0, lastElapsedAt = 0, running = false, doneExtraPolls = 0;
 
   const fmtTime = (s) => {
@@ -306,6 +325,11 @@
     sel.addEventListener("change", voiceHint);
     voiceHint();
     $("limits").textContent = `MP4, MOV, MKV or WebM · up to ${fmtTime(cfg.max_seconds)} long · max ${cfg.max_upload_mb} MB`;
+    $("ytLimits").textContent = `Public videos only, up to ${fmtTime(cfg.max_seconds)} long. The server downloads it, so nothing is uploaded from your device.`;
+    if (cfg.youtube) {
+      $("srcTabs").classList.remove("hidden");
+      if (store.get("dub.src") === "youtube") setSrc("youtube");
+    }
     if (cfg.simulated) $("simBanner").classList.remove("hidden");
     if (!cfg.enabled) $("offBanner").classList.remove("hidden");
   }).catch(() => {});
@@ -342,11 +366,83 @@
   ["dragleave", "drop"].forEach(ev => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove("over"); }));
   drop.addEventListener("drop", (e) => pick(e.dataTransfer.files[0]));
 
+  // ── YouTube link (the server re-validates; this only gives instant feedback) ──
+  const YT_HOSTS = ["youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com",
+                    "youtu.be", "www.youtube-nocookie.com", "youtube-nocookie.com"];
+  const parseYt = (raw) => {
+    raw = (raw || "").trim();
+    if (!raw) return null;
+    let u;
+    try { u = new URL(raw.includes("://") ? raw : "https://" + raw); } catch { return null; }
+    const host = u.hostname.toLowerCase();
+    if (!YT_HOSTS.includes(host)) return null;
+    const segs = u.pathname.split("/").filter(Boolean);
+    let id = null;
+    if (host === "youtu.be") id = segs[0];
+    else if (segs[0] === "watch" || segs[0] === "playlist" || !segs.length) id = u.searchParams.get("v");
+    else if (["shorts", "embed", "live", "v", "e"].includes(segs[0])) id = segs[1];
+    return id && /^[A-Za-z0-9_-]{11}$/.test(id) ? id : null;
+  };
+  const canGo = () => srcKind === "youtube" ? !!ytId : !!file;
+  function setSrc(kind) {
+    srcKind = kind;
+    store.set("dub.src", kind);
+    $("tabFile").setAttribute("aria-selected", String(kind === "file"));
+    $("tabYt").setAttribute("aria-selected", String(kind === "youtube"));
+    $("drop").classList.toggle("hidden", kind !== "file");
+    $("ytPane").classList.toggle("hidden", kind !== "youtube");
+    $("go").disabled = !canGo();
+    hideMsg($("formMsg"));
+  }
+  $("tabFile").addEventListener("click", () => setSrc("file"));
+  $("tabYt").addEventListener("click", () => { setSrc("youtube"); $("ytUrl").focus(); });
+  $("ytUrl").addEventListener("input", () => {
+    const raw = $("ytUrl").value;
+    ytId = parseYt(raw);
+    $("ytPreview").classList.toggle("hidden", !ytId);
+    if (ytId) {
+      $("ytThumb").src = `https://i.ytimg.com/vi/${ytId}/mqdefault.jpg`;
+      $("ytMeta").textContent = `Video ${ytId} · its length and visibility are checked before anything is downloaded.`;
+      hideMsg($("formMsg"));
+    } else if (raw.trim()) {
+      showMsg($("formMsg"), "err", "That isn't a link to a single YouTube video.");
+    } else hideMsg($("formMsg"));
+    $("go").disabled = !canGo();
+  });
+
+  const submitYoutube = async (code) => {
+    $("go").disabled = true;
+    hideMsg($("formMsg"));
+    $("uploadNote").textContent = "Sending the link…";
+    try {
+      const r = await fetch("/ui/dub/youtube", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Demo-Code": code,
+                   "Idempotency-Key": (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random()) },
+        body: JSON.stringify({ url: $("ytUrl").value.trim(), target_lang: $("lang").value, mode: $("mode").value }),
+      });
+      let body = {};
+      try { body = await r.json(); } catch {}
+      $("uploadNote").textContent = "";
+      if (r.ok && body.job_id) { startJob(body.job_id, true); return; }
+      $("go").disabled = false;
+      showMsg($("formMsg"), "err", r.status === 403 ? "That access code isn't valid." : (body.detail || "Couldn't submit the link."));
+    } catch {
+      $("uploadNote").textContent = ""; $("go").disabled = false;
+      showMsg($("formMsg"), "err", "Network error. Try again.");
+    }
+  };
+
   // ── submit (XHR, so the upload itself shows progress) ──
   $("go").addEventListener("click", () => {
     const code = $("code").value.trim();
-    if (!file) return;
+    if (!canGo()) return;
     if (!code) { showMsg($("formMsg"), "err", "Enter the access code you were given."); $("code").focus(); return; }
+    if (srcKind === "youtube") {
+      store.set("dub.code", code); store.set("dub.lang", $("lang").value); store.set("dub.mode", $("mode").value);
+      submitYoutube(code);
+      return;
+    }
     store.set("dub.code", code); store.set("dub.lang", $("lang").value); store.set("dub.mode", $("mode").value);
     const fd = new FormData();
     fd.append("file", file, file.name);
@@ -416,7 +512,7 @@
     $("desc").textContent = st.description;
     $("pct").textContent = st.percent + "%";
     $("bar").firstElementChild.style.width = st.percent + "%";
-    $("clipLen").textContent = fmtTime(st.input_seconds);
+    $("clipLen").textContent = fmtTime(st.input_seconds ?? (st.youtube && st.youtube.duration));
     $("jobLang").textContent = st.target_lang || "–";
     if (st.elapsed_s != null) { lastElapsed = st.elapsed_s; lastElapsedAt = Date.now(); $("elapsed").textContent = fmtTime(st.elapsed_s); }
     renderSteps(st.stage, st.status);
@@ -440,7 +536,7 @@
       $("bar").className = "bar failed";
       $("logBox").open = true;
       showMsg($("progMsg"), "err", st.error || "The dub failed. The log above shows where.");
-      $("go").disabled = false;
+      $("go").disabled = !canGo();
       if (SHOW_COST && !(st.cost && st.cost.final) && doneExtraPolls++ < 10) pollTimer = setTimeout(poll, 3000);
       return;
     }
@@ -455,10 +551,13 @@
     const v = $("dubVideo");
     v.src = st.video_url;
     $("dubCaption").textContent = `Dubbed · ${st.target_lang}`;
-    if (fileUrl) { $("origFig").classList.remove("hidden"); $("origVideo").src = fileUrl; }
+    // The original: the local file for an upload; for a YouTube job (or a reloaded page) the
+    // copy the server dubbed, so the two players compare exactly what went in and came out.
+    const orig = (st.youtube || !fileUrl) ? st.source_url : fileUrl;
+    if (orig) { $("origFig").classList.remove("hidden"); $("origVideo").src = orig; }
     $("dlBtn").href = st.download_url;
     $("shareUrl").value = new URL(st.download_url, location.origin).href;
-    $("go").disabled = !file;
+    $("go").disabled = !canGo();
     renderTranscripts(st);
     $("resultCard").scrollIntoView({ behavior: "smooth", block: "start" });
   };
