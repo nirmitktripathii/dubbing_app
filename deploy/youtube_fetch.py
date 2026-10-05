@@ -132,7 +132,10 @@ def _mmss(s: float) -> str:
 def explain_download_error(msg: str) -> str:
     """yt-dlp's error text -> a sentence for the page. The raw text goes to the log."""
     m = msg.lower()
-    if "confirm you" in m and "not a bot" in m or "sign in to confirm" in m:
+    # The bot wall comes in two shapes from a datacenter IP: refused metadata ("Sign in to
+    # confirm you're not a bot"), or metadata allowed and the media itself refused with a 403
+    # (seen from a production container on 2026-10-05). Both need the same operator fix.
+    if ("confirm you" in m and "not a bot" in m) or "sign in to confirm" in m             or ("http error 403" in m and "download" in m):
         return ("YouTube refused the server's request (its bot check). The operator needs to "
                 "configure YouTube access (YTDLP_COOKIES or YTDLP_PROXY) — or upload the file instead.")
     if "private video" in m:

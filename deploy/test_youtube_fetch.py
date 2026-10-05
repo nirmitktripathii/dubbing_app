@@ -210,6 +210,14 @@ def test_run_job_shared_gate_and_secrets():
     check("YouTube's bot wall fails the job with the YTDLP_COOKIES / YTDLP_PROXY instruction",
           status["j3"]["status"] == "failed" and "YTDLP_COOKIES" in status["j3"]["error"]
           and not spawner.calls, status["j3"].get("error"))
+    Fake, rec = fake_ydl(GOOD, dl_error="ERROR: unable to download video data: HTTP Error 403: Forbidden")
+    status, spawner = {}, Spawner()
+    yf.run_fetch_job(job_id="j4", url=yf.canonical_url(VID), target_lang="Hindi", mode="basic",
+                     plan="DEMO", user="u", job_status=status, jobs_vol=FakeVol(), jobs_dir=jobs,
+                     dub_video=spawner, ydl_cls=Fake)
+    check("metadata allowed but media refused (403) gets the same access instruction",
+          rec["downloads"] == 1 and "YTDLP_COOKIES" in status["j4"]["error"] and not spawner.calls,
+          status["j4"].get("error"))
     pct, desc = demo_ui.progress_for(status["j3"])
     check("a failed fetch reads as such on the page", "Couldn't fetch" in desc, desc)
     shutil.rmtree(jobs, ignore_errors=True)
