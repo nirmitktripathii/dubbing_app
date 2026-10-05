@@ -54,7 +54,10 @@ def _translation_cache_path() -> str:
         if d:
             os.makedirs(d, exist_ok=True)
         return override
-    return os.path.join(_cache_dir(), "translations.json")
+    # "_gemini": a fresh namespace from when translation moved to the flash-lite-only
+    # allowlist. The old translations.json pool is keyed only by (lang, source) and
+    # holds Gemma-generated candidates, which a cache hit would otherwise keep serving.
+    return os.path.join(_cache_dir(), "translations_gemini.json")
 
 
 def _usage_path() -> str:

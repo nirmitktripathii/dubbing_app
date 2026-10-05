@@ -80,3 +80,10 @@ task.md
 # README showcase demo clips — the ONLY committed videos; the *.mp4 rule above still
 # ignores every other video so stray renders never land in the repo.
 !docs/demo/*.mp4
+
+# Local demo-UI simulator job dirs (deploy/demo_dev_server.py)
+deploy/.demo_jobs/
+# Locally curated voice references (Rasa, CC BY 4.0) for demo_dev_server.py --voice-dir
+deploy/.voice_refs/
+# The shared demo access code, kept locally so it can be handed out (never commit)
+deploy/.demo_access_code

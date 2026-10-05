@@ -137,48 +137,62 @@ AUDIT_WINDOW_SIZE = int(os.environ.get("DUBBING_AUDIT_WINDOW_SIZE", "15"))
 AUDIT_WINDOW_OVERLAP = int(os.environ.get("DUBBING_AUDIT_WINDOW_OVERLAP", "3"))
 
 
-# --- v2.5.1 rate-limit / hybrid-model config ----------------------------------
-# gemini-3.1-flash-lite has a strict free-tier limit (both per-minute and
-# per-day). To stay under it we split the work by PHASE:
+# --- Translation model policy -------------------------------------------------
+# Every translation call — bulk candidates, refinement, audit, audit-heal — runs on
+# gemini-3.1-flash-lite or gemini-3.5-flash-lite, and nothing else. This is an
+# ALLOWLIST enforced in _call_gemini (the one choke point every call passes), not
+# just a default: an env override or a caller naming any other model is dropped
+# with a visible log line.
 #
-#   • BULK phase (iteration 0) — the many first-draft candidates for every
-#     segment — runs on lenient-limit Gemma models by default. This is the bulk
-#     of all API calls.
-#   • REFINE phase — the few Chain-of-Thought rounds on only the hard segments —
-#     runs on gemini-3.1-flash-lite (quality where it matters, few calls).
+# History: the bulk phase used to default to gemma-4-31b-it → gemma-4-26b-a4b-it
+# for their lenient free-tier limits. In the deployed Telugu run (job 353efcf6,
+# 2026-09-29) 31b returned 500 INTERNAL four times and 26b wedged to its 240 s
+# timeout then took 206 s more — ~8.5 of Step 4's 10 minutes. Retired.
 #
-# Both chains keep the full Gemini fallback ladder, so if a Gemma id is not
-# available on a given key (or is renamed) the call self-heals to Gemini with a
-# visible log line — it never hard-fails on a model-name guess.
-#
-# Every id is env-overridable so no code change is needed to retune:
-#   DUBBING_GEMINI_BULK_MODEL     head of the bulk (Gemma) chain
-#   DUBBING_GEMINI_REFINE_MODEL   head of the refine (Gemini) chain
+# Env knobs (both must name an allowlisted model, else ignored):
+#   DUBBING_GEMINI_BULK_MODEL     head of the bulk chain
+#   DUBBING_GEMINI_REFINE_MODEL   head of the refine chain
 #   DUBBING_GEMINI_MODEL          legacy alias for the refine head
 #   DUBBING_GEMINI_RPM            client-side requests/minute pace (per model)
 #   DUBBING_GEMINI_RPD            optional per-model requests/day hard cap
 _GEMINI_FALLBACK = ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite"]
-_GEMMA_BULK_DEFAULT = ["gemma-4-31b-it", "gemma-4-26b-a4b-it"]
+ALLOWED_TRANSLATION_MODELS = tuple(_GEMINI_FALLBACK)
+
+
+def _allowed_chain(chain, log_fn=None) -> List[str]:
+    """Keep only allowlisted models (order preserved); never return empty."""
+    kept, dropped = [], []
+    for m in chain or []:
+        (kept if m in ALLOWED_TRANSLATION_MODELS else dropped).append(m)
+    if dropped:
+        msg = (f"  [Gemini API] ignoring non-allowlisted translation model(s) {dropped}; "
+               f"allowed: {list(ALLOWED_TRANSLATION_MODELS)}")
+        if log_fn:
+            log_fn(msg)
+        print(msg)
+    seen = []
+    for m in kept + _GEMINI_FALLBACK:
+        if m not in seen:
+            seen.append(m)
+    return seen
+
+
+def _head_chain(*env_names: str) -> List[str]:
+    for name in env_names:
+        head = os.environ.get(name)
+        if head:
+            return _allowed_chain([head])
+    return list(_GEMINI_FALLBACK)
 
 
 def _bulk_models() -> List[str]:
-    """Model chain for the iteration-0 bulk batch: lenient Gemma first, then the
-    Gemini ladder as a safety net."""
-    head = os.environ.get("DUBBING_GEMINI_BULK_MODEL")
-    chain = [head] if head else list(_GEMMA_BULK_DEFAULT)
-    for m in _GEMINI_FALLBACK:
-        if m not in chain:
-            chain.append(m)
-    return chain
+    """Model chain for the iteration-0 bulk batch."""
+    return _head_chain("DUBBING_GEMINI_BULK_MODEL")
 
 
 def _refine_models() -> List[str]:
-    """Model chain for refinement rounds: gemini-3.1-flash-lite first (quality),
-    then the rest of the Gemini ladder."""
-    head = os.environ.get("DUBBING_GEMINI_REFINE_MODEL") or os.environ.get("DUBBING_GEMINI_MODEL")
-    if head:
-        return [head] + [m for m in _GEMINI_FALLBACK if m != head]
-    return list(_GEMINI_FALLBACK)
+    """Model chain for refinement rounds: gemini-3.1-flash-lite first, then 3.5."""
+    return _head_chain("DUBBING_GEMINI_REFINE_MODEL", "DUBBING_GEMINI_MODEL")
 
 
 def _is_gemma(model: str) -> bool:
@@ -588,7 +602,7 @@ def _call_gemini(
         optional DUBBING_GEMINI_RPD cap we skip it and advance; only when every
         model is capped do we raise.
     """
-    chain = list(models) if models else _refine_models()
+    chain = _allowed_chain(list(models) if models else _refine_models(), log_fn=log_fn)
     rpd = translation_cache.rpd_limit()
 
     def _emit(m: str):
@@ -1395,8 +1409,8 @@ def translate_segments_isochrony(
     `log_fn` are unchanged; the v2.5 knobs (including `use_cache`) are optional
     with sensible defaults.
 
-    Rate-limit strategy (v2.5.1): the iteration-0 BULK batch runs on lenient
-    Gemma models; only the few REFINEMENT rounds use gemini-3.1-flash-lite. A
+    Models: every call runs on gemini-3.1-flash-lite / gemini-3.5-flash-lite
+    only (ALLOWED_TRANSLATION_MODELS, enforced in _call_gemini). A
     persistent candidate cache (keyed by language+source) seeds each segment
     before any API call, so a re-run — or a video with repeated phrases — selects
     its final lines with far fewer requests, often zero.
@@ -1569,7 +1583,7 @@ def translate_segments_isochrony(
     to_generate = [enriched[i] for i in range(len(segments)) if not satisfied[i]]
     if to_generate:
         _log(f"[IsochronyTranslation] Iteration 0: bulk-generating {n_candidates} "
-             f"candidates/segment for {len(to_generate)} segment(s) on the Gemma chain...")
+             f"candidates/segment for {len(to_generate)} segment(s) on the bulk chain (flash-lite)...")
         gen = _generate_batch(
             to_generate,
             lambda chunk: _build_batch_prompt(chunk, internal_lang, n_candidates),

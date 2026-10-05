@@ -124,9 +124,9 @@ def main():
     c1 = tc.TranslationCache()
     c1.add("Hindi", "hello world", ["cand-one", "cand-two"])
     c1.save()
-    persisted = os.path.exists(os.path.join(cache_dir, "translations.json"))
+    persisted = os.path.exists(os.path.join(cache_dir, "translations_gemini.json"))
     got = tc.TranslationCache().get("Hindi", "hello world")       # fresh instance reads back
-    leaked = os.path.exists(os.path.join(os.getcwd(), ".dubbing_cache", "translations.json"))
+    leaked = os.path.exists(os.path.join(os.getcwd(), ".dubbing_cache", "translations_gemini.json"))
     print(f"cache at configured dir? {persisted}   fresh read-back: {got}   leaked to cwd? {leaked}")
     if not persisted:
         fails.append("cache did NOT write to the configured DUBBING_CACHE_DIR")
