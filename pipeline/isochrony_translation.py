@@ -1583,7 +1583,7 @@ def translate_segments_isochrony(
     to_generate = [enriched[i] for i in range(len(segments)) if not satisfied[i]]
     if to_generate:
         _log(f"[IsochronyTranslation] Iteration 0: bulk-generating {n_candidates} "
-             f"candidates/segment for {len(to_generate)} segment(s) on the Gemma chain...")
+             f"candidates/segment for {len(to_generate)} segment(s) on the bulk chain (flash-lite)...")
         gen = _generate_batch(
             to_generate,
             lambda chunk: _build_batch_prompt(chunk, internal_lang, n_candidates),
