@@ -41,6 +41,10 @@ import uuid
 import modal
 
 APP_NAME = "indic-dubbing"
+# Hard ceiling on parallel GPU containers per GPU function (spend guard, deploy/spend_guard.py).
+# Excess jobs queue instead of fanning out, so a flood costs time, not money. TTSEngine has its
+# own cap below (MODAL_TTS_MAX_CONTAINERS) because its shard count is chosen per video.
+GPU_MAX_CONTAINERS = int(os.environ.get("MODAL_GPU_MAX_CONTAINERS", "2"))
 GPU_TYPE = os.environ.get("MODAL_GPU", "L4")   # SETUP: L4 fits Whisper+Demucs+IndicF5+knn-vc; A10G for headroom.
 # The repo is added to the image at /root/app and put on sys.path exactly like the Kaggle
 # notebook does (sys.path.insert(0, ...)), so `from run_headless import main` resolves.
@@ -543,6 +547,7 @@ def curate_voice_refs(languages: str = "", gender: str = "male"):
     secrets=secrets,
     timeout=60 * 30,
     min_containers=int(os.environ.get("MODAL_WARM", "0")),  # SETUP: 1 keeps a GPU warm for the prep phase
+    max_containers=GPU_MAX_CONTAINERS,   # spend cap: bounds parallel GPUs however many jobs arrive
     # SETUP: the GPU is done the instant Steps 1-3 return; without this the container lingers
     # the Modal default (~60 s) billing an idle L4 while the CPU orchestrator does translation.
     # 5 s scales it to zero right after it returns. Raise only if you want warm reuse across
@@ -582,6 +587,7 @@ def gpu_transcribe(job_id: str, input_name: str, target_lang: str = "Hindi", mod
     secrets=secrets,
     timeout=60 * 30,
     min_containers=int(os.environ.get("MODAL_WARM", "0")),
+    max_containers=GPU_MAX_CONTAINERS,   # spend cap, shared meaning with gpu_transcribe
     retries=modal.Retries(max_retries=1, backoff_coefficient=1.0),
 )
 def gpu_full_run(job_id: str, input_name: str, target_lang: str = "Hindi", mode: str = "basic"):
@@ -615,6 +621,9 @@ def gpu_full_run(job_id: str, input_name: str, target_lang: str = "Hindi", mode:
     volumes=VOLUMES,
     secrets=secrets,
     timeout=60 * 40,
+    # One orchestrator per in-flight dub, so this is the cap on concurrent dubs; the GPU
+    # functions it calls carry the same cap. Extra jobs wait in Modal's queue.
+    max_containers=GPU_MAX_CONTAINERS,
     retries=modal.Retries(max_retries=1, backoff_coefficient=1.0),
 )
 def dub_video(job_id: str, input_name: str, target_lang: str = "Hindi", mode: str = "basic"):
