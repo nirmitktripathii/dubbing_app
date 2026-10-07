@@ -44,7 +44,7 @@ modal secret create dubbing-secrets \
 |---|---|---|
 | `GEMINI_API_KEY` | Step 4 isochrony translation | **yes** — the run aborts without it |
 | `HF_TOKEN` | IndicF5, the reference voices, `curate_voice_refs` (Rasa is gated) | yes for gated repos |
-| `RAPIDAPI_PROXY_SECRET` | `api.py::_auth`, so the endpoint can't be called around RapidAPI | before listing; unset = open (dev only) |
+| `RAPIDAPI_PROXY_SECRET` | `api.py::_auth`, so the endpoint can't be called around RapidAPI | **required** — unset = `/v1` returns 503 (fail closed). Local dev only: `DUB_ALLOW_UNAUTH_API=1` |
 
 > The `GEMINI_API_KEY` here should **not** stay a free-tier key once you charge for this —
 > it rate-limits under concurrent load and reselling its output is almost certainly against
@@ -184,6 +184,36 @@ customer is billed on and the number they were gated on come from one implementa
 ```bash
 python deploy/test_api_gate.py   # CPU test of the gate; needs ffmpeg, no GPU/Modal
 ```
+
+### Spend guards — what keeps a flood from draining the Modal account
+Checked in `api.py::admit_job` after the duration gate and before `dub_video.spawn()`, so a
+refused request never reaches a GPU, its upload is deleted and no budget is consumed.
+Code and rationale: `deploy/spend_guard.py`. Defaults are pre-registered and env-overridable.
+
+| layer | what | default | refusal |
+|---|---|---|---|
+| kill switch | pauses new jobs, no redeploy (running jobs finish) | off | `503` |
+| per caller | one dub in flight; jobs/day; video-seconds/day (× plan: BASIC 3, PRO 10, ULTRA 30) | 3 jobs, 600 s | `429` |
+| daily budget | all callers together, input video-seconds per UTC day | `DUB_DAILY_VIDEO_SECONDS=3600` (~12 five-minute dubs, ~$1.20) | `503` |
+| container cap | parallel GPU containers per GPU function, and concurrent dubs | `MODAL_GPU_MAX_CONTAINERS=2` | jobs queue |
+| auth | `/v1` refuses to start open without `RAPIDAPI_PROXY_SECRET` | fail closed | `503` / `403` |
+
+Callers are keyed by the demo visitor's IP (last `X-Forwarded-For` hop), the `X-RapidAPI-User`
+header on `/v1`, hashed before storage. The owner code (`DEMO_OWNER_CODE`) skips the per-caller
+limits only, never the switch or the daily budget. If the counters cannot be read, the request
+is refused rather than waved through.
+
+```bash
+python -m deploy.spend_guard status               # today's totals against the limits
+python -m deploy.spend_guard pause "bot traffic"  # stop new jobs now
+python -m deploy.spend_guard resume
+python deploy/test_spend_guard.py                 # CPU test; needs ffmpeg, no GPU/Modal
+```
+
+The counters live in a `modal.Dict`, which has no atomic increment: two simultaneous requests can
+both read the same total, so the budget can overshoot by up to the number of API containers. The
+container cap and the **Modal workspace budget** (Settings -> Usage & Billing) are the hard
+backstops; set the workspace budget before announcing the app.
 
 ### Job progress
 `GET /v1/dub/{id}` reports a live `stage` (`step 4/7 — Isochrony-aware translation…`,
