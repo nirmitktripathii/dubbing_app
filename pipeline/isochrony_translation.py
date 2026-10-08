@@ -145,7 +145,7 @@ AUDIT_WINDOW_OVERLAP = int(os.environ.get("DUBBING_AUDIT_WINDOW_OVERLAP", "3"))
 #     segment — runs on lenient-limit Gemma models by default. This is the bulk
 #     of all API calls.
 #   • REFINE phase — the few Chain-of-Thought rounds on only the hard segments —
-#     runs on gemini-3.1-flash-lite (quality where it matters, few calls).
+#     runs on gemini-3.5-flash-lite first, falling back to gemini-3.1-flash-lite.
 #
 # Both chains keep the full Gemini fallback ladder, so if a Gemma id is not
 # available on a given key (or is renamed) the call self-heals to Gemini with a
@@ -157,8 +157,51 @@ AUDIT_WINDOW_OVERLAP = int(os.environ.get("DUBBING_AUDIT_WINDOW_OVERLAP", "3"))
 #   DUBBING_GEMINI_MODEL          legacy alias for the refine head
 #   DUBBING_GEMINI_RPM            client-side requests/minute pace (per model)
 #   DUBBING_GEMINI_RPD            optional per-model requests/day hard cap
-_GEMINI_FALLBACK = ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite"]
+_GEMINI_FALLBACK = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
 _GEMMA_BULK_DEFAULT = ["gemma-4-31b-it", "gemma-4-26b-a4b-it"]
+
+# 5xx / timeout policy (see _call_gemini): each model gets one attempt per ROUND; when
+# every model in a round fails transiently we sleep a cooldown and start the next
+# round with the Gemini order flipped; after _GEMINI_ROUNDS rounds the error is raised
+# so the caller's own fallback applies.
+#   DUBBING_GEMINI_COOLDOWN_S   BASE cooldown; doubles each round (20s, 40s, 80s ...), capped
+#   DUBBING_GEMINI_ROUNDS       rounds before giving up (each model tried this many times)
+_GEMINI_COOLDOWN_S_DEFAULT = 20.0
+_GEMINI_COOLDOWN_CAP_S = 120.0
+_GEMINI_ROUNDS_DEFAULT = 3
+
+
+def _gemini_cooldown_seconds() -> float:
+    """The BASE cooldown (the wait before round 2); see _cooldown_for_round."""
+    try:
+        return max(0.0, float(os.environ.get("DUBBING_GEMINI_COOLDOWN_S", _GEMINI_COOLDOWN_S_DEFAULT)))
+    except ValueError:
+        return _GEMINI_COOLDOWN_S_DEFAULT
+
+
+def _cooldown_for_round(base_s: float, next_round_no: int) -> float:
+    """Exponential cooldown before round `next_round_no` (0-based, so >= 1): base * 2^(n-1),
+    capped at _GEMINI_COOLDOWN_CAP_S."""
+    return min(base_s * (2.0 ** (next_round_no - 1)), _GEMINI_COOLDOWN_CAP_S)
+
+
+def _gemini_rounds() -> int:
+    try:
+        return max(1, int(os.environ.get("DUBBING_GEMINI_ROUNDS", _GEMINI_ROUNDS_DEFAULT)))
+    except ValueError:
+        return _GEMINI_ROUNDS_DEFAULT
+
+
+def _round_chain(chain: List[str], round_no: int) -> List[str]:
+    """Model order for a given round: even rounds use `chain` as given; odd rounds
+    reverse its Gemini (non-Gemma) tail so a model that was tried last gets tried
+    first after the cooldown. Leading Gemma models keep their place."""
+    if round_no % 2 == 0:
+        return list(chain)
+    n_head = 0
+    while n_head < len(chain) and _is_gemma(chain[n_head]):
+        n_head += 1
+    return list(chain[:n_head]) + list(reversed(chain[n_head:]))
 
 
 def _bulk_models() -> List[str]:
@@ -173,8 +216,8 @@ def _bulk_models() -> List[str]:
 
 
 def _refine_models() -> List[str]:
-    """Model chain for refinement rounds: gemini-3.1-flash-lite first (quality),
-    then the rest of the Gemini ladder."""
+    """Model chain for refinement rounds: gemini-3.5-flash-lite first, then the rest
+    of the Gemini ladder."""
     head = os.environ.get("DUBBING_GEMINI_REFINE_MODEL") or os.environ.get("DUBBING_GEMINI_MODEL")
     if head:
         return [head] + [m for m in _GEMINI_FALLBACK if m != head]
@@ -588,7 +631,11 @@ def _call_gemini(
         optional DUBBING_GEMINI_RPD cap we skip it and advance; only when every
         model is capped do we raise.
     """
-    chain = list(models) if models else _refine_models()
+    base_chain = list(models) if models else _refine_models()
+    max_rounds = _gemini_rounds()
+    base_cooldown_s = _gemini_cooldown_seconds()
+    round_no = 0
+    chain = _round_chain(base_chain, round_no)
     rpd = translation_cache.rpd_limit()
 
     def _emit(m: str):
@@ -598,15 +645,12 @@ def _call_gemini(
 
     idx = 0
     rate_retries = 0
-    transient_retries = 0      # 500/503 back-off budget for the CURRENT model
     parse_retries = 0          # reask budget for the CURRENT model; reset on advance
     total_tries = 0
     # Hard ceiling on real API calls. Sized to allow a couple of parse-reasks and
-    # a few transient-server-error retries on the first model(s) without starving
-    # the chain walk that follows.
+    # the full rounds x models walk of transient failures without starving the chain.
     max_total_tries = 20
     max_rate_retries = 4
-    max_transient_retries = 3
     _reformat_suffix = (
         "\n\nIMPORTANT: Return ONLY the JSON array requested above — no prose, no "
         "markdown fences, no explanation. Output must start with '[' and end with "
@@ -621,7 +665,6 @@ def _call_gemini(
             _emit(f"  [Gemini API] '{model_name}' hit daily cap ({rpd}); advancing model.")
             idx += 1
             rate_retries = 0
-            transient_retries = 0
             parse_retries = 0
             continue
 
@@ -686,7 +729,6 @@ def _call_gemini(
                     idx += 1
                     parse_retries = 0
                     rate_retries = 0
-                    transient_retries = 0
                     continue
 
             if served is not None:
@@ -721,7 +763,6 @@ def _call_gemini(
                 _emit(f"  [Gemini API] '{model_name}' unavailable; advancing to next model.")
                 idx += 1
                 rate_retries = 0
-                transient_retries = 0
                 parse_retries = 0
                 continue
 
@@ -738,25 +779,37 @@ def _call_gemini(
                 time.sleep(wait)
                 continue
 
-            if is_transient and transient_retries < max_transient_retries:
-                # Flaky 500/503 on the SAME model — short back-off then retry it,
-                # rather than thrashing down the chain to a weaker/slower model.
-                # These endpoints recover within a second or two, so this keeps the
-                # batch on the fast primary and avoids the sequential collapse.
-                transient_retries += 1
-                wait = min(1.5 * (2.0 ** (transient_retries - 1)) + random.uniform(0, 1.0), 20.0)
-                _emit(f"  [Gemini API] transient server error; backing off {wait:.1f}s "
-                      f"then retrying '{model_name}' "
-                      f"(transient retry {transient_retries}/{max_transient_retries}).")
-                time.sleep(wait)
+            if is_transient and idx < len(chain) - 1:
+                # 5xx / timeout: this model gets ONE attempt per round, then the next
+                # model in the round is tried straight away (no same-model retries —
+                # a 503 here takes ~70s to come back, so retrying it is the slow path).
+                _emit(f"  [Gemini API] transient server error on '{model_name}'; "
+                      f"trying next model (round {round_no + 1}/{max_rounds}).")
+                idx += 1
+                rate_retries = 0
+                parse_retries = 0
                 continue
 
-            if (is_rate or is_transient) and idx < len(chain) - 1:
+            if is_transient and round_no + 1 < max_rounds:
+                # Every model in this round failed transiently → cool down, then run
+                # another round with the Gemini order flipped (see _round_chain).
+                round_no += 1
+                chain = _round_chain(base_chain, round_no)
+                cooldown_s = _cooldown_for_round(base_cooldown_s, round_no)
+                _emit(f"  [Gemini API] all models failed transiently; cooling down "
+                      f"{cooldown_s:.0f}s before round {round_no + 1}/{max_rounds} "
+                      f"(order: {' -> '.join(chain)}).")
+                time.sleep(cooldown_s)
+                idx = 0
+                rate_retries = 0
+                parse_retries = 0
+                continue
+
+            if is_rate and idx < len(chain) - 1:
                 # Exhausted same-model retries → next model.
                 _emit(f"  [Gemini API] advancing from '{model_name}' to next model.")
                 idx += 1
                 rate_retries = 0
-                transient_retries = 0
                 parse_retries = 0
                 continue
 
