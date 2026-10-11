@@ -158,7 +158,7 @@
     </div>
     <h1>IndicAI Dubbing</h1>
   </header>
-  <p class="tagline">Upload an English clip, or paste a YouTube link, and get it back dubbed into one of 11 Indian languages, with the timing matched to the original.</p>
+  <p class="tagline" id="tagline">Upload an English clip and get it back dubbed into one of 11 Indian languages, with the timing matched to the original.</p>
 
   <div id="simBanner" class="banner hidden">Local simulation: no Modal and no GPU are involved. The progress shown here is made up for testing.</div>
   <div id="offBanner" class="banner hidden">The demo is switched off on this deployment because no access code is configured.</div>
@@ -274,6 +274,9 @@
   ];
   let file = null, fileUrl = null, jobId = null, pollTimer = null, tickTimer = null;
   let srcKind = "file", ytId = null;
+  // YouTube links are switched off in the page until the feature is finished. The code below and the
+  // /ui/dub/youtube endpoint are intact: set this to true to bring the tab and the tagline back.
+  const SHOW_YOUTUBE = false;
   let lastElapsed = 0, lastElapsedAt = 0, running = false;
 
   const fmtTime = (s) => {
@@ -306,7 +309,8 @@
     voiceHint();
     $("limits").textContent = `MP4, MOV, MKV or WebM · up to ${fmtTime(cfg.max_seconds)} long · max ${cfg.max_upload_mb} MB`;
     $("ytLimits").textContent = `Public videos only, up to ${fmtTime(cfg.max_seconds)} long. The server downloads it, so nothing is uploaded from your device.`;
-    if (cfg.youtube) {
+    if (cfg.youtube && SHOW_YOUTUBE) {
+      $("tagline").textContent = "Upload an English clip, or paste a YouTube link, and get it back dubbed into one of 11 Indian languages, with the timing matched to the original.";
       $("srcTabs").classList.remove("hidden");
       if (store.get("dub.src") === "youtube") setSrc("youtube");
     }
