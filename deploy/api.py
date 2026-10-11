@@ -26,6 +26,7 @@ module has no hard Modal dependency and can be unit-tested with fakes.
 """
 from __future__ import annotations
 
+import hmac
 import os
 import shutil
 import subprocess
@@ -40,12 +41,17 @@ import uuid
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 
+from deploy import spend_guard
+
 MAX_UPLOAD_MB = int(os.environ.get("DUB_MAX_UPLOAD_MB", "500"))
 VALID_MODES = {"basic", "vc", "xlingual"}
 # Per-plan input ceilings (seconds of video). RapidAPI enforces call quotas; this guards GPU.
 PLAN_MAX_SECONDS = {"BASIC": 600, "PRO": 3600, "ULTRA": 7200, "": 120}  # "" = unauth/free probe
 # The web demo UI (deploy/demo_ui.py) submits as plan DEMO: access-code gated, its own ceiling.
 PLAN_MAX_SECONDS["DEMO"] = int(os.environ.get("DUB_DEMO_MAX_SECONDS", "300"))
+# The owner's demo code (DEMO_OWNER_CODE) skips the per-caller limits, never the kill switch or
+# the daily budget.
+OWNER_USER = "demo-owner"
 
 
 def probe_duration(path: str) -> float | None:
@@ -91,7 +97,7 @@ def check_mode(mode: str) -> str:
 def prepare_job(*, job_status, jobs_vol, jobs_dir, dub_video, data: bytes, filename: str,
                 target_lang: str, mode: str, plan: str = "", user: str | None = None,
                 idempotency_key: str | None = None, max_upload_mb: int = MAX_UPLOAD_MB,
-                extra: dict | None = None):
+                extra: dict | None = None, caller: str | None = None):
     """Validate + persist input + spawn the GPU job. Pure (no FastAPI); raises ApiError.
 
     This is the POST /v1/dub business logic, extracted so auth/limits/idempotency/spawn are
@@ -120,7 +126,7 @@ def prepare_job(*, job_status, jobs_vol, jobs_dir, dub_video, data: bytes, filen
 
     admit_job(job_status=job_status, jobs_vol=jobs_vol, dub_video=dub_video, job_id=job_id,
               job_dir=job_dir, input_name=input_name, target_lang=target_lang, mode=mode,
-              plan=plan, user=user, extra=extra)
+              plan=plan, user=user, extra=extra, caller=caller)
     if idempotency_key:
         job_status[f"idem:{idempotency_key}"] = job_id
     return {"job_id": job_id, "status": "queued", "poll": f"/v1/dub/{job_id}"}
@@ -128,7 +134,7 @@ def prepare_job(*, job_status, jobs_vol, jobs_dir, dub_video, data: bytes, filen
 
 def admit_job(*, job_status, jobs_vol, dub_video, job_id: str, job_dir: str, input_name: str,
               target_lang: str, mode: str, plan: str = "", user: str | None = None,
-              extra: dict | None = None) -> float:
+              extra: dict | None = None, caller: str | None = None) -> float:
     """Gate an input file that is ALREADY in ``job_dir`` on duration, then spawn the GPU job.
 
     The one admission path for every input source — an upload (prepare_job) or a fetched
@@ -136,6 +142,11 @@ def admit_job(*, job_status, jobs_vol, dub_video, job_id: str, job_dir: str, inp
     A status record already present for ``job_id`` (a fetch's progress and log) is kept and
     updated, not replaced. Returns the probed duration; raises ApiError and deletes
     ``job_dir`` on rejection.
+
+    After the duration gate it also passes the spend guards (deploy/spend_guard.py): kill switch,
+    per-caller limits, daily video-seconds budget. ``caller`` keys the per-caller limits (an
+    invite code, a RapidAPI user, a hashed IP); it falls back to what the job record already
+    carries, then to ``user``.
     """
     # ── The pre-GPU duration gate ────────────────────────────────────────────────────────
     # File size in MB is NOT a proxy for GPU cost: a heavily-compressed 3-hour video clears
@@ -155,21 +166,38 @@ def admit_job(*, job_status, jobs_vol, dub_video, job_id: str, job_dir: str, inp
         raise ApiError(413, f"input is {duration:.0f}s; plan {plan or 'FREE'} allows "
                             f"{max_seconds}s. Upgrade the plan or send a shorter clip.")
 
+    prev = job_status.get(job_id) or {}
+    # The caller is hashed once, here; a job record that already carries a hashed id (the YouTube
+    # route stores one before the fetch) keeps it.
+    cid = spend_guard.caller_id(caller) if caller else (
+        prev.get("caller") or spend_guard.caller_id(user))
+    try:
+        spend_guard.reserve(job_status, job_id=job_id, seconds=duration, cid=cid, plan=plan,
+                            exempt_caller_limits=(user == OWNER_USER))
+    except spend_guard.GuardRefused as e:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise ApiError(e.status_code, e.detail)
+
     try:
         jobs_vol.commit()
     except Exception:
         pass
 
-    prev = job_status.get(job_id) or {}
     job_status[job_id] = {
         **prev,
         "status": "queued", "stage": "queued", "mode": mode, "target_lang": target_lang,
         "user": user, "plan": plan, "max_seconds": max_seconds, "input_seconds": duration,
         "input_name": input_name, "created_at": prev.get("created_at") or time.time(),
+        "caller": cid,
         **(extra or {}),
     }
 
-    dub_video.spawn(job_id, input_name, target_lang, mode)   # fire-and-forget GPU job
+    try:
+        dub_video.spawn(job_id, input_name, target_lang, mode)   # fire-and-forget GPU job
+    except Exception:
+        # Nothing started, so don't charge the budget for it.
+        spend_guard.release(job_status, seconds=duration, cid=cid)
+        raise
     return duration
 
 
@@ -178,9 +206,19 @@ def build_api(dub_video, job_status, jobs_vol, jobs_dir, fetch_youtube=None):
 
     expected_secret = os.environ.get("RAPIDAPI_PROXY_SECRET", "")
 
+    # Local development only: lets /v1 run with no proxy secret. Never set on Modal.
+    allow_unauth = os.environ.get("DUB_ALLOW_UNAUTH_API") == "1"
+
     def _auth(proxy_secret: str | None):
-        # If a secret is configured, require it. (Unset => open, for local `modal serve` dev.)
-        if expected_secret and proxy_secret != expected_secret:
+        # FAIL CLOSED. With no secret configured the endpoint is unreachable, not open: a
+        # deployment that forgot the secret must not be a free public GPU. (It used to skip the
+        # check when the secret was unset.) The demo UI has its own gate and is unaffected.
+        if not expected_secret:
+            if allow_unauth:
+                return
+            raise HTTPException(status_code=503, detail="API disabled: RAPIDAPI_PROXY_SECRET is "
+                                                        "not configured on this deployment.")
+        if not hmac.compare_digest((proxy_secret or "").encode(), expected_secret.encode()):
             raise HTTPException(status_code=403, detail="Invalid or missing RapidAPI proxy secret.")
 
     @api.get("/healthz")
@@ -234,6 +272,7 @@ def build_api(dub_video, job_status, jobs_vol, jobs_dir, fetch_youtube=None):
                 data=data, filename=filename, target_lang=target_lang,
                 mode=mode, plan=request.headers.get("x-rapidapi-subscription") or "",
                 user=request.headers.get("x-rapidapi-user"),
+                caller="rapidapi:" + (request.headers.get("x-rapidapi-user") or "anon"),
                 idempotency_key=request.headers.get("idempotency-key"),
             )
         except ApiError as e:

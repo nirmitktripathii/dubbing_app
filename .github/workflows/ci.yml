@@ -50,5 +50,7 @@ jobs:
         run: python deploy/test_youtube_fetch.py
       - name: test_api_gate
         run: python deploy/test_api_gate.py
+      - name: test_spend_guard
+        run: python deploy/test_spend_guard.py
       - name: test_tts_fanout
         run: python deploy/test_tts_fanout.py

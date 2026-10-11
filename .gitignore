@@ -87,3 +87,6 @@ deploy/.demo_jobs/
 deploy/.voice_refs/
 # The shared demo access code, kept locally so it can be handed out (never commit)
 deploy/.demo_access_code
+
+# local provider key file
+RAPID_API_API.txt

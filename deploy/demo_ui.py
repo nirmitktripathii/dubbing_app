@@ -51,6 +51,7 @@ import uuid
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, Response
 
+from deploy import spend_guard
 from deploy.api import ApiError, MAX_UPLOAD_MB, PLAN_MAX_SECONDS, check_mode, prepare_job
 from deploy.youtube_fetch import FetchRejected, access_configured, canonical_url, parse_youtube_url
 
@@ -273,6 +274,16 @@ def add_demo_routes(api: FastAPI, *, dub_video, job_status, jobs_vol, jobs_dir,
             return "demo-ui"
         raise HTTPException(403, "Wrong access code.")
 
+    def _caller(request: Request, who: str) -> str:
+        """Who the per-caller spend limits are charged to. All visitors share one access code, so
+        the code alone cannot tell them apart; the client IP can. Behind Modal's proxy the LAST
+        X-Forwarded-For entry is the one the proxy appended (earlier ones are client-supplied and
+        spoofable). A spoofed or shared IP only blunts the per-caller limit -- the daily budget
+        and the container cap are the backstop."""
+        xff = (request.headers.get("x-forwarded-for") or "").split(",")[-1].strip()
+        ip = xff or (request.client.host if request.client else "")
+        return f"{who}:{ip}"
+
     def _demo_job(job_id: str) -> dict:
         st = job_status.get(job_id)
         if not st or st.get("source") != DEMO_SOURCE:
@@ -309,6 +320,7 @@ def add_demo_routes(api: FastAPI, *, dub_video, job_status, jobs_vol, jobs_dir,
                 dub_video=dub_video, data=data,
                 filename=getattr(upload, "filename", None) or "input.mp4",
                 target_lang=target_lang, mode=mode, plan="DEMO", user=who,
+                caller=_caller(request, who),
                 idempotency_key=request.headers.get("idempotency-key"),
                 extra={"source": DEMO_SOURCE, "dl_token": secrets.token_urlsafe(18)},
             )
@@ -347,7 +359,8 @@ def add_demo_routes(api: FastAPI, *, dub_video, job_status, jobs_vol, jobs_dir,
         extra = {"source": DEMO_SOURCE, "dl_token": secrets.token_urlsafe(18)}
         job_status[job_id] = {"status": "fetching", "stage": "fetching", "mode": mode,
                               "target_lang": target_lang, "user": who, "plan": "DEMO",
-                              "created_at": time.time(), "youtube": {"id": vid,
+                              "created_at": time.time(), "caller": spend_guard.caller_id(_caller(request, who)),
+                              "youtube": {"id": vid,
                               "url": canonical_url(vid)}, **extra}
         if idem:
             job_status[f"idem:{idem}"] = job_id
